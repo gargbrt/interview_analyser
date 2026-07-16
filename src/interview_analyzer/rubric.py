@@ -24,28 +24,40 @@ For EACH question/answer pair, evaluate the answer against these categories:
 For each pair return:
 - question (short paraphrase)
 - answer_summary (1-2 sentence summary of what you said)
-- issues: list of specific problems found, tagged by category
-- suggested_improvement: a concise, concrete rewrite or specific advice
+- issues: list of specific problems found, tagged by category. For EACH issue,
+  quote the exact words from the transcript that illustrate it verbatim in
+  "excerpt" (copy-paste, do not paraphrase) -- this is what makes the
+  feedback concrete instead of generic. Leave "excerpt" as an empty string
+  only if the issue is about something absent (e.g. "no metric given")
+  rather than something said.
+- suggested_improvement: a concise, concrete rewrite or specific advice,
+  ideally showing how the quoted excerpt could be rephrased
 
 Then return an overall "session_summary" with:
 - top_strengths (max 3)
 - top_issues (max 3, most impactful first)
 - one_thing_to_practice_next (single most actionable suggestion)
-
+- confidence: an integer 0-100 -- your own honest confidence that this
+  assessment is accurate and complete, given transcript quality (e.g.
+  unclear audio, ambiguous speaker labels) and how much you had to infer
+  vs. what was explicitly said. Don't default to a high number just to seem
+  certain -- a noisy or ambiguous transcript should get a lower score.
+{calibration_section}
 Respond ONLY with valid JSON in this shape, no markdown fences, no preamble:
 {{
   "qa_pairs": [
     {{
       "question": "...",
       "answer_summary": "...",
-      "issues": [{{"category": "...", "detail": "..."}}],
+      "issues": [{{"category": "...", "detail": "...", "excerpt": "..."}}],
       "suggested_improvement": "..."
     }}
   ],
   "session_summary": {{
     "top_strengths": ["..."],
     "top_issues": ["..."],
-    "one_thing_to_practice_next": "..."
+    "one_thing_to_practice_next": "...",
+    "confidence": 0
   }}
 }}
 
@@ -56,7 +68,8 @@ Transcript:
 """
 
 
-def build_prompt(transcript: str) -> str:
+def build_prompt(transcript: str, calibration_notes: str = "") -> str:
+    calibration_section = f"\n{calibration_notes}\n" if calibration_notes else ""
     return ANALYSIS_PROMPT_TEMPLATE.format(
-        categories=", ".join(CATEGORIES), transcript=transcript
+        categories=", ".join(CATEGORIES), transcript=transcript, calibration_section=calibration_section
     )

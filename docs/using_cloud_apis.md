@@ -58,6 +58,11 @@ analysis:
   llm_model: "qwen2.5:14b"
 ```
 
+Or from the dashboard: Settings tab → pick `qwen2.5:14b` from the Model
+name dropdown (it lists a small curated catalog with approximate download
+sizes) → **Install model...**, which downloads it with a progress bar after
+confirming the size with you.
+
 ## Writing a completely custom engine
 
 Any provider, any local model, any prompt strategy — implement
@@ -77,6 +82,12 @@ class MyEngine(AnalysisEngine):
 
 register_engine("my_engine", lambda acfg: MyEngine())
 ```
+
+(Optionally implement `run(self, prompt, on_progress=None)` and call
+`on_progress(fraction)` as your response streams in, if your provider
+supports streaming, for a live "Analyzing… N%" indicator in the dashboard --
+see `analyzer.py`'s `OllamaEngine` for a worked example. It's entirely
+optional; engines that only implement `run(self, prompt)` still work fine.)
 
 Then import `my_engine` before `interview_analyzer.watcher.main()` runs
 (e.g. add `import my_engine` at the top of a small wrapper script you point

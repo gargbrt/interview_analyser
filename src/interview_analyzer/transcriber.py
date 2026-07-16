@@ -5,17 +5,41 @@ from __future__ import annotations
 
 import logging
 import pathlib
+import threading
+from typing import Callable, Optional
 
 from .config_loader import Config
 
 logger = logging.getLogger(__name__)
 
 
-def transcribe(audio_path: pathlib.Path, cfg: Config) -> str:
+class TranscriptionCancelled(Exception):
+    """Raised when `cancel_event` is set mid-transcription. Whatever
+    segments were already decoded are discarded -- there's no meaningful
+    "resume from here" for a batch Whisper run, so a cancelled transcript
+    is treated as fully cancelled, not partial."""
+
+
+def transcribe(
+    audio_path: pathlib.Path,
+    cfg: Config,
+    on_progress: Optional[Callable[[float], None]] = None,
+    cancel_event: Optional[threading.Event] = None,
+) -> str:
     """Returns a speaker-labeled transcript as plain text, e.g.:
 
     [Interviewer] Tell me about a time you dealt with conflict.
     [You] So, um, there was this one time...
+
+    If given, `on_progress(fraction)` is called with a real 0.0-1.0 estimate
+    as transcription proceeds -- faster-whisper yields segments lazily as it
+    works through the audio, so each segment's end timestamp against the
+    total duration is an honest progress signal, not a fake animation.
+
+    If given, `cancel_event` is checked between segments; when set, raises
+    `TranscriptionCancelled` instead of returning (checked between segments
+    because that's the only natural interruption point faster-whisper's
+    synchronous, single-call API offers -- there's no mid-segment hook).
     """
     from faster_whisper import WhisperModel
 
@@ -26,16 +50,87 @@ def transcribe(audio_path: pathlib.Path, cfg: Config) -> str:
         compute_type="int8" if tcfg.get("device", "cpu") == "cpu" else "float16",
     )
 
-    segments, _info = model.transcribe(str(audio_path), beam_size=5)
-    segments = list(segments)
+    language = _resolve_whisper_language(tcfg.get("language", "auto"))
+    vad_filter = tcfg.get("vad_filter", True)
+
+    segment_stream, info = model.transcribe(
+        str(audio_path),
+        beam_size=5,
+        language=language,
+        # vad_filter segments the audio on actual speech first, instead of
+        # decoding fixed ~30s windows regardless of content -- without it, a
+        # short utterance right after a long silence can land inside a
+        # mostly-silent window and get silently dropped (reproduced on a
+        # real recording: speech ~55s in, after a long "waiting for
+        # participants" pause, was missing from the transcript until this
+        # was enabled). speech_pad_ms keeps a little silence on each side of
+        # a detected speech span so words right at the boundary aren't clipped.
+        vad_filter=vad_filter,
+        vad_parameters=dict(min_silence_duration_ms=300, speech_pad_ms=300) if vad_filter else None,
+        # Off by default: with it on, a long silent stretch can make Whisper
+        # keep "conditioning" on the last thing it transcribed and either
+        # hallucinate or under-transcribe the next real utterance instead of
+        # treating it fresh. That's part of the same 55s-dropped-speech bug.
+        condition_on_previous_text=False,
+        no_speech_threshold=0.4,
+    )
+    total_duration = info.duration or 0
+    segments = []
+    for seg in segment_stream:
+        if cancel_event is not None and cancel_event.is_set():
+            raise TranscriptionCancelled()
+        segments.append(seg)
+        if on_progress is not None and total_duration > 0:
+            on_progress(min(seg.end / total_duration, 1.0))
 
     if tcfg.get("diarization", True):
         labeled = _diarize_and_label(audio_path, segments)
     else:
         labeled = [(seg.start, seg.end, "Speaker", seg.text.strip()) for seg in segments]
 
+    if tcfg.get("language", "auto") == "hinglish":
+        labeled = [(s, e, spk, _to_latin_if_available(text)) for s, e, spk, text in labeled]
+
     lines = [f"[{spk}] {text}" for _, _, spk, text in labeled]
     return "\n".join(lines)
+
+
+def _resolve_whisper_language(language_setting: str) -> Optional[str]:
+    """Maps this app's `transcription.language` setting to the language code
+    Whisper expects. "auto" (or anything unrecognized) leaves it as None so
+    Whisper auto-detects, same as before this setting existed. "hinglish"
+    isn't a real Whisper language code -- Whisper has no dedicated
+    code-switched Hindi/English mode -- so it's pinned to "hi", which in
+    practice transcribes embedded English words inline rather than forcing
+    everything into Hindi; the output is then optionally romanized in
+    `transcribe()` above. See docs/language_support.md."""
+    if language_setting in (None, "", "auto"):
+        return None
+    if language_setting == "hinglish":
+        return "hi"
+    return language_setting
+
+
+def _to_latin_if_available(text: str) -> str:
+    """Best-effort transliteration of Devanagari text to the Latin
+    alphabet, for the optional "hinglish" language pack -- so the transcript
+    reads as Romanized Hinglish instead of mixed Devanagari/Latin script.
+    Falls back to the untouched text if the optional `indic-transliteration`
+    package isn't installed (same optional-dependency pattern as
+    diarization's pyannote.audio -- see docs/language_support.md)."""
+    try:
+        from indic_transliteration import sanscript
+        from indic_transliteration.sanscript import transliterate
+    except ImportError:
+        logger.warning(
+            "indic-transliteration isn't installed; leaving hinglish transcript in its "
+            "original script instead of romanizing it. `pip install indic-transliteration` to enable it."
+        )
+        return text
+    try:
+        return transliterate(text, sanscript.DEVANAGARI, sanscript.ITRANS)
+    except Exception:  # noqa: BLE001
+        return text
 
 
 def _diarize_and_label(audio_path: pathlib.Path, segments) -> list[tuple[float, float, str, str]]:

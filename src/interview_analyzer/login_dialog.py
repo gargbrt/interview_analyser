@@ -25,7 +25,6 @@ def gui_login_or_create(conn: sqlite3.Connection) -> Optional[User]:
     def _show():
         try:
             import tkinter as tk
-            from tkinter import messagebox
         except ImportError:  # pragma: no cover
             logger.warning("Tkinter not available; cannot show the login dialog.")
             result_queue.put(None)
@@ -39,18 +38,18 @@ def gui_login_or_create(conn: sqlite3.Connection) -> Optional[User]:
         tk.Label(
             root,
             text="Local profile name\n(scopes your interview history and trend tracking)",
-            padx=20, pady=(18, 6), justify="left",
-        ).pack()
+            padx=20, justify="left",
+        ).pack(pady=(18, 6))
 
         username_var = tk.StringVar()
         username_entry = tk.Entry(root, textvariable=username_var, width=28)
         username_entry.pack(padx=20)
         username_entry.focus_set()
 
-        password_label = tk.Label(root, text="Password (only if this profile has one)", padx=20, pady=(10, 4))
+        password_label = tk.Label(root, text="Password (only if this profile has one)", padx=20)
         password_var = tk.StringVar()
         password_entry = tk.Entry(root, textvariable=password_var, show="*", width=28)
-        password_label.pack()
+        password_label.pack(pady=(10, 4))
         password_entry.pack(padx=20)
 
         error_var = tk.StringVar()

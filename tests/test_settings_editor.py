@@ -96,6 +96,19 @@ def test_save_editable_settings_coerces_string_input_from_gui_widgets(tmp_path):
     assert settings["transcription.diarization"] is False
 
 
+def test_save_editable_settings_can_add_a_new_language_key(tmp_path):
+    """transcription.language didn't exist in older config.yaml files (the
+    Hindi/English/Hinglish language pack added it later) -- saving it must
+    add the key rather than requiring it to already be present."""
+    path = _write_sample(tmp_path)
+
+    save_editable_settings(path, {"transcription.language": "hinglish"})
+
+    settings = load_editable_settings(path)
+    assert settings["transcription.language"] == "hinglish"
+    assert settings["transcription.whisper_model"] == "small"  # untouched
+
+
 def test_save_editable_settings_rejects_unknown_field(tmp_path):
     path = _write_sample(tmp_path)
     try:

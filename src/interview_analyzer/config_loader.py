@@ -31,6 +31,22 @@ class Config:
         return int(self.raw.get("start_debounce_polls", 2))
 
     @property
+    def browser_start_debounce_polls(self) -> int:
+        return int(self.raw.get("browser_start_debounce_polls", 6))
+
+    @property
+    def stop_debounce_polls(self) -> int:
+        return int(self.raw.get("stop_debounce_polls", 12))
+
+    @property
+    def post_call_cooldown_seconds(self) -> float:
+        return float(self.raw.get("post_call_cooldown_seconds", 30))
+
+    @property
+    def declined_cooldown_seconds(self) -> float:
+        return float(self.raw.get("declined_cooldown_seconds", 300))
+
+    @property
     def watched_processes(self) -> dict[str, list[str]]:
         return self.raw.get("watched_processes", {})
 

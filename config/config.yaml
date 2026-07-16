@@ -20,9 +20,22 @@ watched_processes:
     - "AmazonChime.exe"
   browser_tab_keywords:
     # Matched against browser window/tab titles when a browser process
-    # (chrome.exe, msedge.exe, firefox.exe) is running.
-    - "Meet - "
-    - "meet.google.com"
+    # (chrome.exe, msedge.exe, firefox.exe) is running. This is inherently
+    # a weaker signal than a desktop app process (see
+    # browser_start_debounce_polls below) -- e.g. Meet's pre-join lobby/
+    # camera-check screen matches the same way an actual call does, since
+    # it shows the same title before you've actually joined.
+    #
+    # Google Meet's real tab title is "Meet – <code> - Google Chrome" using
+    # an EN DASH (–, U+2013), not a plain hyphen -- verified against a live
+    # call. A plain-hyphen "Meet - " keyword is deliberately NOT included:
+    # every Chrome/Edge tab title ends with " - Google Chrome"/" - <profile>
+    # - Microsoft Edge", so "Meet - " would coincidentally match the bare
+    # "Google Meet" homepage tab too ("Google Meet - Google Chrome"),
+    # bringing back the over-detection this was meant to fix. If detection
+    # ever misses a real call, use the dashboard's "Start recording" button
+    # as a manual fallback rather than widening this keyword.
+    - "Meet – "
     - "Zoom Meeting"
     - "webex.com"
     - "chime.aws"
@@ -37,8 +50,40 @@ poll_interval_seconds: 5
 
 # Require the meeting window/process to be present for this many consecutive
 # polls before starting recording, to avoid false triggers from a window
-# flashing open briefly.
+# flashing open briefly. Only applies to desktop-app detection (Zoom.exe
+# etc.) -- see browser_start_debounce_polls for browser tabs.
 start_debounce_polls: 2
+
+# Same idea, but for browser-tab-title matches specifically, which are a
+# much weaker signal than a real app process being open (a Meet tab sitting
+# on the pre-join lobby screen matches the exact same way an actual call
+# does -- see the comment on browser_tab_keywords above). Deliberately
+# higher than start_debounce_polls so a brief glance at a meeting tab
+# before deciding not to join doesn't trigger a consent prompt. Default
+# 6 * 5s = 30s.
+browser_start_debounce_polls: 6
+
+# Require the meeting window/process to be ABSENT for this many consecutive
+# polls before stopping an in-progress recording. Deliberately much higher
+# than start_debounce_polls: browser-tab-title detection can flicker
+# mid-call (a title that stops matching for one poll shouldn't end the
+# recording), and a false early stop loses part of the interview, while a
+# late stop just costs a few extra seconds of audio. Default 12 * 5s = 60s.
+stop_debounce_polls: 12
+
+# After a recording ends (call closed, or manually stopped), don't re-prompt
+# for the same app for this many seconds -- a just-ended call's window/tab
+# can briefly linger and keep matching the detection keywords (e.g. a Meet
+# tab still open on the post-call screen) even though the call is over.
+post_call_cooldown_seconds: 30
+
+# After declining to record ("No" on the consent prompt), don't ask again
+# for the same still-detected app for this many seconds. This is a safety
+# net, not just a convenience: browser-tab detection can occasionally keep
+# matching well past when you've actually left the call (see
+# browser_tab_keywords above), which would otherwise mean never being
+# prompted again for a genuinely new call without restarting the app.
+declined_cooldown_seconds: 300
 
 # --- Recording ---
 audio:
@@ -47,6 +92,14 @@ audio:
   bitrate_kbps: 64
   format: "opus"            # small, good speech quality; falls back to mp3
   raw_dir: "data/audio"
+  # System-audio (loopback) capture alone only gets what you HEAR --
+  # the interviewer's side. This mixes in your own microphone too, so your
+  # answers are actually in the transcript. If Windows blocks microphone
+  # access for desktop apps, recording falls back to system audio only
+  # (logged as a warning) rather than failing -- see
+  # Settings > Privacy & security > Microphone > "Let desktop apps access
+  # your microphone".
+  include_microphone: true
 
 # --- Transcription ---
 transcription:
@@ -54,6 +107,23 @@ transcription:
   whisper_model: "small"    # tiny|base|small|medium|large-v3 (bigger = slower, more accurate)
   device: "cpu"             # set to "cuda" if you have a supported GPU
   diarization: true          # separate speakers (you vs interviewer)
+  # Voice-activity-detection pre-filter. Without this, Whisper decodes fixed
+  # ~30s windows regardless of content -- a real bug found in testing: a
+  # quiet utterance right after a long pause (e.g. waiting for participants
+  # to join) landed inside a mostly-silent window and its speech was
+  # silently dropped from the transcript. vad_filter segments on actual
+  # speech first, which fixed that exact case. Leave this on unless you
+  # have a specific reason to disable it.
+  vad_filter: true
+  # Whisper supports ~99 languages (see docs/language_support.md for the
+  # constraints/notes on accuracy per language and on code-switching).
+  #   "auto"      - detect automatically per recording (default)
+  #   "en"        - force English
+  #   "hi"        - force Hindi (Devanagari script output)
+  #   "hinglish"  - Hindi audio with code-switched English, romanized to
+  #                 Latin script where possible (needs the optional
+  #                 indic-transliteration package -- see docs/language_support.md)
+  language: "auto"
 
 # --- Analysis ---
 # "engine" selects which AnalysisEngine to use (see src/interview_analyzer/engines.py).

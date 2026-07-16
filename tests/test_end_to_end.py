@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import datetime as dt
 import json
+import time
 from unittest.mock import patch
 
 from interview_analyzer.config_loader import Config
@@ -20,11 +21,25 @@ from interview_analyzer.db import InterviewDB
 from interview_analyzer.watcher import MeetingWatcher
 
 
+def _wait_until(predicate, timeout=5.0):
+    """Background processing now runs on its own thread (see watcher.py's
+    _process_in_background), so tests must wait for a job to actually
+    finish -- while any mocks it depends on are still active -- rather
+    than asserting immediately after the tick that kicked it off returns."""
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if predicate():
+            return True
+        time.sleep(0.01)
+    return False
+
+
 def _test_config(tmp_path) -> Config:
     return Config(raw={
         "retention_days": 3,
         "poll_interval_seconds": 0.01,
         "start_debounce_polls": 1,
+        "stop_debounce_polls": 1,
         "watched_processes": {
             "desktop_apps": ["Zoom.exe"],
             "browser_tab_keywords": [],
@@ -74,7 +89,7 @@ def test_full_pipeline_end_to_end_with_consent_granted(tmp_path):
 
     # simulate: a fake WAV exists once "recording" stops, consent is granted,
     # transcription/analysis are mocked at their external boundaries only
-    with patch("interview_analyzer.watcher.detect_active_meeting", side_effect=["Zoom", None]), \
+    with patch("interview_analyzer.watcher.detect_active_meeting", side_effect=[("Zoom", True), None]), \
          patch("interview_analyzer.watcher.ask_consent", return_value=True), \
          patch("interview_analyzer.watcher.SystemAudioRecorder") as MockRecorder, \
          patch("interview_analyzer.watcher.RecordingControlPanel") as MockPanel, \
@@ -97,9 +112,13 @@ def test_full_pipeline_end_to_end_with_consent_granted(tmp_path):
         interview_id = watcher._current_interview_id
         MockPanel.assert_called_once()  # pause/resume/stop control shown while recording
 
-        # tick 2: meeting gone -> stop, transcribe, analyze, report, cleanup-eligible
+        # tick 2: meeting gone -> stop, hand off to a background thread for
+        # transcribe/analyze/report/cleanup-eligible
         watcher._tick()
         MockPanel.return_value.close.assert_called_once()  # control panel torn down with the recording
+
+        assert _wait_until(lambda: not watcher.status["processing_jobs"]), \
+            "background processing never finished"
 
     # --- assertions on end state ---
     record = watcher.db.get(interview_id)
@@ -126,7 +145,7 @@ def test_full_pipeline_consent_declined_skips_recording(tmp_path):
     cfg = _test_config(tmp_path)
     watcher = MeetingWatcher(cfg, user_id=1)
 
-    with patch("interview_analyzer.watcher.detect_active_meeting", return_value="Zoom"), \
+    with patch("interview_analyzer.watcher.detect_active_meeting", return_value=("Zoom", True)), \
          patch("interview_analyzer.watcher.ask_consent", return_value=False) as mock_consent, \
          patch("interview_analyzer.watcher.SystemAudioRecorder") as MockRecorder:
 
@@ -147,7 +166,7 @@ def test_manual_stop_via_control_panel_ends_call_early_and_runs_pipeline(tmp_pat
     cfg = _test_config(tmp_path)
     watcher = MeetingWatcher(cfg, user_id=1)
 
-    with patch("interview_analyzer.watcher.detect_active_meeting", return_value="Zoom"), \
+    with patch("interview_analyzer.watcher.detect_active_meeting", return_value=("Zoom", True)), \
          patch("interview_analyzer.watcher.ask_consent", return_value=True), \
          patch("interview_analyzer.watcher.SystemAudioRecorder") as MockRecorder, \
          patch("interview_analyzer.watcher.RecordingControlPanel") as MockPanel, \
@@ -186,6 +205,9 @@ def test_manual_stop_via_control_panel_ends_call_early_and_runs_pipeline(tmp_pat
         # immediately, even though the meeting app is still detected
         watcher._tick()
         MockPanel.return_value.close.assert_called_once()
+
+        assert _wait_until(lambda: not watcher.status["processing_jobs"]), \
+            "background processing never finished"
 
     assert watcher._current_interview_id is None
     record = watcher.db.get(interview_id)

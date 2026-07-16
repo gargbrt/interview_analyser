@@ -12,7 +12,24 @@ import datetime as dt
 import pathlib
 
 from .config_loader import Config
+from .confidence import format_confidence
 from .db import InterviewRecord
+
+
+def _stringify(value) -> str:
+    """LLM output doesn't always exactly match the requested JSON schema --
+    smaller/local models in particular sometimes return a richer object
+    (e.g. {"issue": "...", "detail": "..."}) where a plain string was
+    asked for. Coerce defensively into a hashable, displayable string
+    instead of crashing report/trend generation on an unexpected shape."""
+    if isinstance(value, str):
+        return value
+    if isinstance(value, dict):
+        for key in ("issue", "strength", "text", "description", "summary", "name"):
+            if isinstance(value.get(key), str):
+                return value[key]
+        return ", ".join(str(v) for v in value.values()) if value else str(value)
+    return str(value)
 
 
 def write_interview_report(record: InterviewRecord, cfg: Config) -> pathlib.Path:
@@ -47,14 +64,24 @@ def write_interview_report(record: InterviewRecord, cfg: Config) -> pathlib.Path
         report_path.write_text("\n".join(lines), encoding="utf-8")
         return report_path
 
+    if analysis.get("no_speech_detected"):
+        lines += [
+            "> No speech was detected in this recording — it may have captured "
+            "silence or background noise only. There's nothing to analyze.",
+        ]
+        report_path.write_text("\n".join(lines), encoding="utf-8")
+        return report_path
+
     lines += ["## Session Summary", ""]
+    lines.append(f"**Confidence in this assessment:** {format_confidence(analysis.get('confidence_info'))}")
+    lines.append("")
     if summary.get("top_strengths"):
         lines.append("**Top strengths:**")
-        lines += [f"- {s}" for s in summary["top_strengths"]]
+        lines += [f"- {_stringify(s)}" for s in summary["top_strengths"]]
         lines.append("")
     if summary.get("top_issues"):
         lines.append("**Top issues:**")
-        lines += [f"- {s}" for s in summary["top_issues"]]
+        lines += [f"- {_stringify(s)}" for s in summary["top_issues"]]
         lines.append("")
     if summary.get("one_thing_to_practice_next"):
         lines.append(f"**Focus for next practice:** {summary['one_thing_to_practice_next']}")
@@ -68,7 +95,13 @@ def write_interview_report(record: InterviewRecord, cfg: Config) -> pathlib.Path
         if issues:
             lines.append("**Issues:**")
             for issue in issues:
-                lines.append(f"- _{issue.get('category', '')}_: {issue.get('detail', '')}")
+                if isinstance(issue, dict):
+                    lines.append(f"- _{issue.get('category', '')}_: {issue.get('detail', '')}")
+                    excerpt = issue.get("excerpt")
+                    if excerpt:
+                        lines.append(f'> "{excerpt}"')
+                else:
+                    lines.append(f"- {_stringify(issue)}")
         if qa.get("suggested_improvement"):
             lines.append(f"**Suggested improvement:** {qa['suggested_improvement']}")
         lines.append("")
@@ -88,17 +121,18 @@ def write_trends_report(records: list[InterviewRecord], cfg: Config) -> pathlib.
 
     for record in records:
         analysis = record.analysis
-        if not analysis or analysis.get("parse_error"):
+        if not analysis or analysis.get("parse_error") or analysis.get("no_speech_detected"):
             continue
         analyzed_count += 1
         summary = analysis.get("session_summary", {})
         for issue in summary.get("top_issues", []):
-            issue_counter[issue] += 1
+            issue_counter[_stringify(issue)] += 1
         for strength in summary.get("top_strengths", []):
-            strength_counter[strength] += 1
+            strength_counter[_stringify(strength)] += 1
         for qa in analysis.get("qa_pairs", []):
             for issue in qa.get("issues", []):
-                issue_counter[issue.get("category", "unspecified")] += 1
+                category = issue.get("category", "unspecified") if isinstance(issue, dict) else _stringify(issue)
+                issue_counter[category] += 1
 
     lines = [
         "# Recurring Issues Across Interviews",

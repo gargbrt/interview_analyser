@@ -7,6 +7,7 @@ pystray>=0.19.5            # system tray icon
 Pillow>=10.0                # tray icon image generation
 faster-whisper>=1.0.0
 pyannote.audio>=3.1        # diarization (optional; needs a free HF token to download models)
+indic-transliteration>=2.3  # romanizes Devanagari for the optional "hinglish" language pack
 requests>=2.31
 numpy>=1.26
 soundfile>=0.12

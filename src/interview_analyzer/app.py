@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import argparse
 import logging
+import sys
 import threading
 
 from .auth import create_user, get_user_by_username
@@ -23,6 +24,8 @@ from .config_loader import load_config
 from .dashboard import Dashboard
 from .db import InterviewDB
 from .login_dialog import gui_login_or_create
+from .model_setup import maybe_run_first_time_setup
+from .single_instance import acquire_single_instance_lock
 from .tray import TrayIcon
 from .watcher import MeetingWatcher
 
@@ -37,6 +40,16 @@ def main() -> None:
     args = parser.parse_args()
 
     cfg = load_config()
+
+    lock_path = cfg.resolve(cfg.storage.get("db_path", "data/interviews.db")).with_name(".app.lock")
+    if not acquire_single_instance_lock(lock_path):
+        logger.error(
+            "Interview Analyzer is already running (lock held at %s). "
+            "Use the existing tray icon instead of starting a second copy.",
+            lock_path,
+        )
+        sys.exit(1)
+
     db = InterviewDB(cfg.resolve(cfg.storage.get("db_path", "data/interviews.db")))
 
     if args.username:
@@ -56,10 +69,26 @@ def main() -> None:
     tray = TrayIcon(watcher, open_dashboard=dashboard.open, on_quit=watcher.shutdown)
     watcher.set_on_state_change(lambda: (tray.refresh(), dashboard.notify_state_change()))
 
+    # Open the dashboard (its Tk root becomes the one shared UI thread that
+    # consent/control-panel popups build Toplevels on -- see consent.py's
+    # docstring) and wait for it before the watcher starts polling, so
+    # there's no window where a popup might spin up its own competing Tk()
+    # interpreter concurrently with the dashboard's.
+    dashboard.open()
+    if not dashboard.wait_until_ready(timeout=10):
+        logger.warning(
+            "Dashboard did not open in time; consent/control-panel popups will run as standalone windows."
+        )
+
+    # One-time (per install) prompt to install the local analysis model or
+    # skip it for a cloud API instead -- before the watcher starts polling,
+    # same reasoning as the dashboard-readiness wait above: no popup should
+    # spin up a competing Tk() interpreter concurrently with the dashboard's.
+    maybe_run_first_time_setup(cfg, ui_root=watcher.ui_root)
+
     watcher_thread = threading.Thread(target=watcher.run_forever, daemon=True)
     watcher_thread.start()
 
-    dashboard.open()  # so first run isn't just an invisible tray icon
     tray.run()  # blocking; runs on the main thread
 
 

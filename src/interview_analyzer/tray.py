@@ -18,26 +18,72 @@ except ImportError:  # pragma: no cover
     Image = None
     ImageDraw = None
 
-# state -> (fill color, tooltip label)
-_STATE_STYLE = {
-    "idle": ("#8a8f8a", "Idle — watching for calls"),
-    "recording": ("#c0392b", "Recording"),
-    "paused": ("#c8892c", "Paused"),
+# state -> fill color
+_STATE_COLOR = {
+    "idle": "#8a8f8a",
+    "recording": "#c0392b",
+    "paused": "#c8892c",
+    "processing": "#2f6fa8",
 }
+
+STAGE_LABEL = {
+    "compressing": "Compressing",
+    "transcribing": "Transcribing",
+    "analyzing": "Analyzing",
+    "generating_report": "Generating report",
+}
+
+
+def job_text(job: dict) -> str:
+    """Human-readable one-liner for a single processing_jobs entry, e.g.
+    'Transcribing… 42%'. Shared by the tray and the dashboard's History tab
+    (which shows this per-row for whichever interview is being processed)."""
+    stage = STAGE_LABEL.get(job.get("stage"), "Processing")
+    progress = job.get("progress")
+    if progress is not None:
+        return f"{stage}… {round(progress * 100)}%"
+    return f"{stage}…"
 
 
 def status_text(status: dict) -> str:
     """Human-readable one-liner for a watcher.status snapshot, shared by
-    the tray tooltip/menu label and (indirectly) the dashboard."""
+    the tray tooltip/menu label and the dashboard. Recording/paused and
+    background processing are independent now (a new call can be recording
+    while an earlier one is still being transcribed/analyzed), so both are
+    reflected together when both are happening."""
     state = status.get("state", "idle")
+    jobs = status.get("processing_jobs") or {}
+
     if state == "idle":
-        return "Idle — watching for calls"
-    app_name = status.get("app_name") or "call"
-    return f"{'Paused' if state == 'paused' else 'Recording'} — {app_name}"
+        base = "Idle — watching for calls"
+    else:
+        app_name = status.get("app_name") or "call"
+        base = f"{'Paused' if state == 'paused' else 'Recording'} — {app_name}"
+
+    if not jobs:
+        return base
+
+    if len(jobs) == 1:
+        job_summary = job_text(next(iter(jobs.values())))
+    else:
+        job_summary = f"{len(jobs)} interviews processing"
+
+    return job_summary if state == "idle" else f"{base} · {job_summary}"
+
+
+def _visual_state(status: dict) -> str:
+    """Which of idle/recording/paused/processing the icon should actually
+    look like -- recording/paused takes visual priority (it's the state
+    that needs attention), background processing shows only when nothing
+    is actively being recorded."""
+    state = status.get("state", "idle")
+    if state in ("recording", "paused"):
+        return state
+    return "processing" if status.get("processing_jobs") else "idle"
 
 
 def _make_icon_image(state: str):
-    color, _ = _STATE_STYLE.get(state, _STATE_STYLE["idle"])
+    color = _STATE_COLOR.get(state, _STATE_COLOR["idle"])
     size = 64
     img = Image.new("RGBA", (size, size), (0, 0, 0, 0))
     draw = ImageDraw.Draw(img)
@@ -50,6 +96,12 @@ def _make_icon_image(state: str):
         cy = size // 2
         draw.rectangle((22, cy - bar_h // 2, 22 + bar_w, cy + bar_h // 2), fill="white")
         draw.rectangle((size - 22 - bar_w, cy - bar_h // 2, size - 22, cy + bar_h // 2), fill="white")
+    elif state == "processing":
+        # three dots, like a "working on it" glyph
+        cy = size // 2
+        for dx in (-14, 0, 14):
+            cx = size // 2 + dx
+            draw.ellipse((cx - 4, cy - 4, cx + 4, cy + 4), fill="white")
     return img
 
 
@@ -88,19 +140,32 @@ class TrayIcon:
             pystray.MenuItem(lambda item: status_text(self.watcher.status), None, enabled=False),
             pystray.Menu.SEPARATOR,
             pystray.MenuItem(
+                "Start recording now (not detected?)",
+                lambda icon, item: self._start_manually(),
+                visible=lambda item: self.watcher.status.get("state") == "idle",
+            ),
+            pystray.MenuItem(
                 lambda item: "Resume recording" if self.watcher.status.get("state") == "paused" else "Pause recording",
                 self._toggle_pause,
-                visible=lambda item: self.watcher.status.get("state") != "idle",
+                visible=lambda item: self.watcher.status.get("state") in ("recording", "paused"),
             ),
             pystray.MenuItem(
                 "Stop recording",
                 lambda icon, item: self.watcher.request_stop_recording(),
-                visible=lambda item: self.watcher.status.get("state") != "idle",
+                visible=lambda item: self.watcher.status.get("state") in ("recording", "paused"),
             ),
             pystray.Menu.SEPARATOR,
             pystray.MenuItem("Open dashboard", lambda icon, item: self._open_dashboard(), default=True),
             pystray.MenuItem("Quit", lambda icon, item: self._quit()),
         )
+
+    def _start_manually(self) -> None:
+        # a fixed generic label -- the dashboard's Status tab has a text
+        # field if you want to name the app/platform yourself
+        try:
+            self.watcher.request_start_recording("Manual")
+        except RuntimeError:
+            pass  # already recording -- the menu item should be hidden then anyway
 
     def _toggle_pause(self, icon, item) -> None:
         if self.watcher.status.get("state") == "paused":
@@ -117,9 +182,8 @@ class TrayIcon:
         to call from any thread -- pass this as MeetingWatcher's
         `on_state_change` callback."""
         status = self.watcher.status
-        state = status.get("state", "idle")
         try:
-            self._icon.icon = _make_icon_image(state)
+            self._icon.icon = _make_icon_image(_visual_state(status))
             self._icon.title = status_text(status)
             self._icon.update_menu()
         except Exception:  # noqa: BLE001

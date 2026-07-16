@@ -47,12 +47,19 @@ analyzer.py    →  pluggable engine (local Ollama by default, free; or your
                    own Anthropic/OpenAI API key; or a custom engine you
                    register) scores each Q&A pair against a rubric:
                    structure, clarity, specificity, confidence, technical
-                   accuracy
+                   accuracy -- shows live "Analyzing… N%" progress, and
+                   asks the model for its own confidence + feeds in any
+                   calibration notes from your past feedback (see below)
+                       │
+                       ▼
+confidence.py  →  a confidence score for the assessment: your own
+                   feedback-based accuracy track record once you've rated
+                   enough reports, else the model's own self-reported figure
                        │
                        ▼
 db.py          →  SQLite, scoped to your local login profile: stores
                    transcript + analysis JSON permanently, stores audio
-                   file path + expiry date
+                   file path + expiry date, stores your feedback ratings
                        │
                        ▼
 cleanup.py     →  deletes audio files older than `retention_days` (default 3)
@@ -94,34 +101,37 @@ meeting app/tab has closed — you never have to remember to turn it off.
 
 - Windows 10/11
 - Python 3.10+
-- [Ollama](https://ollama.com) installed locally, with a small model pulled,
-  e.g. `ollama pull llama3.1:8b`
+- [Ollama](https://ollama.com) installed locally -- the app offers to pull
+  a model for you on first run (see "First run" below), so a manual
+  `ollama pull` beforehand is optional, not required
 - A WASAPI loopback-capable audio backend (handled via `pyaudiowpatch`,
   no extra driver install needed on Windows 10/11)
 
 No paid API keys are required for the default configuration. You can
 optionally swap the analyzer to use a hosted LLM API by editing
-`config/config.yaml` — see `docs/using_cloud_apis.md`.
+`config/config.yaml` (or the Settings tab) — see `docs/using_cloud_apis.md`.
 
 ---
 
 ## Setup
 
 ```bash
-git clone https://github.com/<you>/interview-analyzer
-cd interview-analyzer
+git clone https://github.com/gargbrt/interview_analyser.git
+cd interview_analyser
 python -m venv .venv
 .venv\Scripts\activate
 pip install -r requirements.txt
-
-# pull a local model for analysis (one-time, ~5GB)
-ollama pull llama3.1:8b
 ```
 
-Edit `config/config.yaml` to adjust:
+That's it — no model pull needed beforehand; the app walks you through that
+on first launch (next section). If you'd rather do it upfront anyway:
+`ollama pull llama3.1:8b` (~4.7GB).
+
+Edit `config/config.yaml` (or the dashboard's Settings tab, once running) to adjust:
 - `retention_days` — how long raw audio is kept before auto-deletion (default: 3)
 - `watched_processes` — which apps/browser tabs trigger recording
 - `whisper_model` — transcription model size (`tiny`/`base`/`small`/`medium`)
+- `transcription.language` — `auto`/`en`/`hi`/`hinglish` (see `docs/language_support.md`)
 - `llm_model` — which local Ollama model to use for analysis
 - `output_dir` — where markdown reports are written
 
@@ -132,19 +142,65 @@ python -m interview_analyzer.app
 ```
 
 This is the normal way to run it: a **system tray icon** plus a **dashboard
-window**, both described below. On first run it shows a small login dialog
-to create/select your local profile (just a name, password optional). Use
-`--username yourname` to skip the dialog.
+window**, both described below.
+
+1. **Login dialog** — create/select your local profile (just a name,
+   password optional). Use `--username yourname` to skip it.
+2. **Dashboard** opens automatically.
+3. **First run only**: an **analysis model setup** dialog, if the
+   configured local model (`llama3.1:8b` by default) isn't already
+   installed — pick a model (each shows its approximate download size),
+   install it locally with a live progress bar, or skip and configure a
+   cloud API key instead (`docs/using_cloud_apis.md`). This is a one-time
+   prompt — see "Analysis model setup" below for what happens after.
 
 Leave it running in the background — it does nothing until it detects a
 meeting app, at which point it **asks you** whether to record (see
 `docs/consent.md`). Only on "Yes" does it record, analyze, and report, fully
 automatically from there. No manual step is required per interview beyond
-that one Yes/No.
+that one Yes/No. If automatic detection ever misses a real call, the Status
+tab (and the tray menu) has a manual **"Start recording"** fallback that
+skips straight to recording — clicking it is treated as your consent.
 
 Reports land in `output_dir/reports/<date>_<app>.md`. A continuously updated
 `output_dir/trends.md` tracks recurring issues across all interviews for
-your profile — both are also browsable right in the dashboard.
+your profile — both are also browsable right in the dashboard. The Status
+tab also has an **"Open recordings folder"** button that opens the raw
+audio folder directly in Explorer.
+
+### Analysis model setup
+
+The local Ollama model is a multi-gigabyte download, so the app always asks
+before pulling one — both the first time (above) and any later time you
+change it:
+
+- **Settings tab → Model name**: pick from a dropdown of curated models
+  (each with its approximate size and a one-line tradeoff description --
+  e.g. `llama3.1:8b` ~4.7GB fast/default, `qwen2.5:14b` ~9GB better
+  reasoning, `llama3.2:3b` ~2GB fastest/lower quality) or type any other
+  Ollama model name. **Install model...** downloads whatever's currently
+  typed/selected, always confirming the size first. Saving Settings with a
+  model that isn't installed yet also prompts before it would let analysis
+  fail silently.
+- Nothing is ever downloaded without an explicit "yes" click.
+
+### Feedback & confidence scoring
+
+Every report has a **Feedback** panel (History tab → select an interview)
+to rate whether the transcription and analysis were accurate, with an
+optional comment. This calibrates a **confidence score** shown on every
+report going forward (your own accuracy track record once you've rated a
+few, the model's own self-reported confidence before that) and feeds
+corrective notes from negative feedback back into future analysis prompts.
+See `docs/feedback_and_confidence.md` for details.
+
+### Language packs
+
+`transcription.language` (Settings tab, or `config.yaml`) supports
+`auto`/`en`/`hi`/`hinglish`. The Hindi/Hinglish romanization pack is
+optional and installable/uninstallable any time from Settings → Language
+packs (or `pip install/uninstall indic-transliteration` by hand). See
+`docs/language_support.md` for Whisper's language coverage and constraints.
 
 ### The tray icon
 
@@ -165,16 +221,21 @@ Opens automatically on first launch, and any time from the tray icon. Four
 tabs:
 
 - **Status** — current state and the same Pause/Resume/Stop controls as the
-  tray menu and the in-call control panel.
+  tray menu and the in-call control panel, a manual "Start recording"
+  fallback, and an "Open recordings folder" button.
 - **History** — every past interview (date, app, top issue); select one to
   read its full report right there, nicely formatted, no need to dig
-  through the `output/reports/` folder.
+  through the `output/reports/` folder. Below the report: a **Feedback**
+  panel (see "Feedback & confidence scoring" above) and the report's
+  confidence score.
 - **Trends** — the recurring-issues report across all your interviews.
 - **Settings** — edit the most common `config.yaml` options (retention
-  days, poll interval, Whisper model, diarization, analysis engine/model,
-  reports folder) from a form instead of a text editor. Saving preserves
-  every comment in `config.yaml`; a restart picks up the new values. Less
-  common settings (like the watched-app list) still need a text editor.
+  days, poll interval, Whisper model, language, diarization, analysis
+  engine/model, reports folder) from a form instead of a text editor, plus
+  **Install model...** (with a curated model-size catalog) and
+  **Language packs** install/uninstall. Saving preserves every comment in
+  `config.yaml`; a restart picks up the new values. Less common settings
+  (like the watched-app list) still need a text editor.
 
 ### Headless mode (no GUI)
 
@@ -197,32 +258,38 @@ src/interview_analyzer/
   tray.py                       - system tray icon (status, pause/resume/stop, quit)
   dashboard.py                   - dashboard window (status/history/trends/settings tabs)
   login_dialog.py                 - GUI login dialog (app.py's counterpart to auth.py's console prompt)
-  settings_editor.py                - comment-preserving config.yaml edits for the Settings tab
-  report_view.py                      - renders report/trend markdown into the dashboard's Text widgets
-  consent.py                            - pop-up permission prompt before recording
-  auth.py                                 - local login/profile system
-  recorder.py                              - system-audio loopback recording (with pause/resume)
-  control_panel.py                          - Pause/Resume/Stop control shown during recording
-  compress.py                                - shrinks WAV to small opus/mp3
-  transcriber.py                              - faster-whisper transcription + diarization
-  engines.py                                   - pluggable AnalysisEngine base + registry
-  analyzer.py                                   - built-in engines (ollama/anthropic/openai) + rubric runner
-  rubric.py                                      - the evaluation rubric/prompts (editable)
-  db.py                                           - SQLite storage layer (per-user scoped, thread-safe)
-  cleanup.py                                       - retention/auto-delete of audio
-  report.py                                         - per-interview + trend markdown reports
-  config_loader.py                                   - loads config.yaml
-tests/                        - automated test suite (43 tests; see "Testing" below)
+  single_instance.py                - prevents two copies of the app running at once
+  settings_editor.py                  - comment-preserving config.yaml edits for the Settings tab
+  model_setup.py                        - first-run + on-demand local model install (size-confirmed downloads)
+  language_packs.py                       - optional per-language transcription packs, install/uninstall any time
+  report_view.py                            - renders report/trend markdown into the dashboard's Text widgets
+  consent.py                                  - pop-up permission prompt before recording
+  auth.py                                       - local login/profile system
+  recorder.py                                     - system-audio loopback recording (with pause/resume)
+  control_panel.py                                  - Pause/Resume/Stop control shown during recording
+  compress.py                                         - shrinks WAV to small opus/mp3
+  transcriber.py                                        - faster-whisper transcription + diarization + language packs
+  engines.py                                              - pluggable AnalysisEngine base + registry
+  analyzer.py                                               - built-in engines (ollama/anthropic/openai) + rubric runner
+  rubric.py                                                   - the evaluation rubric/prompts (editable)
+  confidence.py                                                 - confidence scoring + feedback-based calibration notes
+  db.py                                                           - SQLite storage layer (per-user scoped, thread-safe)
+  cleanup.py                                                        - retention/auto-delete of audio
+  report.py                                                           - per-interview + trend markdown reports
+  config_loader.py                                                      - loads config.yaml
+tests/                        - automated test suite (180+ tests; see "Testing" below)
 ```
 
 ## Testing
 
-The suite covers auth/login, the DB layer (including retention expiry and
-per-user scoping), cleanup, the pluggable analyzer/engine registry, report
-generation, recorder pause/resume/stop behavior, watcher status/notify
-wiring, the comment-preserving settings editor, and a full mocked
-end-to-end pipeline run (consent → record → pause/resume/manual-stop →
-transcribe → analyze → report → trend update → cleanup).
+The suite covers auth/login, the DB layer (including retention expiry,
+per-user scoping, and feedback storage), cleanup, the pluggable
+analyzer/engine registry, confidence scoring/calibration, report generation,
+recorder pause/resume/stop behavior, watcher status/notify wiring, meeting
+detection, the comment-preserving settings editor, model/language-pack
+install logic, and a full mocked end-to-end pipeline run (consent → record
+→ pause/resume/manual-stop → transcribe → analyze → report → trend update →
+cleanup).
 
 The tray icon and dashboard window are also manually verified end-to-end on
 a real Windows session (not just unit-tested): constructing and running the

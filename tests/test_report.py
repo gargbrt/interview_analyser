@@ -59,6 +59,182 @@ def test_write_interview_report_creates_file_with_expected_sections(tmp_path):
     assert "Research 3 company-specific talking points" in content
 
 
+def test_write_interview_report_includes_excerpt_quote_when_present(tmp_path):
+    cfg = _config(tmp_path)
+    analysis = {
+        "qa_pairs": [{
+            "question": "Tell me about a conflict.",
+            "answer_summary": "Rambled without a clear resolution.",
+            "issues": [{
+                "category": "clarity",
+                "detail": "Rambling, no clear resolution stated.",
+                "excerpt": "so, um, there was this one time, it was kind of a whole thing",
+            }],
+            "suggested_improvement": "State the resolution directly.",
+        }],
+        "session_summary": {"top_strengths": [], "top_issues": [], "one_thing_to_practice_next": ""},
+    }
+    record = _record(3, "Zoom", analysis)
+
+    report_path = write_interview_report(record, cfg)
+    content = report_path.read_text(encoding="utf-8")
+
+    assert '> "so, um, there was this one time, it was kind of a whole thing"' in content
+
+
+def test_write_interview_report_omits_excerpt_line_when_absent(tmp_path):
+    cfg = _config(tmp_path)
+    analysis = {
+        "qa_pairs": [{
+            "question": "Tell me about a conflict.",
+            "answer_summary": "No answer given.",
+            "issues": [{"category": "specificity", "detail": "No concrete outcome given."}],
+            "suggested_improvement": "Add a measurable result.",
+        }],
+        "session_summary": {"top_strengths": [], "top_issues": [], "one_thing_to_practice_next": ""},
+    }
+    record = _record(4, "Zoom", analysis)
+
+    report_path = write_interview_report(record, cfg)
+    content = report_path.read_text(encoding="utf-8")
+
+    assert ">" not in content
+
+
+def test_write_interview_report_handles_no_speech_detected(tmp_path):
+    cfg = _config(tmp_path)
+    record = _record(5, "Zoom", {"no_speech_detected": True})
+
+    report_path = write_interview_report(record, cfg)
+    content = report_path.read_text(encoding="utf-8")
+
+    assert "No speech was detected" in content
+
+
+def test_write_interview_report_shows_feedback_calibrated_confidence(tmp_path):
+    cfg = _config(tmp_path)
+    analysis = {
+        "qa_pairs": [],
+        "session_summary": {"top_strengths": [], "top_issues": [], "one_thing_to_practice_next": ""},
+        "confidence_info": {"score": 82, "source": "feedback", "sample_size": 12},
+    }
+    record = _record(6, "Zoom", analysis)
+
+    content = write_interview_report(record, cfg).read_text(encoding="utf-8")
+
+    assert "Confidence in this assessment:" in content
+    assert "82%" in content
+    assert "12" in content
+
+
+def test_write_interview_report_shows_model_reported_confidence(tmp_path):
+    cfg = _config(tmp_path)
+    analysis = {
+        "qa_pairs": [],
+        "session_summary": {"top_strengths": [], "top_issues": [], "one_thing_to_practice_next": ""},
+        "confidence_info": {"score": 65, "source": "model", "sample_size": 0},
+    }
+    record = _record(7, "Zoom", analysis)
+
+    content = write_interview_report(record, cfg).read_text(encoding="utf-8")
+
+    assert "65%" in content
+    assert "self-assessment" in content
+
+
+def test_write_interview_report_handles_missing_confidence_info(tmp_path):
+    """Older analyses recorded before this feature existed have no
+    confidence_info at all -- must render gracefully, not crash."""
+    cfg = _config(tmp_path)
+    analysis = {
+        "qa_pairs": [],
+        "session_summary": {"top_strengths": [], "top_issues": [], "one_thing_to_practice_next": ""},
+    }
+    record = _record(8, "Zoom", analysis)
+
+    content = write_interview_report(record, cfg).read_text(encoding="utf-8")
+
+    assert "not available" in content
+
+
+def test_write_trends_report_excludes_no_speech_detected_interviews(tmp_path):
+    cfg = _config(tmp_path)
+    records = [
+        _record(1, "Zoom", {"no_speech_detected": True}),
+        _record(2, "Teams", {
+            "qa_pairs": [], "session_summary": {"top_strengths": [], "top_issues": ["Rambling"],
+                                                  "one_thing_to_practice_next": ""},
+        }),
+    ]
+
+    trends_path = write_trends_report(records, cfg)
+    content = trends_path.read_text(encoding="utf-8")
+
+    assert "based on 1 analyzed interview(s)" in content
+    assert "Rambling" in content
+
+
+def test_write_trends_report_handles_top_issues_returned_as_dicts_not_strings(tmp_path):
+    """Reproduces a real crash: a local LLM (llama3.1:8b) returned
+    top_issues as a list of dicts instead of the requested plain strings,
+    and using one directly as a Counter key raised
+    `TypeError: unhashable type: 'dict'`, taking down trend aggregation
+    for an otherwise-successfully-processed interview."""
+    cfg = _config(tmp_path)
+    records = [_record(1, "Zoom", {
+        "qa_pairs": [],
+        "session_summary": {
+            "top_strengths": [{"strength": "Clear communication"}],
+            "top_issues": [{"issue": "Rambling answers", "detail": "..."}],
+            "one_thing_to_practice_next": "",
+        },
+    })]
+
+    trends_path = write_trends_report(records, cfg)  # must not raise
+    content = trends_path.read_text(encoding="utf-8")
+
+    assert "Rambling answers" in content
+    assert "Clear communication" in content
+
+
+def test_write_interview_report_handles_top_issues_returned_as_dicts_not_strings(tmp_path):
+    cfg = _config(tmp_path)
+    record = _record(3, "Zoom", {
+        "qa_pairs": [],
+        "session_summary": {
+            "top_strengths": [{"strength": "Clear communication"}],
+            "top_issues": [{"issue": "Rambling answers"}],
+            "one_thing_to_practice_next": "",
+        },
+    })
+
+    report_path = write_interview_report(record, cfg)  # must not raise
+    content = report_path.read_text(encoding="utf-8")
+
+    assert "Rambling answers" in content
+    assert "Clear communication" in content
+
+
+def test_write_interview_report_handles_a_qa_issue_returned_as_a_plain_string(tmp_path):
+    """Same class of schema drift, but at the per-question issue level
+    (a plain string instead of the requested {"category", "detail"} dict)."""
+    cfg = _config(tmp_path)
+    record = _record(4, "Zoom", {
+        "qa_pairs": [{
+            "question": "Tell me about yourself.",
+            "answer_summary": "Rambled a bit.",
+            "issues": ["Too long-winded"],
+            "suggested_improvement": "",
+        }],
+        "session_summary": {"top_strengths": [], "top_issues": [], "one_thing_to_practice_next": ""},
+    })
+
+    report_path = write_interview_report(record, cfg)  # must not raise
+    content = report_path.read_text(encoding="utf-8")
+
+    assert "Too long-winded" in content
+
+
 def test_write_interview_report_handles_parse_error(tmp_path):
     cfg = _config(tmp_path)
     record = _record(2, "Teams", {"raw": "garbled output", "parse_error": True})

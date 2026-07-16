@@ -29,6 +29,21 @@ CREATE TABLE IF NOT EXISTS interviews (
     report_path TEXT,
     FOREIGN KEY (user_id) REFERENCES users(id)
 );
+
+-- One row per interview: the user's own judgment of whether the
+-- transcription/analysis for that interview was accurate. Used to
+-- calibrate the confidence score shown on later interviews' reports (see
+-- confidence.py) and to feed corrective notes back into future analysis
+-- prompts -- see analyzer.py/rubric.py's calibration_notes.
+CREATE TABLE IF NOT EXISTS feedback (
+    interview_id INTEGER PRIMARY KEY,
+    user_id INTEGER,
+    transcript_correct INTEGER,  -- 1/0/NULL (NULL = not rated)
+    analysis_correct INTEGER,    -- 1/0/NULL
+    comment TEXT,
+    created_at TEXT NOT NULL,
+    FOREIGN KEY (interview_id) REFERENCES interviews(id)
+);
 """
 
 
@@ -51,6 +66,16 @@ class InterviewRecord:
         return json.loads(self.analysis_json) if self.analysis_json else None
 
 
+@dataclass
+class FeedbackRecord:
+    interview_id: int
+    user_id: Optional[int]
+    transcript_correct: Optional[bool]
+    analysis_correct: Optional[bool]
+    comment: Optional[str]
+    created_at: str
+
+
 class InterviewDB:
     """A watcher, its tray icon, and its dashboard all share one InterviewDB
     from different threads (the watcher's background loop, the dashboard's
@@ -68,7 +93,7 @@ class InterviewDB:
         self._conn.row_factory = sqlite3.Row
         self._lock = threading.Lock()
         ensure_users_table(self._conn)  # users table must exist before interviews FK is used
-        self._conn.execute(SCHEMA)
+        self._conn.executescript(SCHEMA)
         self._conn.commit()
 
     def start_interview(
@@ -129,6 +154,17 @@ class InterviewDB:
             )
             self._conn.commit()
 
+    def delete_interview(self, interview_id: int) -> None:
+        """Removes the DB row entirely -- used by the dashboard's Delete
+        action for interviews the user wants to clear out (e.g. ones with
+        no audio and no report, from a crash or an accidental recording).
+        Does not touch any files on disk; callers decide whether to also
+        remove the audio/report files first."""
+        with self._lock:
+            self._conn.execute("DELETE FROM feedback WHERE interview_id = ?", (interview_id,))
+            self._conn.execute("DELETE FROM interviews WHERE id = ?", (interview_id,))
+            self._conn.commit()
+
     def get(self, interview_id: int) -> Optional[InterviewRecord]:
         with self._lock:
             row = self._conn.execute(
@@ -155,6 +191,68 @@ class InterviewDB:
                 (now,),
             ).fetchall()
             return [self._row_to_record(r) for r in rows]
+
+    def save_feedback(
+        self,
+        interview_id: int,
+        user_id: Optional[int],
+        transcript_correct: Optional[bool],
+        analysis_correct: Optional[bool],
+        comment: str = "",
+    ) -> None:
+        """Upserts the single feedback row for this interview -- resubmitting
+        (e.g. changing your mind, or adding a comment later) replaces the
+        previous rating rather than accumulating duplicates."""
+        with self._lock:
+            self._conn.execute(
+                """
+                INSERT INTO feedback (interview_id, user_id, transcript_correct, analysis_correct, comment, created_at)
+                VALUES (?, ?, ?, ?, ?, ?)
+                ON CONFLICT(interview_id) DO UPDATE SET
+                    user_id = excluded.user_id,
+                    transcript_correct = excluded.transcript_correct,
+                    analysis_correct = excluded.analysis_correct,
+                    comment = excluded.comment,
+                    created_at = excluded.created_at
+                """,
+                (
+                    interview_id,
+                    user_id,
+                    None if transcript_correct is None else int(transcript_correct),
+                    None if analysis_correct is None else int(analysis_correct),
+                    comment,
+                    dt.datetime.now().isoformat(),
+                ),
+            )
+            self._conn.commit()
+
+    def get_feedback(self, interview_id: int) -> Optional[FeedbackRecord]:
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT * FROM feedback WHERE interview_id = ?", (interview_id,)
+            ).fetchone()
+            return self._row_to_feedback(row) if row else None
+
+    def list_feedback(self, user_id: Optional[int] = None) -> list[FeedbackRecord]:
+        with self._lock:
+            if user_id is not None:
+                rows = self._conn.execute(
+                    "SELECT * FROM feedback WHERE user_id = ? ORDER BY created_at ASC", (user_id,)
+                ).fetchall()
+            else:
+                rows = self._conn.execute("SELECT * FROM feedback ORDER BY created_at ASC").fetchall()
+            return [self._row_to_feedback(r) for r in rows]
+
+    @staticmethod
+    def _row_to_feedback(row: sqlite3.Row) -> FeedbackRecord:
+        return FeedbackRecord(
+            interview_id=row["interview_id"],
+            user_id=row["user_id"],
+            transcript_correct=None if row["transcript_correct"] is None else bool(row["transcript_correct"]),
+            analysis_correct=None if row["analysis_correct"] is None else bool(row["analysis_correct"]),
+            comment=row["comment"],
+            created_at=row["created_at"],
+        )
 
     @staticmethod
     def _row_to_record(row: sqlite3.Row) -> InterviewRecord:

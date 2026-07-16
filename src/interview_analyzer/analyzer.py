@@ -17,6 +17,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+from typing import Callable, Optional
 
 import requests
 
@@ -32,14 +33,48 @@ class OllamaEngine(AnalysisEngine):
         self.host = acfg.get("ollama_host", "http://localhost:11434")
         self.model = acfg.get("llm_model", "llama3.1:8b")
 
-    def run(self, prompt: str) -> str:
+    def run(self, prompt: str, on_progress: Optional[Callable[[float], None]] = None) -> str:
+        if on_progress is None:
+            resp = requests.post(
+                f"{self.host}/api/generate",
+                json={"model": self.model, "prompt": prompt, "stream": False, "format": "json"},
+                timeout=600,
+            )
+            resp.raise_for_status()
+            return resp.json().get("response", "")
+
+        # Streaming mode: Ollama's rubric response is fixed-shape JSON, so
+        # the number of tokens generated so far (eval_count) against a rough
+        # expected-size estimate makes a reasonable progress signal -- an
+        # estimate, not exact, same spirit as transcription's real
+        # segment-timestamp progress but for a single LLM call there's no
+        # exact total to report against ahead of time.
+        expected_tokens = max(300, prompt.count("?") * 180 + 150)
+        chunks = []
         resp = requests.post(
             f"{self.host}/api/generate",
-            json={"model": self.model, "prompt": prompt, "stream": False, "format": "json"},
+            json={"model": self.model, "prompt": prompt, "stream": True, "format": "json"},
             timeout=600,
+            stream=True,
         )
         resp.raise_for_status()
-        return resp.json().get("response", "")
+        try:
+            for line in resp.iter_lines():
+                if not line:
+                    continue
+                try:
+                    data = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                chunks.append(data.get("response", ""))
+                eval_count = data.get("eval_count")
+                if eval_count is not None:
+                    on_progress(min(eval_count / expected_tokens, 0.97))
+                if data.get("done"):
+                    on_progress(1.0)
+        finally:
+            resp.close()
+        return "".join(chunks)
 
 
 class AnthropicEngine(AnalysisEngine):
@@ -58,7 +93,11 @@ class AnthropicEngine(AnalysisEngine):
             )
         self.model = acfg.get("llm_model", "claude-sonnet-5")
 
-    def run(self, prompt: str) -> str:
+    def run(self, prompt: str, on_progress: Optional[Callable[[float], None]] = None) -> str:
+        # No incremental progress signal for this engine -- a single
+        # non-streaming request; on_progress is accepted for interface
+        # consistency but left unused, same as any engine that has nothing
+        # partial to report.
         resp = requests.post(
             "https://api.anthropic.com/v1/messages",
             headers={
@@ -86,7 +125,8 @@ class OpenAIEngine(AnalysisEngine):
             raise RuntimeError(f"Set the {env_var} environment variable to use openai_api.")
         self.model = acfg.get("llm_model", "gpt-4o-mini")
 
-    def run(self, prompt: str) -> str:
+    def run(self, prompt: str, on_progress: Optional[Callable[[float], None]] = None) -> str:
+        # No incremental progress signal for this engine -- see AnthropicEngine.run.
         resp = requests.post(
             "https://api.openai.com/v1/chat/completions",
             headers={"Authorization": f"Bearer {self.api_key}"},
@@ -106,13 +146,24 @@ register_engine("anthropic_api", lambda acfg: AnthropicEngine(acfg))
 register_engine("openai_api", lambda acfg: OpenAIEngine(acfg))
 
 
-def analyze_transcript(transcript: str, cfg: Config) -> dict:
+def analyze_transcript(
+    transcript: str,
+    cfg: Config,
+    on_progress: Optional[Callable[[float], None]] = None,
+    calibration_notes: str = "",
+) -> dict:
     acfg = cfg.analysis
     engine_name = acfg.get("engine", "ollama")
     engine = get_engine(engine_name, acfg)
 
-    prompt = build_prompt(transcript)
-    raw = engine.run(prompt)
+    prompt = build_prompt(transcript, calibration_notes=calibration_notes)
+    try:
+        raw = engine.run(prompt, on_progress=on_progress)
+    except TypeError:
+        # a third-party engine registered before on_progress existed, or
+        # that simply doesn't implement it -- fall back to the old call
+        # shape rather than breaking custom engines (see engines.py)
+        raw = engine.run(prompt)
 
     try:
         return json.loads(raw)

@@ -8,7 +8,7 @@ model, a different prompt strategy), subclass `AnalysisEngine`, implement
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
-from typing import Callable
+from typing import Callable, Optional
 
 
 class AnalysisEngine(ABC):
@@ -17,10 +17,17 @@ class AnalysisEngine(ABC):
     Implementations receive the fully-built rubric prompt (transcript
     already embedded) and must return the raw text response from the
     model — JSON parsing/validation is handled centrally in analyzer.py.
+
+    `on_progress`, if given, may be called with an estimated 0.0-1.0
+    fraction as the response streams in (e.g. Ollama's streaming API
+    reports tokens generated so far) — purely cosmetic for a progress bar,
+    never required. It's optional so third-party engines that only
+    implement `run(self, prompt)` keep working unchanged; analyzer.py falls
+    back to calling them without it.
     """
 
     @abstractmethod
-    def run(self, prompt: str) -> str:
+    def run(self, prompt: str, on_progress: Optional[Callable[[float], None]] = None) -> str:
         ...
 
 

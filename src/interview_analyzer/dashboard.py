@@ -10,18 +10,100 @@ sharing one Tk mainloop.
 """
 from __future__ import annotations
 
+import datetime as dt
 import logging
+import os
 import pathlib
 import threading
 from typing import Optional
 
+from .confidence import format_confidence
+from .language_packs import LANGUAGE_PACKS, PackActionDialog, is_pack_installed
+from .model_setup import (
+    MODEL_CATALOG,
+    ModelInstallDialog,
+    is_model_installed,
+    ollama_is_reachable,
+    size_label,
+)
 from .report_view import render_into_text_widget
 from .settings_editor import load_editable_settings, save_editable_settings
+from .tray import job_text
 
 logger = logging.getLogger(__name__)
 
 _WHISPER_MODELS = ["tiny", "base", "small", "medium", "large-v3"]
 _ANALYSIS_ENGINES = ["ollama", "anthropic_api", "openai_api"]
+_TRANSCRIPTION_LANGUAGES = ["auto", "en", "hi", "hinglish"]
+
+
+def _format_elapsed(seconds: float) -> str:
+    total = int(seconds)
+    mins, secs = divmod(total, 60)
+    return f"{mins:02d}:{secs:02d}"
+
+
+def format_started(record) -> str:
+    try:
+        started = dt.datetime.fromisoformat(record.started_at)
+    except (TypeError, ValueError):
+        return record.started_at or "—"
+    return started.strftime("%Y-%m-%d %H:%M")
+
+
+def format_duration(record) -> str:
+    """'—' when the recording never cleanly finished (ended_at unset --
+    e.g. it was interrupted by a crash) rather than 0:00, since those are
+    different situations worth distinguishing at a glance."""
+    if not record.ended_at:
+        return "—"
+    try:
+        started = dt.datetime.fromisoformat(record.started_at)
+        ended = dt.datetime.fromisoformat(record.ended_at)
+    except (TypeError, ValueError):
+        return "—"
+    seconds = max(0, int((ended - started).total_seconds()))
+    mins, secs = divmod(seconds, 60)
+    return f"{mins:02d}:{secs:02d}"
+
+
+def history_status_label(record) -> str:
+    """One-line status for the History list's Status column and as the
+    basis for the detail pane's placeholder text when there's no report."""
+    if record.report_path and pathlib.Path(record.report_path).exists():
+        analysis = record.analysis
+        if analysis and analysis.get("no_speech_detected"):
+            return "No speech detected"
+        if analysis and not analysis.get("parse_error"):
+            issues = analysis.get("session_summary", {}).get("top_issues") or []
+            return issues[0] if issues else "No issues flagged"
+        return "Report generated"
+    if record.analysis:
+        return "Report pending"
+    if record.transcript:
+        return "Analysis failed"
+    if record.ended_at is None:
+        return "Interrupted — no report"
+    return "Not processed"
+
+
+def has_audio(record) -> bool:
+    """True if this interview's raw audio is still on disk (it's deleted
+    automatically after the configured retention window)."""
+    if not record.audio_path:
+        return False
+    path = pathlib.Path(record.audio_path)
+    return path.exists() and path.stat().st_size > 0
+
+
+def can_reprocess(record) -> bool:
+    """True if this interview has recoverable audio but no finished report
+    -- i.e. the History tab's Reprocess button should be enabled for it
+    (subject also to the watcher not currently being busy -- see
+    Dashboard._update_action_buttons)."""
+    if record.report_path and pathlib.Path(record.report_path).exists():
+        return False
+    return has_audio(record)
 
 
 def _configure_report_tags(text_widget) -> None:
@@ -48,13 +130,36 @@ class Dashboard:
         # touched from the dashboard's own Tk thread
         self._status_label = None
         self._detail_label = None
+        self._timer_label = None
+        self._activity_bar = None
+        self._activity_running = False
+        self._background_jobs_label = None
         self._pause_btn = None
         self._stop_btn = None
+        self._manual_start_entry = None
+        self._manual_start_btn = None
         self._history_tree = None
         self._history_text = None
+        self._reprocess_btn = None
+        self._open_audio_btn = None
+        self._view_transcript_btn = None
+        self._delete_btn = None
+        self._cancel_btn = None
+        self._history_progress_label = None
+        self._history_progress_bar = None
+        self._history_progress_running = False
         self._trends_text = None
         self._settings_widgets: dict[str, object] = {}
         self._settings_status = None
+        self._fb_transcript_var = None
+        self._fb_analysis_var = None
+        self._fb_comment_entry = None
+        self._fb_frame = None
+        self._fb_status_label = None
+        self._fb_confidence_label = None
+        self._model_name_entry = None
+        self._model_status_label = None
+        self._lang_pack_rows: dict[str, dict[str, object]] = {}
 
     @property
     def is_open(self) -> bool:
@@ -72,12 +177,23 @@ class Dashboard:
             thread = threading.Thread(target=self._run, daemon=True)
             thread.start()
 
+    def wait_until_ready(self, timeout: float = 10) -> bool:
+        """Block until the dashboard window is fully built (or `timeout`
+        elapses). Used by app.py to make sure the watcher doesn't start
+        polling -- and potentially spin up a *second* Tk() interpreter for
+        a consent popup -- before the dashboard's shared root exists."""
+        return self._ready.wait(timeout=timeout)
+
     def notify_state_change(self) -> None:
         """Called (from any thread) whenever the watcher's recording state
-        changes, so an open dashboard can refresh itself."""
+        changes, so an open dashboard can refresh itself -- including
+        History/Trends, since a transition back to idle is exactly when a
+        new report (or a reprocessed one) may have just appeared."""
         if self._ready.is_set() and self._root is not None:
             try:
                 self._root.after(0, self._refresh_status)
+                self._root.after(0, self._refresh_history)
+                self._root.after(0, self._refresh_trends)
             except Exception:  # noqa: BLE001
                 pass
 
@@ -94,8 +210,8 @@ class Dashboard:
         root = tk.Tk()
         self._root = root
         root.title("Interview Analyzer")
-        root.geometry("720x520")
-        root.minsize(560, 400)
+        root.geometry("820x540")
+        root.minsize(620, 400)
 
         notebook = ttk.Notebook(root)
         notebook.pack(fill="both", expand=True, padx=10, pady=10)
@@ -108,6 +224,7 @@ class Dashboard:
         def _on_close():
             self._ready.clear()
             self._root = None
+            self.watcher.set_ui_root(None)
             root.destroy()
 
         root.protocol("WM_DELETE_WINDOW", _on_close)
@@ -115,6 +232,7 @@ class Dashboard:
         self._refresh_status()
         self._refresh_history()
         self._refresh_trends()
+        self.watcher.set_ui_root(root)
         self._ready.set()
         root.mainloop()
 
@@ -126,7 +244,12 @@ class Dashboard:
         self._status_label = ttk.Label(frame, text="", font=("Segoe UI", 14, "bold"))
         self._status_label.pack(anchor="w")
         self._detail_label = ttk.Label(frame, text="", foreground="#5b645f")
-        self._detail_label.pack(anchor="w", pady=(2, 16))
+        self._detail_label.pack(anchor="w", pady=(2, 4))
+        self._timer_label = ttk.Label(frame, text="", font=("Consolas", 12))
+        self._timer_label.pack(anchor="w", pady=(0, 8))
+
+        self._activity_bar = ttk.Progressbar(frame, mode="indeterminate", length=260)
+        self._activity_bar.pack(anchor="w", pady=(0, 16))
 
         btn_row = ttk.Frame(frame)
         btn_row.pack(anchor="w")
@@ -134,6 +257,28 @@ class Dashboard:
         self._pause_btn.pack(side="left", padx=(0, 8))
         self._stop_btn = ttk.Button(btn_row, text="Stop recording", command=self._on_stop)
         self._stop_btn.pack(side="left")
+
+        # manual fallback for when automatic detection doesn't pick up a
+        # real call -- clicking this IS the consent, so it skips straight
+        # to recording rather than showing the usual consent popup
+        manual_row = ttk.Frame(frame)
+        manual_row.pack(anchor="w", pady=(14, 0))
+        ttk.Label(manual_row, text="Not detected automatically?").pack(side="left", padx=(0, 8))
+        self._manual_start_entry = ttk.Entry(manual_row, width=14)
+        self._manual_start_entry.insert(0, "Meet")
+        self._manual_start_entry.pack(side="left", padx=(0, 8))
+        self._manual_start_btn = ttk.Button(manual_row, text="Start recording", command=self._on_manual_start)
+        self._manual_start_btn.pack(side="left")
+
+        ttk.Button(
+            frame, text="Open recordings folder", command=self._on_open_recordings_folder
+        ).pack(anchor="w", pady=(14, 0))
+
+        # background transcribe/analyze/report jobs are independent of the
+        # live recording state above -- a new call can be recording while an
+        # earlier one is still processing -- so they get their own line
+        self._background_jobs_label = ttk.Label(frame, text="", foreground="#2f6fa8")
+        self._background_jobs_label.pack(anchor="w", pady=(16, 0))
 
         ttk.Label(
             frame,
@@ -155,98 +300,472 @@ class Dashboard:
         self.watcher.request_stop_recording()
         self._refresh_status()
 
+    def _on_manual_start(self) -> None:
+        app_name = self._manual_start_entry.get().strip() or "Manual"
+        try:
+            self.watcher.request_start_recording(app_name)
+        except RuntimeError:
+            pass  # already recording -- the button should be disabled then anyway
+        self._refresh_status()
+
+    def _on_open_recordings_folder(self) -> None:
+        cfg = self.watcher.cfg
+        folder = cfg.resolve(cfg.audio.get("raw_dir", "data/audio"))
+        try:
+            folder.mkdir(parents=True, exist_ok=True)
+            os.startfile(folder)  # noqa: S606 -- opens with Explorer, Windows-only app
+        except Exception:  # noqa: BLE001
+            logger.exception("Failed to open recordings folder %s", folder)
+
     def _refresh_status(self) -> None:
         if self._root is None or self._status_label is None:
             return
         status = self.watcher.status
         state = status.get("state", "idle")
+        jobs = status.get("processing_jobs") or {}
+
+        self._manual_start_btn.config(state="normal" if state == "idle" else "disabled")
+        self._manual_start_entry.config(state="normal" if state == "idle" else "disabled")
 
         if state == "idle":
             self._status_label.config(text="● Idle", foreground="#5b645f")
             self._detail_label.config(text="Watching for a meeting to begin.")
+            self._timer_label.config(text="")
             self._pause_btn.config(text="Pause", state="disabled")
             self._stop_btn.config(state="disabled")
         elif state == "recording":
             self._status_label.config(text="● Recording", foreground="#c0392b")
             self._detail_label.config(text=f"{status.get('app_name', 'call')}")
+            self._timer_label.config(text=_format_elapsed(status.get("elapsed_seconds", 0)))
             self._pause_btn.config(text="Pause", state="normal")
             self._stop_btn.config(state="normal")
         else:  # paused
             self._status_label.config(text="⏸ Paused", foreground="#c8892c")
             self._detail_label.config(text=f"{status.get('app_name', 'call')} — capture paused")
+            self._timer_label.config(text=_format_elapsed(status.get("elapsed_seconds", 0)))
             self._pause_btn.config(text="Resume", state="normal")
             self._stop_btn.config(state="normal")
 
+        self._apply_activity_bar(self._activity_bar, "_activity_running", state == "recording", None)
+
+        if jobs:
+            if len(jobs) == 1:
+                job = next(iter(jobs.values()))
+                app = job.get("source_app") or "an interview"
+                self._background_jobs_label.config(text=f"⋯ Processing {app} — {job_text(job)}")
+            else:
+                self._background_jobs_label.config(text=f"⋯ {len(jobs)} interviews processing in the background")
+        else:
+            self._background_jobs_label.config(text="")
+
+        self._update_history_progress_indicator(jobs)
+
         if self._root is not None:
             self._root.after(1000, self._refresh_status)
+
+    def _apply_activity_bar(self, bar, running_attr: str, should_run: bool, progress: Optional[float]) -> None:
+        """Shared indeterminate/determinate switching, used by both the
+        Status tab's activity bar and the History tab's inline one.
+        `progress` (0.0-1.0) switches the bar to a real percentage --
+        e.g. transcription, which faster-whisper reports incrementally --
+        rather than an oscillating "something is happening" animation that
+        can't say how much is left."""
+        is_running = getattr(self, running_attr)
+        if progress is not None:
+            if is_running:
+                bar.stop()
+                setattr(self, running_attr, False)
+            bar.config(mode="determinate", maximum=100)
+            bar["value"] = progress * 100
+        else:
+            bar.config(mode="indeterminate")
+            if should_run and not is_running:
+                bar.start(80)
+                setattr(self, running_attr, True)
+            elif not should_run and is_running:
+                bar.stop()
+                setattr(self, running_attr, False)
+
+    def _update_history_progress_indicator(self, jobs: dict) -> None:
+        """A general "something's processing" bar for the History tab
+        (per-row status text in the tree itself -- see _refresh_history --
+        shows which specific interview and its stage/percentage). Also
+        keeps the action buttons' enabled state in sync with busy-ness
+        (re-selecting a row must not re-enable Reprocess while it's
+        genuinely still running)."""
+        if self._history_progress_label is None:
+            return
+        processing = bool(jobs)
+        progress = None
+        label = ""
+        if processing:
+            if len(jobs) == 1:
+                job = next(iter(jobs.values()))
+                progress = job.get("progress")
+                label = job_text(job)
+            else:
+                label = f"{len(jobs)} interviews processing"
+
+        if processing and not self._history_progress_bar.winfo_ismapped():
+            self._history_progress_bar.pack(side="left", padx=(8, 0))
+        elif not processing and self._history_progress_bar.winfo_ismapped():
+            self._history_progress_bar.pack_forget()
+
+        self._history_progress_label.config(text=label)
+        self._apply_activity_bar(self._history_progress_bar, "_history_progress_running", processing, progress)
+        self._update_action_buttons()
 
     # -- History tab ----------------------------------------------------
 
     def _build_history_tab(self, notebook, tk, ttk):
         frame = ttk.Frame(notebook, padding=10)
-        frame.columnconfigure(0, weight=1)
+        # the tree's columns need ~460px to show fully without scrolling --
+        # give it more relative share than a plain 1:2 split would, so the
+        # default window size rarely needs horizontal scrolling at all
+        frame.columnconfigure(0, weight=3)
         frame.columnconfigure(1, weight=2)
-        frame.rowconfigure(1, weight=1)
+        frame.rowconfigure(2, weight=1)
 
-        ttk.Button(frame, text="Refresh", command=self._refresh_history).grid(
-            row=0, column=0, sticky="w", pady=(0, 6)
+        toolbar = ttk.Frame(frame)
+        toolbar.grid(row=0, column=0, columnspan=2, sticky="w", pady=(0, 4))
+        ttk.Button(toolbar, text="Refresh", command=self._refresh_history).pack(side="left")
+        self._reprocess_btn = ttk.Button(
+            toolbar, text="Reprocess (generate report)", command=self._on_reprocess, state="disabled"
         )
+        self._reprocess_btn.pack(side="left", padx=(8, 0))
+        self._open_audio_btn = ttk.Button(
+            toolbar, text="Play audio", command=self._on_open_audio, state="disabled"
+        )
+        self._open_audio_btn.pack(side="left", padx=(8, 0))
+        self._view_transcript_btn = ttk.Button(
+            toolbar, text="View transcript", command=self._on_view_transcript, state="disabled"
+        )
+        self._view_transcript_btn.pack(side="left", padx=(8, 0))
+        self._delete_btn = ttk.Button(
+            toolbar, text="Delete", command=self._on_delete, state="disabled"
+        )
+        self._delete_btn.pack(side="left", padx=(8, 0))
+        self._cancel_btn = ttk.Button(
+            toolbar, text="Cancel processing", command=self._on_cancel, state="disabled"
+        )
+        self._cancel_btn.pack(side="left", padx=(8, 0))
 
-        columns = ("date", "app", "top_issue")
-        tree = ttk.Treeview(frame, columns=columns, show="headings", selectmode="browse")
-        tree.heading("date", text="Date")
+        progress_row = ttk.Frame(frame)
+        progress_row.grid(row=1, column=0, columnspan=2, sticky="w", pady=(0, 6))
+        self._history_progress_label = ttk.Label(progress_row, text="", foreground="#2f6fa8")
+        self._history_progress_label.pack(side="left")
+        self._history_progress_bar = ttk.Progressbar(progress_row, mode="indeterminate", length=180)
+        # packed on demand by _update_history_progress_indicator, not here
+
+        tree_frame = ttk.Frame(frame)
+        tree_frame.grid(row=2, column=0, sticky="nsew", padx=(0, 8))
+        tree_frame.columnconfigure(0, weight=1)
+        tree_frame.rowconfigure(0, weight=1)
+
+        columns = ("started", "duration", "app", "status")
+        tree = ttk.Treeview(tree_frame, columns=columns, show="headings", selectmode="browse")
+        tree.heading("started", text="Started")
+        tree.heading("duration", text="Duration")
         tree.heading("app", text="App")
-        tree.heading("top_issue", text="Top issue")
-        tree.column("date", width=110, stretch=False)
-        tree.column("app", width=90, stretch=False)
-        tree.column("top_issue", width=220)
-        tree.grid(row=1, column=0, sticky="nsew", padx=(0, 8))
+        tree.heading("status", text="Status")
+        tree.column("started", width=125, minwidth=90, stretch=False)
+        tree.column("duration", width=65, minwidth=55, stretch=False)
+        tree.column("app", width=75, minwidth=55, stretch=False)
+        tree.column("status", width=190, minwidth=100, stretch=True)
+
+        # explicit scrollbars, properly bound to the tree's view -- without
+        # these, dragging to scroll horizontally goes through Tk's default
+        # (unbound) fallback, which is what made it feel slow/unresponsive
+        vsb = ttk.Scrollbar(tree_frame, orient="vertical", command=tree.yview)
+        hsb = ttk.Scrollbar(tree_frame, orient="horizontal", command=tree.xview)
+        tree.configure(yscrollcommand=vsb.set, xscrollcommand=hsb.set)
+
+        tree.grid(row=0, column=0, sticky="nsew")
+        vsb.grid(row=0, column=1, sticky="ns")
+        hsb.grid(row=1, column=0, sticky="ew")
+
         tree.bind("<<TreeviewSelect>>", lambda e: self._on_history_select())
         self._history_tree = tree
 
-        text = tk.Text(frame, wrap="word", padx=10, pady=8, state="disabled", relief="flat")
+        detail_container = ttk.Frame(frame)
+        detail_container.grid(row=2, column=1, sticky="nsew")
+        detail_container.columnconfigure(0, weight=1)
+        detail_container.rowconfigure(0, weight=1)
+
+        text = tk.Text(detail_container, wrap="word", padx=10, pady=8, state="disabled", relief="flat")
         _configure_report_tags(text)
-        text.grid(row=1, column=1, sticky="nsew")
+        text.grid(row=0, column=0, sticky="nsew")
         self._history_text = text
 
+        self._fb_frame = self._build_feedback_panel(detail_container, tk, ttk)
+        self._fb_frame.grid(row=1, column=0, sticky="ew", pady=(6, 0))
+        self._fb_frame.grid_remove()  # hidden until a report is actually selected
+
         return frame
+
+    def _build_feedback_panel(self, parent, tk, ttk):
+        """A compact "was this right?" panel shown under a selected
+        interview's report. Feedback here is what calibrates the
+        confidence score shown on *future* reports and feeds corrective
+        notes back into future analysis prompts -- see confidence.py."""
+        panel = ttk.LabelFrame(parent, text="Feedback", padding=8)
+
+        row1 = ttk.Frame(panel)
+        row1.pack(fill="x", pady=(0, 4))
+        ttk.Label(row1, text="Transcription accurate?", width=22).pack(side="left")
+        self._fb_transcript_var = tk.StringVar(value="")
+        ttk.Radiobutton(row1, text="Yes", variable=self._fb_transcript_var, value="yes").pack(side="left")
+        ttk.Radiobutton(row1, text="No", variable=self._fb_transcript_var, value="no").pack(side="left")
+
+        row2 = ttk.Frame(panel)
+        row2.pack(fill="x", pady=(0, 4))
+        ttk.Label(row2, text="Analysis accurate/helpful?", width=22).pack(side="left")
+        self._fb_analysis_var = tk.StringVar(value="")
+        ttk.Radiobutton(row2, text="Yes", variable=self._fb_analysis_var, value="yes").pack(side="left")
+        ttk.Radiobutton(row2, text="No", variable=self._fb_analysis_var, value="no").pack(side="left")
+
+        row3 = ttk.Frame(panel)
+        row3.pack(fill="x", pady=(0, 4))
+        ttk.Label(row3, text="Comment (optional)", width=22).pack(side="left")
+        self._fb_comment_entry = ttk.Entry(row3)
+        self._fb_comment_entry.pack(side="left", fill="x", expand=True)
+
+        row4 = ttk.Frame(panel)
+        row4.pack(fill="x")
+        ttk.Button(row4, text="Submit feedback", command=self._on_submit_feedback).pack(side="left")
+        self._fb_status_label = ttk.Label(row4, text="", foreground="#2f6f5e")
+        self._fb_status_label.pack(side="left", padx=(10, 0))
+
+        self._fb_confidence_label = ttk.Label(panel, text="", foreground="#5b645f")
+        self._fb_confidence_label.pack(anchor="w", pady=(4, 0))
+
+        return panel
+
+    def _on_submit_feedback(self) -> None:
+        record = self._selected_record()
+        if record is None:
+            return
+
+        def _as_bool(var) -> Optional[bool]:
+            value = var.get()
+            return {"yes": True, "no": False}.get(value)
+
+        comment = self._fb_comment_entry.get().strip()
+        self.watcher.db.save_feedback(
+            record.id,
+            user_id=self.watcher.user_id,
+            transcript_correct=_as_bool(self._fb_transcript_var),
+            analysis_correct=_as_bool(self._fb_analysis_var),
+            comment=comment,
+        )
+        self._fb_status_label.config(text="Saved -- thanks, this improves future confidence scoring.")
+
+    def _refresh_feedback_panel(self, record) -> None:
+        if self._fb_frame is None:
+            return
+        if record is None or not record.analysis:
+            self._fb_frame.grid_remove()
+            return
+
+        self._fb_frame.grid()
+        self._fb_status_label.config(text="")
+
+        existing = self.watcher.db.get_feedback(record.id)
+        to_str = lambda v: "" if v is None else ("yes" if v else "no")  # noqa: E731
+        self._fb_transcript_var.set(to_str(existing.transcript_correct) if existing else "")
+        self._fb_analysis_var.set(to_str(existing.analysis_correct) if existing else "")
+        self._fb_comment_entry.delete(0, "end")
+        if existing and existing.comment:
+            self._fb_comment_entry.insert(0, existing.comment)
+
+        confidence_info = (record.analysis or {}).get("confidence_info")
+        self._fb_confidence_label.config(text=f"Confidence in this assessment: {format_confidence(confidence_info)}")
 
     def _refresh_history(self) -> None:
         if self._history_tree is None:
             return
+        selected = self._history_tree.selection()
+        jobs = self.watcher.status.get("processing_jobs", {})
         self._history_tree.delete(*self._history_tree.get_children())
         records = list(reversed(self.watcher.db.list_all(user_id=self.watcher.user_id)))
         for record in records:
-            top_issue = "—"
-            analysis = record.analysis
-            if analysis and not analysis.get("parse_error"):
-                issues = analysis.get("session_summary", {}).get("top_issues") or []
-                if issues:
-                    top_issue = issues[0]
-            date_str = record.started_at.split("T")[0]
+            job = jobs.get(record.id)
+            status_cell = job_text(job) if job else history_status_label(record)
             self._history_tree.insert(
                 "", "end", iid=str(record.id),
-                values=(date_str, record.source_app or "—", top_issue),
+                values=(
+                    format_started(record),
+                    format_duration(record),
+                    record.source_app or "—",
+                    status_cell,
+                ),
             )
+        if selected and self._history_tree.exists(selected[0]):
+            self._history_tree.selection_set(selected[0])
+        self._update_action_buttons()
 
-    def _on_history_select(self) -> None:
+    def _selected_record(self):
         selection = self._history_tree.selection()
         if not selection:
+            return None
+        return self.watcher.db.get(int(selection[0]))
+
+    def _update_action_buttons(self) -> None:
+        record = self._selected_record()
+        status = self.watcher.status
+        is_recording_this = record is not None and status.get("interview_id") == record.id
+        is_processing_this = record is not None and record.id in (status.get("processing_jobs") or {})
+        busy = is_recording_this or is_processing_this
+
+        can_do_reprocess = record is not None and can_reprocess(record) and not busy
+        self._reprocess_btn.config(state="normal" if can_do_reprocess else "disabled")
+        can_play = record is not None and has_audio(record)
+        self._open_audio_btn.config(state="normal" if can_play else "disabled")
+        can_view_transcript = record is not None and bool(record.transcript)
+        self._view_transcript_btn.config(state="normal" if can_view_transcript else "disabled")
+        can_delete = record is not None and not busy
+        self._delete_btn.config(state="normal" if can_delete else "disabled")
+        self._cancel_btn.config(state="normal" if is_processing_this else "disabled")
+
+    def _on_cancel(self) -> None:
+        record = self._selected_record()
+        if record is None:
             return
-        record = self.watcher.db.get(int(selection[0]))
+        self.watcher.cancel_processing(record.id)
+
+    def _on_history_select(self) -> None:
+        record = self._selected_record()
+        self._update_action_buttons()
         self._history_text.config(state="normal")
+        jobs = self.watcher.status.get("processing_jobs", {})
+        show_feedback = False
         if record is None:
             self._history_text.delete("1.0", "end")
+        elif record.id in jobs:
+            render_into_text_widget(
+                self._history_text,
+                f"# Processing…\n\n{job_text(jobs[record.id])}\n\n"
+                "Click **Cancel processing** above to stop it.",
+            )
         elif record.report_path and pathlib.Path(record.report_path).exists():
             content = pathlib.Path(record.report_path).read_text(encoding="utf-8")
             render_into_text_widget(self._history_text, content)
-        else:
-            render_into_text_widget(
-                self._history_text,
-                "# Report not available\n\nThis interview hasn't finished processing yet, "
-                "or its report file is missing.",
+            show_feedback = bool(record.analysis) and not (
+                record.analysis.get("parse_error") or record.analysis.get("no_speech_detected")
             )
+        else:
+            reason = {
+                "Interrupted — no report": "The recording was interrupted before it finished (e.g. a crash or "
+                                            "a force-quit), so it never reached the report stage.",
+                "Analysis failed": "The transcript was produced, but analysis didn't complete "
+                                    "(e.g. the analysis engine was unreachable at the time).",
+                "Not processed": "This interview hasn't been processed yet.",
+                "Report pending": "Analysis finished, but the report file wasn't written yet.",
+            }.get(history_status_label(record), "The report file is missing.")
+            hint = ("\n\nIts audio is still available -- click **Reprocess** above to try generating "
+                    "a report from it now." if can_reprocess(record) else
+                    "\n\nIts audio is no longer available, so this can't be recovered.")
+            if record.transcript:
+                hint += "\n\nThe raw transcript was saved though -- click **View transcript** above to read it."
+            render_into_text_widget(self._history_text, f"# Report not available\n\n{reason}{hint}")
         self._history_text.config(state="disabled")
+        self._refresh_feedback_panel(record if show_feedback else None)
+
+    def _on_reprocess(self) -> None:
+        record = self._selected_record()
+        if record is None or not can_reprocess(record):
+            return
+        if record.id in (self.watcher.status.get("processing_jobs") or {}):
+            return  # already busy (button should be disabled already; this is a defensive belt-and-braces check)
+        interview_id = record.id
+        self._reprocess_btn.config(state="disabled")
+
+        def _run():
+            try:
+                self.watcher.reprocess_interview(interview_id)
+            except Exception as e:  # noqa: BLE001
+                logger.exception("Reprocessing interview #%s failed", interview_id)
+                # `e` is deleted when this except block exits (standard
+                # Python behavior for `except ... as e`), so it must be
+                # captured into a plain variable now -- a lambda referring
+                # to `e` directly would raise NameError once .after() runs
+                # it later, since by then the name no longer exists.
+                error_message = str(e)
+                if self._root is not None:
+                    # only re-render the row list (to re-enable Reprocess,
+                    # since the audio is still there) -- NOT the detail
+                    # pane, which already shows the error message below and
+                    # would otherwise get immediately overwritten by
+                    # _on_history_select()'s normal "not processed" text
+                    self._root.after(0, self._refresh_history)
+                    self._root.after(0, lambda msg=error_message: self._show_reprocess_error(msg))
+            else:
+                # success -- re-render the row list and the now-available report
+                if self._root is not None:
+                    self._root.after(0, self._refresh_history)
+                    self._root.after(0, self._on_history_select)
+
+        threading.Thread(target=_run, daemon=True).start()
+
+    def _show_reprocess_error(self, message: str) -> None:
+        self._history_text.config(state="normal")
+        render_into_text_widget(self._history_text, f"# Reprocessing failed\n\n{message}")
+        self._history_text.config(state="disabled")
+
+    def _on_open_audio(self) -> None:
+        record = self._selected_record()
+        if record is None or not has_audio(record):
+            return
+        try:
+            os.startfile(record.audio_path)  # noqa: S606 -- opens with the OS default player, Windows-only app
+        except Exception as e:  # noqa: BLE001
+            logger.exception("Failed to open audio for interview #%s", record.id)
+            self._history_text.config(state="normal")
+            render_into_text_widget(self._history_text, f"# Couldn't open audio\n\n{e}")
+            self._history_text.config(state="disabled")
+
+    def _on_view_transcript(self) -> None:
+        record = self._selected_record()
+        if record is None or not record.transcript:
+            return
+        self._history_text.config(state="normal")
+        self._history_text.delete("1.0", "end")
+        self._history_text.insert("end", "Transcript\n", ("h1",))
+        self._history_text.insert("end", "\n")
+        # inserted as plain text (not run through the markdown renderer) --
+        # it's a real transcript, not markdown, and a line that happens to
+        # start with "#"/"-"/">" shouldn't be misread as a heading/bullet/quote
+        self._history_text.insert("end", record.transcript, ("text",))
+        self._history_text.config(state="disabled")
+
+    def _on_delete(self) -> None:
+        record = self._selected_record()
+        if record is None:
+            return
+        if record.id in (self.watcher.status.get("processing_jobs") or {}):
+            return  # still being processed -- shouldn't happen since the button is disabled then, but be safe
+        import tkinter.messagebox as messagebox
+
+        confirmed = messagebox.askyesno(
+            "Delete interview",
+            f"Delete the {format_started(record)} interview ({record.source_app or 'unknown app'})?\n\n"
+            "This also removes its audio and report files from disk, and can't be undone.",
+            parent=self._root,
+        )
+        if not confirmed:
+            return
+        for path_str in (record.audio_path, record.report_path):
+            if path_str:
+                try:
+                    pathlib.Path(path_str).unlink(missing_ok=True)
+                except OSError:
+                    logger.warning("Couldn't delete file %s for interview #%s", path_str, record.id)
+        self.watcher.db.delete_interview(record.id)
+        self._refresh_history()
+        self._history_text.config(state="normal")
+        self._history_text.delete("1.0", "end")
+        self._history_text.config(state="disabled")
+        self._refresh_feedback_panel(None)
 
     # -- Trends tab -------------------------------------------------------
 
@@ -313,11 +832,28 @@ class Dashboard:
 
         e = ttk.Spinbox(form, from_=1, to=20, width=8)
         e.set(current.get("start_debounce_polls", 2))
-        _row(r, "Start debounce (polls)", "start_debounce_polls", e); r += 1
+        _row(r, "Start debounce, apps (polls)", "start_debounce_polls", e); r += 1
+
+        e = ttk.Spinbox(form, from_=1, to=60, width=8)
+        e.set(current.get("browser_start_debounce_polls", 6))
+        _row(r, "Start debounce, browser tabs (polls)", "browser_start_debounce_polls", e); r += 1
+
+        e = ttk.Spinbox(form, from_=1, to=60, width=8)
+        e.set(current.get("stop_debounce_polls", 12))
+        _row(r, "Stop debounce (polls)", "stop_debounce_polls", e); r += 1
+
+        e = ttk.Entry(form, width=10)
+        e.insert(0, str(current.get("declined_cooldown_seconds", 300)))
+        _row(r, "Re-prompt after declining (seconds)", "declined_cooldown_seconds", e); r += 1
 
         e = ttk.Spinbox(form, from_=16, to=320, width=8)
         e.set(current.get("audio.bitrate_kbps", 64))
         _row(r, "Audio bitrate (kbps)", "audio.bitrate_kbps", e); r += 1
+
+        mic_var = tk.BooleanVar(value=bool(current.get("audio.include_microphone", True)))
+        e = ttk.Checkbutton(form, variable=mic_var, text="Include your microphone (recommended)")
+        e.var = mic_var
+        _row(r, "Record your voice", "audio.include_microphone", e); r += 1
 
         e = ttk.Combobox(form, values=_WHISPER_MODELS, state="readonly", width=12)
         e.set(current.get("transcription.whisper_model", "small"))
@@ -328,23 +864,125 @@ class Dashboard:
         e.var = diarization_var  # keep a reference so it isn't garbage-collected
         _row(r, "Diarization", "transcription.diarization", e); r += 1
 
+        e = ttk.Combobox(form, values=_TRANSCRIPTION_LANGUAGES, state="readonly", width=12)
+        e.set(current.get("transcription.language", "auto"))
+        _row(r, "Language", "transcription.language", e); r += 1
+        ttk.Label(
+            form,
+            text="auto = detect automatically. hinglish = Hindi speech, romanized where possible.",
+            foreground="#6b6b6b",
+        ).grid(row=r, column=1, sticky="w"); r += 1
+
         e = ttk.Combobox(form, values=_ANALYSIS_ENGINES, state="readonly", width=12)
         e.set(current.get("analysis.engine", "ollama"))
         _row(r, "Analysis engine", "analysis.engine", e); r += 1
 
-        e = ttk.Entry(form)
-        e.insert(0, current.get("analysis.llm_model", ""))
-        _row(r, "Model name", "analysis.llm_model", e); r += 1
+        model_row = ttk.Frame(form)
+        # editable (not readonly) so a model outside the curated catalog can
+        # still be typed in directly -- the catalog is a convenience list,
+        # not the only thing this app can run
+        e = ttk.Combobox(model_row, values=list(MODEL_CATALOG.keys()), width=18)
+        e.set(current.get("analysis.llm_model", ""))
+        e.pack(side="left")
+        self._model_name_entry = e
+        ttk.Button(model_row, text="Install model...", command=self._on_install_model).pack(
+            side="left", padx=(8, 0)
+        )
+        ttk.Label(form, text="Model name").grid(row=r, column=0, sticky="w", pady=4, padx=(0, 12))
+        model_row.grid(row=r, column=1, sticky="ew", pady=4)
+        self._settings_widgets["analysis.llm_model"] = e
+        r += 1
+
+        self._model_status_label = ttk.Label(form, text="", foreground="#5b645f")
+        self._model_status_label.grid(row=r, column=1, sticky="w"); r += 1
+        e.bind("<<ComboboxSelected>>", lambda _e: self._refresh_model_status_label())
+        e.bind("<KeyRelease>", lambda _e: self._refresh_model_status_label())
+        self._refresh_model_status_label()
 
         e = ttk.Entry(form)
         e.insert(0, current.get("output.output_dir", "output"))
         _row(r, "Reports output dir", "output.output_dir", e); r += 1
+
+        ttk.Separator(form, orient="horizontal").grid(row=r, column=0, columnspan=2, sticky="ew", pady=10); r += 1
+
+        ttk.Label(form, text="Language packs", font=("Segoe UI", 10, "bold")).grid(
+            row=r, column=0, columnspan=2, sticky="w"
+        ); r += 1
+        r = self._build_language_pack_rows(form, ttk, r)
 
         self._settings_status = ttk.Label(frame, text="", foreground="#2f6f5e")
         ttk.Button(frame, text="Save", command=self._on_save_settings).pack(anchor="w", pady=(16, 4))
         self._settings_status.pack(anchor="w")
 
         return frame
+
+    def _build_language_pack_rows(self, form, ttk, r: int) -> int:
+        """One row per optional language pack (see language_packs.py) --
+        install/uninstall any time, not just during first-run setup."""
+        for pack_id, entry in LANGUAGE_PACKS.items():
+            row = ttk.Frame(form)
+            row.grid(row=r, column=0, columnspan=2, sticky="ew", pady=2)
+            ttk.Label(row, text=entry["label"], width=32).pack(side="left")
+            status_label = ttk.Label(row, text="", foreground="#5b645f", width=14)
+            status_label.pack(side="left")
+            action_btn = ttk.Button(row, text="", command=lambda pid=pack_id: self._on_toggle_language_pack(pid))
+            action_btn.pack(side="left")
+            self._lang_pack_rows[pack_id] = {"status_label": status_label, "action_btn": action_btn}
+            r += 1
+        self._refresh_language_pack_rows()
+        return r
+
+    def _refresh_language_pack_rows(self) -> None:
+        for pack_id, widgets in self._lang_pack_rows.items():
+            installed = is_pack_installed(pack_id)
+            widgets["status_label"].config(text="Installed" if installed else "Not installed")
+            widgets["action_btn"].config(text="Uninstall" if installed else "Install")
+
+    def _on_toggle_language_pack(self, pack_id: str) -> None:
+        from tkinter import messagebox
+
+        entry = LANGUAGE_PACKS[pack_id]
+        installed = is_pack_installed(pack_id)
+        action = "uninstall" if installed else "install"
+        verb = "Uninstall" if installed else "Install"
+        confirmed = messagebox.askyesno(
+            "Interview Analyzer",
+            f"{verb} the '{entry['label']}' language pack ({entry['pip_package']})?\n\n{entry['description']}",
+            parent=self._root,
+        )
+        if not confirmed:
+            return
+        PackActionDialog(pack_id, action, ui_root=self._root, on_done=lambda _ok: self._refresh_language_pack_rows())
+
+    def _refresh_model_status_label(self) -> None:
+        if self._model_status_label is None:
+            return
+        model_name = self._model_name_entry.get().strip()
+        if not model_name:
+            self._model_status_label.config(text="")
+            return
+        self._model_status_label.config(text=size_label(model_name))
+
+    def _on_install_model(self) -> None:
+        from tkinter import messagebox
+
+        model_name = self._model_name_entry.get().strip()
+        if not model_name:
+            return
+        host = self.watcher.cfg.analysis.get("ollama_host", "http://localhost:11434")
+        catalog_note = MODEL_CATALOG.get(model_name, {}).get("description", "")
+        if ollama_is_reachable(host) and is_model_installed(model_name, host):
+            messagebox.showinfo("Interview Analyzer", f"{model_name} is already installed.", parent=self._root)
+            return
+        confirmed = messagebox.askyesno(
+            "Interview Analyzer",
+            f"Download {model_name} ({size_label(model_name)}) via Ollama?\n\n{catalog_note}\n\n"
+            "This downloads to your machine and runs fully locally afterwards.",
+            parent=self._root,
+        )
+        if not confirmed:
+            return
+        ModelInstallDialog(model_name, host, ui_root=self._root)
 
     def _on_save_settings(self) -> None:
         updates: dict[str, object] = {}
@@ -353,6 +991,27 @@ class Dashboard:
                 updates[dotted] = bool(widget.var.get())
             else:
                 updates[dotted] = widget.get()
+
+        # Switching to an Ollama model that isn't downloaded yet is a
+        # multi-GB action -- confirm it explicitly rather than silently
+        # kicking off a background pull the user didn't ask for.
+        new_engine = updates.get("analysis.engine", self.watcher.cfg.analysis.get("engine", "ollama"))
+        new_model = updates.get("analysis.llm_model", self.watcher.cfg.analysis.get("llm_model"))
+        if new_engine == "ollama" and new_model:
+            host = self.watcher.cfg.analysis.get("ollama_host", "http://localhost:11434")
+            if ollama_is_reachable(host) and not is_model_installed(new_model, host):
+                from tkinter import messagebox
+
+                confirmed = messagebox.askyesno(
+                    "Interview Analyzer",
+                    f"{new_model} isn't installed yet ({size_label(new_model)} download). "
+                    "Install it now via the Settings tab's \"Install model...\" button, "
+                    "then Save again?\n\nSaving without installing it first will make analysis "
+                    "fail until you do.",
+                    parent=self._root,
+                )
+                if not confirmed:
+                    return
 
         try:
             save_editable_settings(self.watcher.cfg.path, updates)
