@@ -179,7 +179,9 @@ def test_browser_tab_match_needs_more_sustained_presence_than_a_desktop_app(tmp_
     watcher = MeetingWatcher(cfg, user_id=1)
 
     with patch("interview_analyzer.watcher.detect_active_meeting", return_value=("Meet", False)), \
-         patch("interview_analyzer.watcher.ask_consent", return_value=True) as mock_consent:
+         patch("interview_analyzer.watcher.ask_consent", return_value=True) as mock_consent, \
+         patch("interview_analyzer.watcher.SystemAudioRecorder"), \
+         patch("interview_analyzer.watcher.RecordingControlPanel"):
         watcher._tick()  # poll 1
         watcher._tick()  # poll 2 -- would already trigger a desktop-app match
         mock_consent.assert_not_called()
