@@ -15,8 +15,9 @@ import logging
 import os
 import pathlib
 import threading
-from typing import Optional
+from typing import Callable, Optional
 
+from . import api_keys
 from .confidence import format_confidence
 from .language_packs import LANGUAGE_PACKS, PackActionDialog, is_pack_installed
 from .model_setup import (
@@ -26,7 +27,7 @@ from .model_setup import (
     ollama_is_reachable,
     size_label,
 )
-from .report import trends_report_path
+from .report import write_trends_report
 from .report_view import render_into_text_widget
 from .settings_editor import load_editable_settings, save_editable_settings
 from .tray import job_text
@@ -36,6 +37,10 @@ logger = logging.getLogger(__name__)
 _WHISPER_MODELS = ["tiny", "base", "small", "medium", "large-v3"]
 _ANALYSIS_ENGINES = ["ollama", "anthropic_api", "openai_api"]
 _TRANSCRIPTION_LANGUAGES = ["auto", "en", "hi", "hinglish"]
+# "Not rated" (index 0) doubles as the clear-a-rating value for the
+# feedback panel's Comboboxes -- selecting it and saving is how you clear
+# a previously-given score.
+_FEEDBACK_SCORE_VALUES = ["Not rated"] + [str(i) for i in range(1, 11)]
 
 
 def _format_elapsed(seconds: float) -> str:
@@ -117,8 +122,10 @@ def _configure_report_tags(text_widget) -> None:
 
 
 class Dashboard:
-    def __init__(self, watcher):
+    def __init__(self, watcher, on_logout: Optional[Callable[[], None]] = None):
         self.watcher = watcher
+        self._on_logout = on_logout
+        self._logout_btn = None
         self._lock = threading.Lock()
         self._root = None
         # set once the window is fully built and about to enter mainloop();
@@ -167,6 +174,9 @@ class Dashboard:
         self._fb_confidence_label = None
         self._model_name_entry = None
         self._model_status_label = None
+        self._api_key_provider = None
+        self._api_key_entry = None
+        self._api_key_status_label = None
         self._lang_pack_rows: dict[str, dict[str, object]] = {}
 
     @property
@@ -272,10 +282,53 @@ class Dashboard:
             self._root.destroy()
         self._root = None
 
+    # -- shared helpers -----------------------------------------------------
+
+    def _make_scrollable_tab(self, notebook, tk, ttk):
+        """Wraps a tab's content in a vertically-scrollable canvas, so
+        content/buttons further down (e.g. Settings' Save button) stay
+        reachable via a scrollbar or mouse wheel instead of getting clipped
+        off in a window smaller than the content -- both tabs' content only
+        grows as more settings/sections get added over time, so a fixed
+        window size can't be relied on to always fit everything.
+
+        Returns (outer_frame_to_add_to_notebook, inner_frame_to_build_content_in) --
+        callers build their tab exactly as before, just into the inner frame."""
+        outer = ttk.Frame(notebook)
+        canvas = tk.Canvas(outer, highlightthickness=0)
+        vsb = ttk.Scrollbar(outer, orient="vertical", command=canvas.yview)
+        canvas.configure(yscrollcommand=vsb.set)
+        canvas.pack(side="left", fill="both", expand=True)
+        vsb.pack(side="right", fill="y")
+
+        inner = ttk.Frame(canvas, padding=16)
+        inner_id = canvas.create_window((0, 0), window=inner, anchor="nw")
+
+        def _on_inner_configure(_event=None):
+            canvas.configure(scrollregion=canvas.bbox("all"))
+
+        def _on_canvas_configure(event):
+            # the inner frame always matches the canvas's width -- only
+            # vertical scrolling is needed, horizontal would just look broken
+            canvas.itemconfig(inner_id, width=event.width)
+
+        inner.bind("<Configure>", _on_inner_configure)
+        canvas.bind("<Configure>", _on_canvas_configure)
+
+        def _on_mousewheel(event):
+            canvas.yview_scroll(int(-1 * (event.delta / 120)), "units")
+
+        # only captures the mouse wheel while actually hovering this tab's
+        # canvas, so scrolling a different tab/widget elsewhere isn't affected
+        canvas.bind("<Enter>", lambda _e: canvas.bind_all("<MouseWheel>", _on_mousewheel))
+        canvas.bind("<Leave>", lambda _e: canvas.unbind_all("<MouseWheel>"))
+
+        return outer, inner
+
     # -- Status tab ---------------------------------------------------------
 
     def _build_status_tab(self, notebook, tk, ttk):
-        frame = ttk.Frame(notebook, padding=16)
+        outer, frame = self._make_scrollable_tab(notebook, tk, ttk)
 
         self._status_label = ttk.Label(frame, text="", font=("Segoe UI", 14, "bold"))
         self._status_label.pack(anchor="w")
@@ -310,6 +363,10 @@ class Dashboard:
             frame, text="Open recordings folder", command=self._on_open_recordings_folder
         ).pack(anchor="w", pady=(14, 0))
 
+        if self._on_logout is not None:
+            self._logout_btn = ttk.Button(frame, text="Log out", command=self._on_click_logout)
+            self._logout_btn.pack(anchor="w", pady=(8, 0))
+
         # background transcribe/analyze/report jobs are independent of the
         # live recording state above -- a new call can be recording while an
         # earlier one is still processing -- so they get their own line
@@ -323,7 +380,7 @@ class Dashboard:
             foreground="#5b645f", justify="left",
         ).pack(anchor="w", pady=(20, 0))
 
-        return frame
+        return outer
 
     def _on_toggle_pause(self) -> None:
         if self.watcher.status.get("state") == "paused":
@@ -353,6 +410,13 @@ class Dashboard:
         except Exception:  # noqa: BLE001
             logger.exception("Failed to open recordings folder %s", folder)
 
+    def _on_click_logout(self) -> None:
+        # only enabled while idle (see _refresh_status) -- logging out
+        # mid-call would silently abandon an active recording, same rule as
+        # the tray menu's "Log out" item
+        if self._on_logout is not None:
+            self._on_logout()
+
     def _refresh_status(self) -> None:
         if self._root is None or self._status_label is None:
             return
@@ -362,6 +426,8 @@ class Dashboard:
 
         self._manual_start_btn.config(state="normal" if state == "idle" else "disabled")
         self._manual_start_entry.config(state="normal" if state == "idle" else "disabled")
+        if self._logout_btn is not None:
+            self._logout_btn.config(state="normal" if state == "idle" else "disabled")
 
         if state == "idle":
             self._status_label.config(text="● Idle", foreground="#5b645f")
@@ -540,35 +606,47 @@ class Dashboard:
         return frame
 
     def _build_feedback_panel(self, parent, tk, ttk):
-        """A compact "was this right?" panel shown under a selected
+        """A compact "how good was this?" panel shown under a selected
         interview's report. Feedback here is what calibrates the
         confidence score shown on *future* reports and feeds corrective
-        notes back into future analysis prompts -- see confidence.py."""
+        notes back into future analysis prompts -- see confidence.py.
+        Scores are 1-10 (10 highest); "Not rated" is both the default and
+        how to clear a rating (see _on_clear_feedback_ratings)."""
         panel = ttk.LabelFrame(parent, text="Feedback", padding=8)
 
         row1 = ttk.Frame(panel)
         row1.pack(fill="x", pady=(0, 4))
-        ttk.Label(row1, text="Transcription accurate?", width=22).pack(side="left")
-        self._fb_transcript_var = tk.StringVar(value="")
-        ttk.Radiobutton(row1, text="Yes", variable=self._fb_transcript_var, value="yes").pack(side="left")
-        ttk.Radiobutton(row1, text="No", variable=self._fb_transcript_var, value="no").pack(side="left")
+        ttk.Label(row1, text="Transcription quality (1-10)", width=24).pack(side="left")
+        self._fb_transcript_var = tk.StringVar(value=_FEEDBACK_SCORE_VALUES[0])
+        ttk.Combobox(
+            row1, textvariable=self._fb_transcript_var, values=_FEEDBACK_SCORE_VALUES,
+            state="readonly", width=10,
+        ).pack(side="left")
 
         row2 = ttk.Frame(panel)
         row2.pack(fill="x", pady=(0, 4))
-        ttk.Label(row2, text="Analysis accurate/helpful?", width=22).pack(side="left")
-        self._fb_analysis_var = tk.StringVar(value="")
-        ttk.Radiobutton(row2, text="Yes", variable=self._fb_analysis_var, value="yes").pack(side="left")
-        ttk.Radiobutton(row2, text="No", variable=self._fb_analysis_var, value="no").pack(side="left")
+        ttk.Label(row2, text="Analysis quality (1-10)", width=24).pack(side="left")
+        self._fb_analysis_var = tk.StringVar(value=_FEEDBACK_SCORE_VALUES[0])
+        ttk.Combobox(
+            row2, textvariable=self._fb_analysis_var, values=_FEEDBACK_SCORE_VALUES,
+            state="readonly", width=10,
+        ).pack(side="left")
 
         row3 = ttk.Frame(panel)
         row3.pack(fill="x", pady=(0, 4))
-        ttk.Label(row3, text="Comment (optional)", width=22).pack(side="left")
+        ttk.Label(row3, text="Comment (optional)", width=24).pack(side="left")
         self._fb_comment_entry = ttk.Entry(row3)
         self._fb_comment_entry.pack(side="left", fill="x", expand=True)
 
         row4 = ttk.Frame(panel)
         row4.pack(fill="x")
         ttk.Button(row4, text="Submit feedback", command=self._on_submit_feedback).pack(side="left")
+        ttk.Button(row4, text="Clear ratings", command=self._on_clear_feedback_ratings).pack(
+            side="left", padx=(6, 0)
+        )
+        ttk.Button(row4, text="Delete feedback", command=self._on_delete_feedback).pack(
+            side="left", padx=(6, 0)
+        )
         self._fb_status_label = ttk.Label(row4, text="", foreground="#2f6f5e")
         self._fb_status_label.pack(side="left", padx=(10, 0))
 
@@ -577,24 +655,53 @@ class Dashboard:
 
         return panel
 
+    @staticmethod
+    def _feedback_score_from_var(var) -> Optional[int]:
+        value = var.get()
+        return None if value == _FEEDBACK_SCORE_VALUES[0] else int(value)
+
     def _on_submit_feedback(self) -> None:
         record = self._selected_record()
         if record is None:
             return
-
-        def _as_bool(var) -> Optional[bool]:
-            value = var.get()
-            return {"yes": True, "no": False}.get(value)
-
         comment = self._fb_comment_entry.get().strip()
         self.watcher.db.save_feedback(
             record.id,
             user_id=self.watcher.user_id,
-            transcript_correct=_as_bool(self._fb_transcript_var),
-            analysis_correct=_as_bool(self._fb_analysis_var),
+            transcript_score=self._feedback_score_from_var(self._fb_transcript_var),
+            analysis_score=self._feedback_score_from_var(self._fb_analysis_var),
             comment=comment,
         )
         self._fb_status_label.config(text="Saved -- thanks, this improves future confidence scoring.")
+
+    def _on_clear_feedback_ratings(self) -> None:
+        """Resets both scores to "Not rated" and the comment to empty, and
+        saves that immediately -- the requested "clear the rating and save"
+        action. Distinct from Delete feedback below, which removes the row
+        entirely rather than leaving an explicitly-unrated one."""
+        record = self._selected_record()
+        if record is None:
+            return
+        self._fb_transcript_var.set(_FEEDBACK_SCORE_VALUES[0])
+        self._fb_analysis_var.set(_FEEDBACK_SCORE_VALUES[0])
+        self._fb_comment_entry.delete(0, "end")
+        self.watcher.db.save_feedback(
+            record.id, user_id=self.watcher.user_id,
+            transcript_score=None, analysis_score=None, comment="",
+        )
+        self._fb_status_label.config(text="Ratings cleared.")
+
+    def _on_delete_feedback(self) -> None:
+        """Removes this interview's feedback row entirely -- for a rating
+        given by mistake, e.g. clicking the wrong interview's row."""
+        record = self._selected_record()
+        if record is None:
+            return
+        self.watcher.db.delete_feedback(record.id)
+        self._fb_transcript_var.set(_FEEDBACK_SCORE_VALUES[0])
+        self._fb_analysis_var.set(_FEEDBACK_SCORE_VALUES[0])
+        self._fb_comment_entry.delete(0, "end")
+        self._fb_status_label.config(text="Feedback deleted.")
 
     def _refresh_feedback_panel(self, record) -> None:
         if self._fb_frame is None:
@@ -607,9 +714,12 @@ class Dashboard:
         self._fb_status_label.config(text="")
 
         existing = self.watcher.db.get_feedback(record.id)
-        to_str = lambda v: "" if v is None else ("yes" if v else "no")  # noqa: E731
-        self._fb_transcript_var.set(to_str(existing.transcript_correct) if existing else "")
-        self._fb_analysis_var.set(to_str(existing.analysis_correct) if existing else "")
+
+        def _to_display(score: Optional[int]) -> str:
+            return _FEEDBACK_SCORE_VALUES[0] if score is None else str(score)
+
+        self._fb_transcript_var.set(_to_display(existing.transcript_score if existing else None))
+        self._fb_analysis_var.set(_to_display(existing.analysis_score if existing else None))
         self._fb_comment_entry.delete(0, "end")
         if existing and existing.comment:
             self._fb_comment_entry.insert(0, existing.comment)
@@ -824,23 +934,30 @@ class Dashboard:
     def _refresh_trends(self) -> None:
         if self._trends_text is None:
             return
-        trends_path = trends_report_path(self.watcher.cfg, user_id=self.watcher.user_id)
+        # Regenerated from the DB every time rather than just reading
+        # whatever file happens to be on disk -- it's a cheap in-memory
+        # aggregation (no LLM calls), and relying on a stale/possibly-never
+        # -written file is exactly what caused a real bug: a profile with
+        # real interview history saw "No trends yet" because its per-user
+        # trends file had never been generated (the file previously only
+        # got (re)written as a side effect of finishing a *new* interview's
+        # analysis, so profiles whose most recent interview predated that
+        # per-user split never got one written for them retroactively).
+        records = self.watcher.db.list_all(user_id=self.watcher.user_id)
+        trends_path = write_trends_report(records, self.watcher.cfg, user_id=self.watcher.user_id)
         self._trends_text.config(state="normal")
-        if trends_path.exists():
-            render_into_text_widget(self._trends_text, trends_path.read_text(encoding="utf-8"))
-        else:
-            render_into_text_widget(self._trends_text, "# No trends yet\n\nComplete an interview to start tracking recurring issues.")
+        render_into_text_widget(self._trends_text, trends_path.read_text(encoding="utf-8"))
         self._trends_text.config(state="disabled")
 
     # -- Settings tab -----------------------------------------------------
 
     def _build_settings_tab(self, notebook, tk, ttk):
-        frame = ttk.Frame(notebook, padding=16)
+        outer, frame = self._make_scrollable_tab(notebook, tk, ttk)
         cfg = self.watcher.cfg
 
         if cfg.path is None:
             ttk.Label(frame, text="No config file path available to edit.").pack(anchor="w")
-            return frame
+            return outer
 
         current = load_editable_settings(cfg.path)
         self._settings_widgets = {}
@@ -932,6 +1049,8 @@ class Dashboard:
         e.bind("<KeyRelease>", lambda _e: self._refresh_model_status_label())
         self._refresh_model_status_label()
 
+        r = self._build_api_key_row(form, tk, ttk, r)
+
         e = ttk.Entry(form)
         e.insert(0, current.get("output.output_dir", "output"))
         _row(r, "Reports output dir", "output.output_dir", e); r += 1
@@ -947,7 +1066,7 @@ class Dashboard:
         ttk.Button(frame, text="Save", command=self._on_save_settings).pack(anchor="w", pady=(16, 4))
         self._settings_status.pack(anchor="w")
 
-        return frame
+        return outer
 
     def _build_language_pack_rows(self, form, ttk, r: int) -> int:
         """One row per optional language pack (see language_packs.py) --
@@ -986,6 +1105,75 @@ class Dashboard:
         if not confirmed:
             return
         PackActionDialog(pack_id, action, ui_root=self._root, on_done=lambda _ok: self._refresh_language_pack_rows())
+
+    def _build_api_key_row(self, form, tk, ttk, r: int) -> int:
+        """Cloud API key entry for anthropic_api/openai_api -- saved
+        locally, encrypted with Windows DPAPI (see api_keys.py), never
+        written into config.yaml. A claude.ai/ChatGPT *subscription* does
+        not grant API access -- this only ever stores a real API key you
+        paste in from console.anthropic.com / platform.openai.com."""
+        row = ttk.Frame(form)
+        row.grid(row=r, column=0, columnspan=2, sticky="ew", pady=2)
+
+        self._api_key_provider = ttk.Combobox(
+            row, values=["anthropic_api", "openai_api"], state="readonly", width=13
+        )
+        self._api_key_provider.set("anthropic_api")
+        self._api_key_provider.pack(side="left")
+        self._api_key_entry = ttk.Entry(row, show="*", width=24)
+        self._api_key_entry.pack(side="left", padx=(6, 6))
+        ttk.Button(row, text="Save key", command=self._on_save_api_key).pack(side="left")
+        ttk.Button(row, text="Clear key", command=self._on_clear_api_key).pack(side="left", padx=(6, 0))
+        self._api_key_provider.bind("<<ComboboxSelected>>", lambda _e: self._refresh_api_key_status())
+
+        ttk.Label(form, text="Cloud API key").grid(row=r, column=0, sticky="w", pady=4, padx=(0, 12))
+        r += 1
+        self._api_key_status_label = ttk.Label(form, text="", foreground="#5b645f")
+        self._api_key_status_label.grid(row=r, column=1, sticky="w"); r += 1
+        ttk.Label(
+            form,
+            text="A claude.ai / ChatGPT subscription does NOT work here -- this needs a real API\n"
+                 "key from console.anthropic.com / platform.openai.com (separately billed).",
+            foreground="#6b6b6b", justify="left",
+        ).grid(row=r, column=1, sticky="w"); r += 1
+
+        self._refresh_api_key_status()
+        return r
+
+    def _refresh_api_key_status(self) -> None:
+        if self._api_key_status_label is None:
+            return
+        provider = self._api_key_provider.get()
+        if api_keys.has_key(provider):
+            key = api_keys.load_key(provider)
+            shown = api_keys.masked(key) if key else "saved"
+            self._api_key_status_label.config(text=f"{provider}: key saved ({shown})", foreground="#2f6f5e")
+        else:
+            self._api_key_status_label.config(text=f"{provider}: not set", foreground="#5b645f")
+
+    def _on_save_api_key(self) -> None:
+        from tkinter import messagebox
+
+        provider = self._api_key_provider.get()
+        key = self._api_key_entry.get().strip()
+        if not key:
+            return
+        if api_keys.save_key(provider, key):
+            self._api_key_entry.delete(0, "end")
+            self._refresh_api_key_status()
+        else:
+            messagebox.showwarning(
+                "Interview Analyzer",
+                "Couldn't save the key locally (Windows DPAPI unavailable). "
+                "Use the INTERVIEW_ANALYZER_API_KEY environment variable instead -- "
+                "see docs/using_cloud_apis.md.",
+                parent=self._root,
+            )
+
+    def _on_clear_api_key(self) -> None:
+        provider = self._api_key_provider.get()
+        api_keys.clear_key(provider)
+        self._refresh_api_key_status()
 
     def _refresh_model_status_label(self) -> None:
         if self._model_status_label is None:

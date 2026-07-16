@@ -1,24 +1,19 @@
 """Tests for confidence.py: the "how much should I trust this assessment"
 score shown on each report, and the calibration notes fed back into future
-analysis prompts from past feedback."""
+analysis prompts from past feedback. Feedback is a 1-10 quality score (10
+highest), not a Yes/No -- see db.py's FeedbackRecord."""
 from __future__ import annotations
 
 from unittest.mock import MagicMock
 
 from interview_analyzer.confidence import (
     MIN_FEEDBACK_SAMPLES,
+    NEGATIVE_SCORE_THRESHOLD,
     calibrated_confidence,
     calibration_notes,
     format_confidence,
 )
-from interview_analyzer.db import FeedbackRecord, InterviewDB
-
-
-def _feedback(analysis_correct, transcript_correct=True, comment="") -> FeedbackRecord:
-    return FeedbackRecord(
-        interview_id=1, user_id=1, transcript_correct=transcript_correct,
-        analysis_correct=analysis_correct, comment=comment, created_at="2026-01-01T00:00:00",
-    )
+from interview_analyzer.db import InterviewDB
 
 
 class TestCalibratedConfidence:
@@ -33,27 +28,28 @@ class TestCalibratedConfidence:
         assert result["score"] is None
         assert result["source"] == "unavailable"
 
-    def test_uses_feedback_accuracy_once_enough_samples_exist(self, tmp_path):
+    def test_uses_average_feedback_score_once_enough_samples_exist(self, tmp_path):
         db = InterviewDB(tmp_path / "test.db")
         iid_a = db.start_interview("Zoom", str(tmp_path / "a.wav"), retention_days=3, user_id=1)
         iid_b = db.start_interview("Zoom", str(tmp_path / "b.wav"), retention_days=3, user_id=1)
         iid_c = db.start_interview("Zoom", str(tmp_path / "c.wav"), retention_days=3, user_id=1)
-        db.save_feedback(iid_a, user_id=1, transcript_correct=True, analysis_correct=True, comment="")
-        db.save_feedback(iid_b, user_id=1, transcript_correct=True, analysis_correct=True, comment="")
-        db.save_feedback(iid_c, user_id=1, transcript_correct=True, analysis_correct=False, comment="")
+        db.save_feedback(iid_a, user_id=1, transcript_score=10, analysis_score=10, comment="")
+        db.save_feedback(iid_b, user_id=1, transcript_score=10, analysis_score=8, comment="")
+        db.save_feedback(iid_c, user_id=1, transcript_score=10, analysis_score=3, comment="")
 
         assert MIN_FEEDBACK_SAMPLES == 3  # this test assumes exactly the threshold
         result = calibrated_confidence(db, user_id=1, model_reported=99)
-        assert result == {"score": 67, "source": "feedback", "sample_size": 3}  # 2/3 accurate, rounded
+        # average analysis_score = (10+8+3)/3 = 7.0 -> 70%
+        assert result == {"score": 70, "source": "feedback", "sample_size": 3}
 
     def test_ignores_ratings_that_only_cover_transcript_not_analysis(self, tmp_path):
-        """analysis_correct is the signal for analysis confidence --
-        someone who only ever rated transcription accuracy shouldn't count
-        toward the analysis-quality sample size."""
+        """analysis_score is the signal for analysis confidence -- someone
+        who only ever rated transcription accuracy shouldn't count toward
+        the analysis-quality sample size."""
         db = InterviewDB(tmp_path / "test.db")
         for i in range(5):
             iid = db.start_interview("Zoom", str(tmp_path / f"{i}.wav"), retention_days=3, user_id=1)
-            db.save_feedback(iid, user_id=1, transcript_correct=False, analysis_correct=None, comment="")
+            db.save_feedback(iid, user_id=1, transcript_score=2, analysis_score=None, comment="")
 
         result = calibrated_confidence(db, user_id=1, model_reported=55)
         assert result == {"score": 55, "source": "model", "sample_size": 0}
@@ -105,25 +101,35 @@ class TestCalibrationNotes:
     def test_empty_when_no_negative_feedback(self, tmp_path):
         db = InterviewDB(tmp_path / "test.db")
         iid = db.start_interview("Zoom", str(tmp_path / "a.wav"), retention_days=3, user_id=1)
-        db.save_feedback(iid, user_id=1, transcript_correct=True, analysis_correct=True, comment="great")
+        db.save_feedback(iid, user_id=1, transcript_score=9, analysis_score=9, comment="great")
 
         assert calibration_notes(db, user_id=1) == ""
 
-    def test_includes_comments_from_negative_feedback(self, tmp_path):
+    def test_includes_comments_from_low_scoring_feedback(self, tmp_path):
         db = InterviewDB(tmp_path / "test.db")
         iid = db.start_interview("Zoom", str(tmp_path / "a.wav"), retention_days=3, user_id=1)
         db.save_feedback(
-            iid, user_id=1, transcript_correct=True, analysis_correct=False,
+            iid, user_id=1, transcript_score=9, analysis_score=NEGATIVE_SCORE_THRESHOLD,
             comment="missed that I gave a metric in my answer",
         )
 
         notes = calibration_notes(db, user_id=1)
         assert "missed that I gave a metric in my answer" in notes
 
+    def test_excludes_comments_from_above_threshold_feedback(self, tmp_path):
+        db = InterviewDB(tmp_path / "test.db")
+        iid = db.start_interview("Zoom", str(tmp_path / "a.wav"), retention_days=3, user_id=1)
+        db.save_feedback(
+            iid, user_id=1, transcript_score=9, analysis_score=NEGATIVE_SCORE_THRESHOLD + 1,
+            comment="a decent analysis, minor nitpick",
+        )
+
+        assert calibration_notes(db, user_id=1) == ""
+
     def test_ignores_negative_feedback_without_a_comment(self, tmp_path):
         db = InterviewDB(tmp_path / "test.db")
         iid = db.start_interview("Zoom", str(tmp_path / "a.wav"), retention_days=3, user_id=1)
-        db.save_feedback(iid, user_id=1, transcript_correct=True, analysis_correct=False, comment="")
+        db.save_feedback(iid, user_id=1, transcript_score=9, analysis_score=1, comment="")
 
         assert calibration_notes(db, user_id=1) == ""
 
@@ -137,7 +143,7 @@ class TestCalibrationNotes:
         db = InterviewDB(tmp_path / "test.db")
         for i in range(8):
             iid = db.start_interview("Zoom", str(tmp_path / f"{i}.wav"), retention_days=3, user_id=1)
-            db.save_feedback(iid, user_id=1, transcript_correct=True, analysis_correct=False, comment=f"issue {i}")
+            db.save_feedback(iid, user_id=1, transcript_score=9, analysis_score=1, comment=f"issue {i}")
 
         notes = calibration_notes(db, user_id=1, limit=3)
         assert notes.count("- issue") == 3

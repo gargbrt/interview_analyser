@@ -12,12 +12,12 @@ retention_days: 3
 # auto-recording when detected running. Extend this list for other apps.
 watched_processes:
   desktop_apps:
-    - "Teams.exe"
-    - "Teams2.exe"        # new Teams client
-    - "CiscoWebExStart.exe"
-    - "webexmta.exe"
-    - "Zoom.exe"
-    - "AmazonChime.exe"
+  - "Teams.exe"
+  - "Teams2.exe"          # new Teams client
+  - "CiscoWebExStart.exe"
+  - "webexmta.exe"
+  - "Zoom.exe"
+  - "AmazonChime.exe"
   browser_tab_keywords:
     # Matched against browser window/tab titles when a browser process
     # (chrome.exe, msedge.exe, firefox.exe) is running. This is inherently
@@ -35,18 +35,18 @@ watched_processes:
     # bringing back the over-detection this was meant to fix. If detection
     # ever misses a real call, use the dashboard's "Start recording" button
     # as a manual fallback rather than widening this keyword.
-    - "Meet – "
-    - "Zoom Meeting"
-    - "webex.com"
-    - "chime.aws"
-    - "teams.microsoft.com"
+  - "Meet – "
+  - "Zoom Meeting"
+  - "webex.com"
+  - "chime.aws"
+  - "teams.microsoft.com"
   browser_processes:
-    - "chrome.exe"
-    - "msedge.exe"
-    - "firefox.exe"
+  - "chrome.exe"
+  - "msedge.exe"
+  - "firefox.exe"
 
 # How often (seconds) the watcher polls running processes/window titles.
-poll_interval_seconds: 5
+poll_interval_seconds: 5.0
 
 # Require the meeting window/process to be present for this many consecutive
 # polls before starting recording, to avoid false triggers from a window
@@ -83,7 +83,7 @@ post_call_cooldown_seconds: 30
 # matching well past when you've actually left the call (see
 # browser_tab_keywords above), which would otherwise mean never being
 # prompted again for a genuinely new call without restarting the app.
-declined_cooldown_seconds: 300
+declined_cooldown_seconds: 300.0
 
 # --- Recording ---
 audio:

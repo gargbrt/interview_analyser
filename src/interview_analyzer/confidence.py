@@ -27,6 +27,11 @@ logger = logging.getLogger(__name__)
 # to be a more meaningful signal than the model's own self-assessment.
 MIN_FEEDBACK_SAMPLES = 3
 
+# Feedback is a 1-10 quality score (10 = highest, see db.py); a score at or
+# below this is "negative" enough to be worth feeding back into future
+# analysis prompts as a corrective note (see calibration_notes below).
+NEGATIVE_SCORE_THRESHOLD = 4
+
 
 def calibrated_confidence(db, user_id: Optional[int], model_reported: Optional[float]) -> dict:
     """Returns {"score": int|None, "source": "feedback"|"model"|"unavailable",
@@ -34,7 +39,7 @@ def calibrated_confidence(db, user_id: Optional[int], model_reported: Optional[f
     feedback history nor a model-reported figure to fall back to."""
     try:
         feedback = db.list_feedback(user_id=user_id)
-        rated = [f for f in feedback if f.analysis_correct is not None]
+        rated = [f for f in feedback if f.analysis_score is not None]
     except Exception:  # noqa: BLE001
         # feedback table unreadable for any reason -- fall back to the
         # model's own figure rather than let confidence scoring break
@@ -43,8 +48,9 @@ def calibrated_confidence(db, user_id: Optional[int], model_reported: Optional[f
         rated = None
 
     if rated is not None and len(rated) >= MIN_FEEDBACK_SAMPLES:
-        accurate = sum(1 for f in rated if f.analysis_correct)
-        return {"score": round(100 * accurate / len(rated)), "source": "feedback", "sample_size": len(rated)}
+        # average 1-10 score, normalized to a 0-100 scale
+        avg_score = sum(f.analysis_score for f in rated) / len(rated)
+        return {"score": round(avg_score / 10 * 100), "source": "feedback", "sample_size": len(rated)}
 
     if model_reported is not None:
         try:
@@ -84,7 +90,10 @@ def calibration_notes(db, user_id: Optional[int], limit: int = 5) -> str:
 
     negative = [
         f for f in feedback
-        if f.comment and f.comment.strip() and (f.analysis_correct is False or f.transcript_correct is False)
+        if f.comment and f.comment.strip() and (
+            (f.analysis_score is not None and f.analysis_score <= NEGATIVE_SCORE_THRESHOLD)
+            or (f.transcript_score is not None and f.transcript_score <= NEGATIVE_SCORE_THRESHOLD)
+        )
     ]
     if not negative:
         return ""

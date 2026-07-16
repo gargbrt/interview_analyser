@@ -21,6 +21,7 @@ from typing import Callable, Optional
 
 import requests
 
+from . import api_keys
 from .config_loader import Config
 from .engines import AnalysisEngine, get_engine, register_engine
 from .rubric import build_prompt
@@ -85,11 +86,16 @@ class AnthropicEngine(AnalysisEngine):
 
     def __init__(self, acfg: dict):
         env_var = acfg.get("cloud_api_key_env_var", "INTERVIEW_ANALYZER_API_KEY")
-        self.api_key = os.environ.get(env_var)
+        # the environment variable (the original mechanism) always wins if
+        # set; otherwise fall back to a key saved via the Settings tab's
+        # "Cloud API key" section (see api_keys.py -- encrypted at rest,
+        # never plaintext)
+        self.api_key = os.environ.get(env_var) or api_keys.load_key("anthropic_api")
         if not self.api_key:
             raise RuntimeError(
-                f"Set the {env_var} environment variable to an Anthropic API key "
-                "(from console.anthropic.com, not your claude.ai subscription) to use anthropic_api."
+                f"No Anthropic API key found. Set it in the Settings tab's \"Cloud API key\" "
+                f"section, or set the {env_var} environment variable, to a real API key from "
+                "console.anthropic.com (not your claude.ai subscription -- that doesn't grant API access)."
             )
         self.model = acfg.get("llm_model", "claude-sonnet-5")
 
@@ -120,9 +126,13 @@ class AnthropicEngine(AnalysisEngine):
 class OpenAIEngine(AnalysisEngine):
     def __init__(self, acfg: dict):
         env_var = acfg.get("cloud_api_key_env_var", "INTERVIEW_ANALYZER_API_KEY")
-        self.api_key = os.environ.get(env_var)
+        self.api_key = os.environ.get(env_var) or api_keys.load_key("openai_api")
         if not self.api_key:
-            raise RuntimeError(f"Set the {env_var} environment variable to use openai_api.")
+            raise RuntimeError(
+                f"No OpenAI API key found. Set it in the Settings tab's \"Cloud API key\" "
+                f"section, or set the {env_var} environment variable, to a real API key from "
+                "platform.openai.com (not your ChatGPT subscription -- that doesn't grant API access)."
+            )
         self.model = acfg.get("llm_model", "gpt-4o-mini")
 
     def run(self, prompt: str, on_progress: Optional[Callable[[float], None]] = None) -> str:

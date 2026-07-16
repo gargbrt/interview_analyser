@@ -35,11 +35,16 @@ CREATE TABLE IF NOT EXISTS interviews (
 -- calibrate the confidence score shown on later interviews' reports (see
 -- confidence.py) and to feed corrective notes back into future analysis
 -- prompts -- see analyzer.py/rubric.py's calibration_notes.
+-- Column names are a holdover from when this was a boolean Yes/No rating
+-- (kept as-is to avoid an ALTER TABLE migration for anyone with existing
+-- rows) -- they now hold a 1-10 quality score, NULL meaning "not rated".
+-- See FeedbackRecord's transcript_score/analysis_score for the current,
+-- accurately-named Python-level names.
 CREATE TABLE IF NOT EXISTS feedback (
     interview_id INTEGER PRIMARY KEY,
     user_id INTEGER,
-    transcript_correct INTEGER,  -- 1/0/NULL (NULL = not rated)
-    analysis_correct INTEGER,    -- 1/0/NULL
+    transcript_correct INTEGER,  -- 1-10/NULL (NULL = not rated)
+    analysis_correct INTEGER,    -- 1-10/NULL
     comment TEXT,
     created_at TEXT NOT NULL,
     FOREIGN KEY (interview_id) REFERENCES interviews(id)
@@ -70,8 +75,8 @@ class InterviewRecord:
 class FeedbackRecord:
     interview_id: int
     user_id: Optional[int]
-    transcript_correct: Optional[bool]
-    analysis_correct: Optional[bool]
+    transcript_score: Optional[int]  # 1-10, None = not rated
+    analysis_score: Optional[int]    # 1-10, None = not rated
     comment: Optional[str]
     created_at: str
 
@@ -196,13 +201,19 @@ class InterviewDB:
         self,
         interview_id: int,
         user_id: Optional[int],
-        transcript_correct: Optional[bool],
-        analysis_correct: Optional[bool],
+        transcript_score: Optional[int],
+        analysis_score: Optional[int],
         comment: str = "",
     ) -> None:
         """Upserts the single feedback row for this interview -- resubmitting
-        (e.g. changing your mind, or adding a comment later) replaces the
-        previous rating rather than accumulating duplicates."""
+        (e.g. changing your mind, adding a comment later, or clearing a
+        rating back to "not rated" by passing None) replaces the previous
+        rating rather than accumulating duplicates. Scores are 1-10 or None
+        (not rated) -- validated here since this is the one place every
+        write path (UI, tests) funnels through."""
+        for score in (transcript_score, analysis_score):
+            if score is not None and not (1 <= score <= 10):
+                raise ValueError(f"Feedback scores must be 1-10 or None, got {score!r}.")
         with self._lock:
             self._conn.execute(
                 """
@@ -218,12 +229,20 @@ class InterviewDB:
                 (
                     interview_id,
                     user_id,
-                    None if transcript_correct is None else int(transcript_correct),
-                    None if analysis_correct is None else int(analysis_correct),
+                    transcript_score,
+                    analysis_score,
                     comment,
                     dt.datetime.now().isoformat(),
                 ),
             )
+            self._conn.commit()
+
+    def delete_feedback(self, interview_id: int) -> None:
+        """Removes feedback for one interview entirely -- for clearing out
+        a feedback entry given by mistake, distinct from save_feedback(...,
+        None, None, "") which still leaves a (now-unrated) row behind."""
+        with self._lock:
+            self._conn.execute("DELETE FROM feedback WHERE interview_id = ?", (interview_id,))
             self._conn.commit()
 
     def get_feedback(self, interview_id: int) -> Optional[FeedbackRecord]:
@@ -248,8 +267,8 @@ class InterviewDB:
         return FeedbackRecord(
             interview_id=row["interview_id"],
             user_id=row["user_id"],
-            transcript_correct=None if row["transcript_correct"] is None else bool(row["transcript_correct"]),
-            analysis_correct=None if row["analysis_correct"] is None else bool(row["analysis_correct"]),
+            transcript_score=row["transcript_correct"],
+            analysis_score=row["analysis_correct"],
             comment=row["comment"],
             created_at=row["created_at"],
         )

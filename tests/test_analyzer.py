@@ -3,7 +3,8 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
-from interview_analyzer.analyzer import OllamaEngine, analyze_transcript
+from interview_analyzer import api_keys
+from interview_analyzer.analyzer import AnthropicEngine, OllamaEngine, OpenAIEngine, analyze_transcript
 from interview_analyzer.config_loader import Config
 from interview_analyzer.engines import AnalysisEngine, get_engine, register_engine
 
@@ -124,3 +125,50 @@ class TestOllamaEngineStreamingProgress:
 
         assert result == {"qa_pairs": []}
         assert progress_calls[-1] == 1.0
+
+
+class TestCloudEngineApiKeyResolution:
+    """A claude.ai/ChatGPT *subscription* does not grant API access -- both
+    cloud engines need a real API key, resolved from either the environment
+    variable (the original mechanism) or a key saved via the Settings tab's
+    "Cloud API key" section (api_keys.py), with the env var taking
+    precedence if both are set."""
+
+    def test_anthropic_engine_uses_env_var_when_set(self, monkeypatch, tmp_path):
+        monkeypatch.setenv("INTERVIEW_ANALYZER_API_KEY", "sk-ant-from-env")
+        with patch.object(api_keys, "_STORE_PATH", tmp_path / ".api_keys.json"):
+            engine = AnthropicEngine({})
+        assert engine.api_key == "sk-ant-from-env"
+
+    def test_anthropic_engine_falls_back_to_saved_key(self, monkeypatch, tmp_path):
+        monkeypatch.delenv("INTERVIEW_ANALYZER_API_KEY", raising=False)
+        with patch.object(api_keys, "_STORE_PATH", tmp_path / ".api_keys.json"):
+            api_keys.save_key("anthropic_api", "sk-ant-saved")
+            engine = AnthropicEngine({})
+        assert engine.api_key == "sk-ant-saved"
+
+    def test_anthropic_engine_env_var_takes_precedence_over_saved_key(self, monkeypatch, tmp_path):
+        monkeypatch.setenv("INTERVIEW_ANALYZER_API_KEY", "sk-ant-from-env")
+        with patch.object(api_keys, "_STORE_PATH", tmp_path / ".api_keys.json"):
+            api_keys.save_key("anthropic_api", "sk-ant-saved")
+            engine = AnthropicEngine({})
+        assert engine.api_key == "sk-ant-from-env"
+
+    def test_anthropic_engine_raises_a_clear_error_with_neither(self, monkeypatch, tmp_path):
+        monkeypatch.delenv("INTERVIEW_ANALYZER_API_KEY", raising=False)
+        with patch.object(api_keys, "_STORE_PATH", tmp_path / ".api_keys.json"):
+            with pytest.raises(RuntimeError, match="claude.ai subscription"):
+                AnthropicEngine({})
+
+    def test_openai_engine_falls_back_to_saved_key(self, monkeypatch, tmp_path):
+        monkeypatch.delenv("INTERVIEW_ANALYZER_API_KEY", raising=False)
+        with patch.object(api_keys, "_STORE_PATH", tmp_path / ".api_keys.json"):
+            api_keys.save_key("openai_api", "sk-openai-saved")
+            engine = OpenAIEngine({})
+        assert engine.api_key == "sk-openai-saved"
+
+    def test_openai_engine_raises_a_clear_error_with_neither(self, monkeypatch, tmp_path):
+        monkeypatch.delenv("INTERVIEW_ANALYZER_API_KEY", raising=False)
+        with patch.object(api_keys, "_STORE_PATH", tmp_path / ".api_keys.json"):
+            with pytest.raises(RuntimeError, match="ChatGPT subscription"):
+                OpenAIEngine({})

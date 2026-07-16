@@ -196,9 +196,10 @@ Explorer.
 
 ### Logging out / switching profiles
 
-Tray menu → **"Log out"** (shown while idle — stop any active recording
-first) closes the current profile's session and returns to the login
-dialog, without restarting the app. **"Quit"** exits entirely.
+**Log out** (only enabled while idle — stop any active recording first)
+closes the current profile's session and returns to the login dialog,
+without restarting the app. Available from two places: the **Status tab**
+(dashboard) and the **tray menu**. **Quit** (tray menu) exits entirely.
 
 ### Analysis model setup
 
@@ -219,12 +220,26 @@ change it:
 ### Feedback & confidence scoring
 
 Every report has a **Feedback** panel (History tab → select an interview)
-to rate whether the transcription and analysis were accurate, with an
-optional comment. This calibrates a **confidence score** shown on every
-report going forward (your own accuracy track record once you've rated a
-few, the model's own self-reported confidence before that) and feeds
-corrective notes from negative feedback back into future analysis prompts.
-See `docs/feedback_and_confidence.md` for details.
+to rate transcription and analysis quality on a **1-10 scale** (10 =
+highest), with an optional comment. **Clear ratings** resets both scores
+to "Not rated" and saves that; **Delete feedback** removes the feedback
+row entirely (for a rating given by mistake). Ratings calibrate a
+**confidence score** shown on every report going forward (your own average
+score once you've rated a few, the model's own self-reported confidence
+before that) and feed corrective notes from low-scored feedback back into
+future analysis prompts. See `docs/feedback_and_confidence.md` for details.
+
+### Using a paid/cloud model instead
+
+The default is free and local (Ollama). To use Anthropic's or OpenAI's API
+instead: Settings tab → **Cloud API key** — paste a real API key (from
+console.anthropic.com / platform.openai.com), **Save key** (encrypted
+locally with Windows DPAPI, never in `config.yaml`), then set **Analysis
+engine** to `anthropic_api`/`openai_api`. **A claude.ai or ChatGPT
+*subscription* does not work here** — API access is a separate,
+separately-billed credential; there's no "log in with your account" option
+because no such integration exists for either provider. See
+`docs/using_cloud_apis.md`.
 
 ### Language packs
 
@@ -245,27 +260,33 @@ Right/left-click for the menu:
 - **Stop recording** (only shown while recording — ends the call immediately
   and runs the report pipeline, same as the in-call control panel's Stop)
 - **Open dashboard**
+- **Log out** (only shown while idle)
 - **Quit**
 
 ### The dashboard
 
 Opens automatically on first launch, and any time from the tray icon. Four
-tabs:
+tabs (Status and Settings scroll if the window is too small to show
+everything at once — e.g. the Save button on Settings — either drag the
+scrollbar or use the mouse wheel over the tab):
 
 - **Status** — current state and the same Pause/Resume/Stop controls as the
   tray menu and the in-call control panel, a manual "Start recording"
-  fallback, and an "Open recordings folder" button.
+  fallback, an "Open recordings folder" button, and **Log out**.
 - **History** — every past interview (date, app, top issue); select one to
   read its full report right there, nicely formatted, no need to dig
   through the `output/reports/` folder. Below the report: a **Feedback**
   panel (see "Feedback & confidence scoring" above) and the report's
   confidence score.
-- **Trends** — the recurring-issues report across all your interviews.
+- **Trends** — the recurring-issues report across all your interviews
+  (regenerated fresh from the database every time you open this tab, so
+  it's always current for whichever profile is logged in).
 - **Settings** — edit the most common `config.yaml` options (retention
   days, poll interval, Whisper model, language, diarization, analysis
   engine/model, reports folder) from a form instead of a text editor, plus
-  **Install model...** (with a curated model-size catalog) and
-  **Language packs** install/uninstall. Saving preserves every comment in
+  **Install model...** (with a curated model-size catalog), **Language
+  packs** install/uninstall, and a **Cloud API key** section (see "Using a
+  paid/cloud model instead" above). Saving preserves every comment in
   `config.yaml`; a restart picks up the new values. Less common settings
   (like the watched-app list) still need a text editor.
 
@@ -300,7 +321,8 @@ src/interview_analyzer/
   settings_editor.py                        - comment-preserving config.yaml edits for the Settings tab
   model_setup.py                              - first-run + on-demand local model install (size-confirmed downloads)
   language_packs.py                             - optional per-language transcription packs, install/uninstall any time
-  report_view.py                                  - renders report/trend markdown into the dashboard's Text widgets
+  api_keys.py                                     - local cloud API key storage (DPAPI-encrypted, never plaintext)
+  report_view.py                                    - renders report/trend markdown into the dashboard's Text widgets
   consent.py                                        - pop-up permission prompt before recording
   auth.py                                             - local login/profile system
   recorder.py                                           - system-audio loopback recording (with pause/resume)
@@ -315,7 +337,7 @@ src/interview_analyzer/
   cleanup.py                                                              - retention/auto-delete of audio
   report.py                                                                 - per-interview + per-user trend markdown reports
   config_loader.py                                                            - loads config.yaml
-tests/                        - automated test suite (200+ tests; see "Testing" below)
+tests/                        - automated test suite (240+ tests; see "Testing" below)
 ```
 
 ## Testing

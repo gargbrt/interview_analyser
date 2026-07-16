@@ -5,10 +5,21 @@ window on the taskbar.
 """
 from __future__ import annotations
 
+import itertools
 import logging
 from typing import Callable, Optional
 
 logger = logging.getLogger(__name__)
+
+# pystray's win32 backend derives its Windows window-class name from this
+# name plus id(icon) (see pystray._win32.Icon._register_class) -- id()
+# isn't guaranteed unique over a process's lifetime (a garbage-collected
+# icon's id can be reused by a later one), which caused a real "Class
+# already exists" WinError when many TrayIcons got constructed in the same
+# process (e.g. across a test run). A monotonic counter guarantees each
+# instance gets a genuinely unique name regardless of id() reuse. This
+# name is never shown to the user -- `title` is what appears in the tray.
+_instance_counter = itertools.count()
 
 try:
     import pystray
@@ -131,7 +142,7 @@ class TrayIcon:
         self._on_quit = on_quit
         self._on_logout = on_logout
         self._icon = pystray.Icon(
-            "interview_analyzer",
+            f"interview_analyzer{next(_instance_counter)}",
             icon=_make_icon_image("idle"),
             title=status_text(watcher.status),
             menu=self._build_menu(),
@@ -190,6 +201,13 @@ class TrayIcon:
         # the menu level rather than needing a confirmation dialog here
         if self._on_logout is not None:
             self._on_logout()
+        self._icon.stop()
+
+    def stop(self) -> None:
+        """Stops the tray icon from outside (e.g. the dashboard's own Log
+        out button, which can't reach the tray menu's own _logout() path)
+        -- same effect as clicking Quit or Log out in the tray menu itself.
+        Safe to call even if the icon never started running."""
         self._icon.stop()
 
     def refresh(self) -> None:

@@ -55,13 +55,18 @@ def _run_session(cfg: Config, user: User) -> str:
     user clicks Quit or Log out. Returns "quit" or "logout" so the caller
     knows whether to loop back to the login dialog."""
     watcher = MeetingWatcher(cfg, user_id=user.id)
-    dashboard = Dashboard(watcher)
     result = {"action": "quit"}
 
     def _do_logout() -> None:
+        # shared by both the tray menu's "Log out" item and the dashboard's
+        # own Log out button (Status tab) -- either one stops the tray icon,
+        # which is what unblocks tray.run() below regardless of which
+        # triggered it.
         result["action"] = "logout"
         watcher.shutdown()
+        tray.stop()
 
+    dashboard = Dashboard(watcher, on_logout=_do_logout)
     tray = TrayIcon(
         watcher,
         open_dashboard=dashboard.open,

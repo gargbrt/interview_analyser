@@ -17,31 +17,34 @@ thousand tokens).
 The same applies to OpenAI: a ChatGPT Plus subscription ≠ an OpenAI API key.
 You need a key from platform.openai.com.
 
-## Using Anthropic's API
+There is no supported way to "log in" with a claude.ai/ChatGPT account
+instead of using a real API key -- no such integration exists for either
+provider (and wouldn't be reliable/supported even unofficially), so this
+app never asks for your consumer account credentials anywhere.
 
-1. Get an API key from console.anthropic.com.
-2. Set it as an environment variable (PowerShell):
-   ```powershell
-   setx INTERVIEW_ANALYZER_API_KEY "sk-ant-..."
-   ```
-   (open a new terminal after `setx` for it to take effect)
-3. Edit `config/config.yaml`:
-   ```yaml
-   analysis:
-     engine: "anthropic_api"
-     llm_model: "claude-sonnet-5"
-   ```
+## Setting your API key (two ways)
 
-## Using OpenAI's API
+**From the dashboard (recommended)** — Settings tab → **Cloud API key**
+section: pick the provider (`anthropic_api`/`openai_api`), paste the key,
+**Save key**. It's encrypted at rest with Windows DPAPI (tied to your
+Windows account, never written in plaintext -- same mechanism as the login
+dialog's "Remember me", see `api_keys.py`), and never touches
+`config.yaml`. **Clear key** removes it.
 
-Same idea:
+**Environment variable** (still supported, e.g. for CI/scripted setups; if
+both are set, the environment variable wins):
 ```powershell
-setx INTERVIEW_ANALYZER_API_KEY "sk-..."
+setx INTERVIEW_ANALYZER_API_KEY "sk-ant-..."
 ```
+(open a new terminal after `setx` for it to take effect)
+
+Either way, also set the engine in `config/config.yaml` (or the Settings
+tab's Analysis engine dropdown):
+
 ```yaml
 analysis:
-  engine: "openai_api"
-  llm_model: "gpt-4o-mini"
+  engine: "anthropic_api"       # or "openai_api"
+  llm_model: "claude-sonnet-5"  # or "gpt-4o-mini" for openai_api
 ```
 
 ## Getting the best free (local) results
