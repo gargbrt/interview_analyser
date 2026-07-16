@@ -121,11 +121,29 @@ cd interview_analyser
 python -m venv .venv
 .venv\Scripts\activate
 pip install -r requirements.txt
+pip install -e .
 ```
+
+`pip install -e .` registers the package so `python -m interview_analyzer.app`
+(and the launch shortcut below) work from anywhere — without it you'd need
+to manually set `PYTHONPATH` to `src`.
 
 That's it — no model pull needed beforehand; the app walks you through that
 on first launch (next section). If you'd rather do it upfront anyway:
 `ollama pull llama3.1:8b` (~4.7GB).
+
+### Launch shortcut (optional)
+
+```powershell
+powershell -ExecutionPolicy Bypass -File scripts\create_shortcut.ps1
+```
+
+Creates an **"Interview Analyzer.lnk"** shortcut in the project folder
+(with the app's icon) that launches it with no console window — double-click
+it any time instead of typing the run command. It's machine-specific
+(git-ignored), so run this once per clone/machine. `run_app.bat` (what the
+shortcut points to) also works directly if you'd rather not create a
+shortcut.
 
 Edit `config/config.yaml` (or the dashboard's Settings tab, once running) to adjust:
 - `retention_days` — how long raw audio is kept before auto-deletion (default: 3)
@@ -141,11 +159,17 @@ Edit `config/config.yaml` (or the dashboard's Settings tab, once running) to adj
 python -m interview_analyzer.app
 ```
 
+Or double-click the **"Interview Analyzer"** shortcut (see "Launch
+shortcut" above) if you created one.
+
 This is the normal way to run it: a **system tray icon** plus a **dashboard
 window**, both described below.
 
 1. **Login dialog** — create/select your local profile (just a name,
-   password optional). Use `--username yourname` to skip it.
+   password optional). Use `--username yourname` to skip it. Check
+   **"Remember me on this computer"** to pre-fill your profile name (and
+   password, encrypted with Windows DPAPI — never stored in plaintext —
+   see `remembered_login.py`) the next time you log in.
 2. **Dashboard** opens automatically.
 3. **First run only**: an **analysis model setup** dialog, if the
    configured local model (`llama3.1:8b` by default) isn't already
@@ -163,10 +187,18 @@ tab (and the tray menu) has a manual **"Start recording"** fallback that
 skips straight to recording — clicking it is treated as your consent.
 
 Reports land in `output_dir/reports/<date>_<app>.md`. A continuously updated
-`output_dir/trends.md` tracks recurring issues across all interviews for
-your profile — both are also browsable right in the dashboard. The Status
-tab also has an **"Open recordings folder"** button that opens the raw
-audio folder directly in Explorer.
+`output_dir/trends_user<id>.md` tracks recurring issues across all of
+*your* interviews specifically (each local profile gets its own trends
+file, so switching profiles never shows another profile's data) — both are
+also browsable right in the dashboard. The Status tab also has an **"Open
+recordings folder"** button that opens the raw audio folder directly in
+Explorer.
+
+### Logging out / switching profiles
+
+Tray menu → **"Log out"** (shown while idle — stop any active recording
+first) closes the current profile's session and returns to the login
+dialog, without restarting the app. **"Quit"** exits entirely.
 
 ### Analysis model setup
 
@@ -251,45 +283,53 @@ independent of which entry point started the watcher); see
 ## Project layout
 
 ```
-config/config.yaml          - all user settings
+pyproject.toml               - packaging (pip install -e . -- makes `python -m interview_analyzer.app` work anywhere)
+run_app.bat                  - portable launcher (used by the generated shortcut)
+scripts/create_shortcut.ps1  - generates "Interview Analyzer.lnk" in the project folder
+assets/icon.ico               - app icon
+.github/workflows/tests.yml    - CI: runs the test suite on push/PR (Windows runners)
+config/config.yaml               - all user settings
 src/interview_analyzer/
-  app.py                      - GUI entry point: login dialog + tray + dashboard
-  watcher.py                   - detects meeting app start/stop, drives the pipeline
-  tray.py                       - system tray icon (status, pause/resume/stop, quit)
-  dashboard.py                   - dashboard window (status/history/trends/settings tabs)
-  login_dialog.py                 - GUI login dialog (app.py's counterpart to auth.py's console prompt)
-  single_instance.py                - prevents two copies of the app running at once
-  settings_editor.py                  - comment-preserving config.yaml edits for the Settings tab
-  model_setup.py                        - first-run + on-demand local model install (size-confirmed downloads)
-  language_packs.py                       - optional per-language transcription packs, install/uninstall any time
-  report_view.py                            - renders report/trend markdown into the dashboard's Text widgets
-  consent.py                                  - pop-up permission prompt before recording
-  auth.py                                       - local login/profile system
-  recorder.py                                     - system-audio loopback recording (with pause/resume)
-  control_panel.py                                  - Pause/Resume/Stop control shown during recording
-  compress.py                                         - shrinks WAV to small opus/mp3
-  transcriber.py                                        - faster-whisper transcription + diarization + language packs
-  engines.py                                              - pluggable AnalysisEngine base + registry
-  analyzer.py                                               - built-in engines (ollama/anthropic/openai) + rubric runner
-  rubric.py                                                   - the evaluation rubric/prompts (editable)
-  confidence.py                                                 - confidence scoring + feedback-based calibration notes
-  db.py                                                           - SQLite storage layer (per-user scoped, thread-safe)
-  cleanup.py                                                        - retention/auto-delete of audio
-  report.py                                                           - per-interview + trend markdown reports
-  config_loader.py                                                      - loads config.yaml
-tests/                        - automated test suite (180+ tests; see "Testing" below)
+  app.py                          - GUI entry point: login/logout loop + tray + dashboard per session
+  watcher.py                       - detects meeting app start/stop, drives the pipeline
+  tray.py                           - system tray icon (status, pause/resume/stop, log out, quit)
+  dashboard.py                       - dashboard window (status/history/trends/settings tabs)
+  login_dialog.py                     - GUI login dialog (app.py's counterpart to auth.py's console prompt)
+  remembered_login.py                   - "remember me" storage (DPAPI-encrypted password, never plaintext)
+  single_instance.py                      - prevents two copies of the app running at once
+  settings_editor.py                        - comment-preserving config.yaml edits for the Settings tab
+  model_setup.py                              - first-run + on-demand local model install (size-confirmed downloads)
+  language_packs.py                             - optional per-language transcription packs, install/uninstall any time
+  report_view.py                                  - renders report/trend markdown into the dashboard's Text widgets
+  consent.py                                        - pop-up permission prompt before recording
+  auth.py                                             - local login/profile system
+  recorder.py                                           - system-audio loopback recording (with pause/resume)
+  control_panel.py                                        - Pause/Resume/Stop control shown during recording
+  compress.py                                               - shrinks WAV to small opus/mp3
+  transcriber.py                                              - faster-whisper transcription + diarization + language packs
+  engines.py                                                    - pluggable AnalysisEngine base + registry
+  analyzer.py                                                     - built-in engines (ollama/anthropic/openai) + rubric runner
+  rubric.py                                                         - the evaluation rubric/prompts (editable)
+  confidence.py                                                       - confidence scoring + feedback-based calibration notes
+  db.py                                                                 - SQLite storage layer (per-user scoped, thread-safe)
+  cleanup.py                                                              - retention/auto-delete of audio
+  report.py                                                                 - per-interview + per-user trend markdown reports
+  config_loader.py                                                            - loads config.yaml
+tests/                        - automated test suite (200+ tests; see "Testing" below)
 ```
 
 ## Testing
 
 The suite covers auth/login, the DB layer (including retention expiry,
 per-user scoping, and feedback storage), cleanup, the pluggable
-analyzer/engine registry, confidence scoring/calibration, report generation,
-recorder pause/resume/stop behavior, watcher status/notify wiring, meeting
-detection, the comment-preserving settings editor, model/language-pack
-install logic, and a full mocked end-to-end pipeline run (consent → record
-→ pause/resume/manual-stop → transcribe → analyze → report → trend update →
-cleanup).
+analyzer/engine registry, confidence scoring/calibration, report generation
+(including that trends are per-user -- a real bug once let one profile see
+another's trends, see below), recorder pause/resume/stop behavior, watcher
+status/notify wiring, meeting detection, the comment-preserving settings
+editor, model/language-pack install logic, remembered-login storage, the
+app's login/logout session loop, and a full mocked end-to-end pipeline run
+(consent → record → pause/resume/manual-stop → transcribe → analyze →
+report → trend update → cleanup).
 
 The tray icon and dashboard window are also manually verified end-to-end on
 a real Windows session (not just unit-tested): constructing and running the

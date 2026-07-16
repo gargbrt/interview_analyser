@@ -50,7 +50,7 @@ task.
 
 ## Verifying it's watching correctly
 
-Check `output/trends.md` timestamp after a real recorded interview, or
+Check `output/trends_user<id>.md`'s timestamp after a real recorded interview (each profile gets its own trends file), or
 watch the log output by running `python -m interview_analyzer.watcher`
 directly (not via `pythonw.exe`) to see the console log lines as it detects
 meetings, asks for consent, and processes interviews.

@@ -9,3 +9,6 @@ output/
 .env
 .claude/
 .pytest_cache/
+logs/
+*.lnk
+*.egg-info/

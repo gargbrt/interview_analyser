@@ -9,7 +9,9 @@ from __future__ import annotations
 
 import collections
 import datetime as dt
+import os
 import pathlib
+from typing import Optional
 
 from .config_loader import Config
 from .confidence import format_confidence
@@ -110,10 +112,26 @@ def write_interview_report(record: InterviewRecord, cfg: Config) -> pathlib.Path
     return report_path
 
 
-def write_trends_report(records: list[InterviewRecord], cfg: Config) -> pathlib.Path:
+def trends_report_path(cfg: Config, user_id: Optional[int] = None) -> pathlib.Path:
+    """Where a given user's trends report lives. Each local profile gets
+    its own file (`trends_<user_id>.md`) -- a single shared `trends.md`
+    used to mean whichever profile's interview finished processing most
+    recently silently overwrote every other profile's trends, and every
+    profile's dashboard read back whatever was in it regardless of who was
+    actually logged in. `user_id=None` is only for contexts with no login
+    concept at all (not used by the normal tray+dashboard app)."""
+    out_dir = cfg.resolve(cfg.output.get("output_dir", "output"))
+    base = cfg.output.get("trends_filename", "trends.md")
+    if user_id is None:
+        return out_dir / base
+    stem, ext = os.path.splitext(base)
+    return out_dir / f"{stem}_user{user_id}{ext}"
+
+
+def write_trends_report(records: list[InterviewRecord], cfg: Config, user_id: Optional[int] = None) -> pathlib.Path:
     out_dir = cfg.resolve(cfg.output.get("output_dir", "output"))
     out_dir.mkdir(parents=True, exist_ok=True)
-    trends_path = out_dir / cfg.output.get("trends_filename", "trends.md")
+    trends_path = trends_report_path(cfg, user_id)
 
     issue_counter: collections.Counter[str] = collections.Counter()
     strength_counter: collections.Counter[str] = collections.Counter()

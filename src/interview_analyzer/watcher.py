@@ -490,7 +490,7 @@ class MeetingWatcher:
             record = self.db.get(interview_id)
             report_path = write_interview_report(record, self.cfg)
             self.db.save_report_path(interview_id, str(report_path))
-            write_trends_report(self.db.list_all(user_id=self.user_id), self.cfg)
+            write_trends_report(self.db.list_all(user_id=self.user_id), self.cfg, user_id=self.user_id)
             logger.info("Interview #%s: no speech detected; skipped analysis.", interview_id)
             return
 
@@ -521,7 +521,7 @@ class MeetingWatcher:
         report_path = write_interview_report(record, self.cfg)
         self.db.save_report_path(interview_id, str(report_path))
 
-        write_trends_report(self.db.list_all(user_id=self.user_id), self.cfg)
+        write_trends_report(self.db.list_all(user_id=self.user_id), self.cfg, user_id=self.user_id)
         logger.info("Interview #%s processed. Report: %s", interview_id, report_path)
 
     def reprocess_interview(self, interview_id: int) -> None:

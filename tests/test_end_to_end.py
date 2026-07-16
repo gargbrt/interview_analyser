@@ -136,7 +136,7 @@ def test_full_pipeline_end_to_end_with_consent_granted(tmp_path):
     assert "Tell me about a time you disagreed" in content
     assert "Rehearse 3 behavioral stories" in content
 
-    trends_path = tmp_path / "output" / "trends.md"
+    trends_path = tmp_path / "output" / "trends_user1.md"
     assert trends_path.exists()
     assert "Lacks structure" in trends_path.read_text()
 

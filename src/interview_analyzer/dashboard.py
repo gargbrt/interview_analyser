@@ -26,6 +26,7 @@ from .model_setup import (
     ollama_is_reachable,
     size_label,
 )
+from .report import trends_report_path
 from .report_view import render_into_text_widget
 from .settings_editor import load_editable_settings, save_editable_settings
 from .tray import job_text
@@ -126,6 +127,13 @@ class Dashboard:
         # Tkinter raises "main thread is not in main loop" if you call into
         # a Tk instance from another thread before its loop is running.
         self._ready = threading.Event()
+        # set once the dashboard's Tk thread has fully exited (mainloop
+        # returned) -- used by app.py's logout flow to know it's safe to
+        # show a new login dialog (only one Tk root may exist at a time,
+        # see consent.py's docstring)
+        self._closed = threading.Event()
+        self._closed.set()
+        self._thread: Optional[threading.Thread] = None
         # widgets refreshed by _refresh_status / notify callbacks; only
         # touched from the dashboard's own Tk thread
         self._status_label = None
@@ -174,8 +182,9 @@ class Dashboard:
             if self._root is not None:
                 logger.info("Dashboard already open.")
                 return
-            thread = threading.Thread(target=self._run, daemon=True)
-            thread.start()
+            self._closed.clear()
+            self._thread = threading.Thread(target=self._run, daemon=True)
+            self._thread.start()
 
     def wait_until_ready(self, timeout: float = 10) -> bool:
         """Block until the dashboard window is fully built (or `timeout`
@@ -183,6 +192,26 @@ class Dashboard:
         polling -- and potentially spin up a *second* Tk() interpreter for
         a consent popup -- before the dashboard's shared root exists."""
         return self._ready.wait(timeout=timeout)
+
+    def close(self) -> None:
+        """Close the dashboard window from another thread (e.g. on logout,
+        before showing a new login dialog). Safe to call even if already
+        closed. Does not block -- call `wait_until_closed()` afterward if
+        the caller needs to know the Tk root is fully torn down before
+        doing anything else Tk-related."""
+        root = self._root
+        if root is not None:
+            try:
+                root.after(0, self._handle_close)
+            except Exception:  # noqa: BLE001
+                pass
+
+    def wait_until_closed(self, timeout: float = 10) -> bool:
+        """Block until the dashboard's Tk thread has fully exited (or
+        `timeout` elapses). Only one Tk root may exist at a time in this
+        process (see consent.py's docstring), so app.py's logout flow must
+        wait for this before showing a new login dialog."""
+        return self._closed.wait(timeout=timeout)
 
     def notify_state_change(self) -> None:
         """Called (from any thread) whenever the watcher's recording state
@@ -205,6 +234,7 @@ class Dashboard:
             from tkinter import ttk
         except ImportError:  # pragma: no cover
             logger.warning("Tkinter not available; cannot open the dashboard.")
+            self._closed.set()
             return
 
         root = tk.Tk()
@@ -221,13 +251,7 @@ class Dashboard:
         notebook.add(self._build_trends_tab(notebook, tk, ttk), text="Trends")
         notebook.add(self._build_settings_tab(notebook, tk, ttk), text="Settings")
 
-        def _on_close():
-            self._ready.clear()
-            self._root = None
-            self.watcher.set_ui_root(None)
-            root.destroy()
-
-        root.protocol("WM_DELETE_WINDOW", _on_close)
+        root.protocol("WM_DELETE_WINDOW", self._handle_close)
 
         self._refresh_status()
         self._refresh_history()
@@ -235,6 +259,18 @@ class Dashboard:
         self.watcher.set_ui_root(root)
         self._ready.set()
         root.mainloop()
+        self._closed.set()
+
+    def _handle_close(self) -> None:
+        """Runs on the dashboard's own Tk thread -- either via the window's
+        titlebar close button, or scheduled by `close()` from another
+        thread. Tears down the window; `mainloop()` returning is what lets
+        `_run()` reach `self._closed.set()` above."""
+        self._ready.clear()
+        self.watcher.set_ui_root(None)
+        if self._root is not None:
+            self._root.destroy()
+        self._root = None
 
     # -- Status tab ---------------------------------------------------------
 
@@ -788,10 +824,7 @@ class Dashboard:
     def _refresh_trends(self) -> None:
         if self._trends_text is None:
             return
-        cfg = self.watcher.cfg
-        trends_path = cfg.resolve(cfg.output.get("output_dir", "output")) / cfg.output.get(
-            "trends_filename", "trends.md"
-        )
+        trends_path = trends_report_path(self.watcher.cfg, user_id=self.watcher.user_id)
         self._trends_text.config(state="normal")
         if trends_path.exists():
             render_into_text_widget(self._trends_text, trends_path.read_text(encoding="utf-8"))

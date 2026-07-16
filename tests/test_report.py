@@ -2,7 +2,7 @@ import json
 
 from interview_analyzer.config_loader import Config
 from interview_analyzer.db import InterviewRecord
-from interview_analyzer.report import write_interview_report, write_trends_report
+from interview_analyzer.report import trends_report_path, write_interview_report, write_trends_report
 
 
 def _config(tmp_path) -> Config:
@@ -280,3 +280,48 @@ def test_write_trends_report_handles_zero_analyzed(tmp_path):
     trends_path = write_trends_report([], cfg)
     content = trends_path.read_text()
     assert "No analyzed interviews yet." in content
+
+
+class TestTrendsAreScopedPerUser:
+    """Regression coverage for a real bug: write_trends_report always
+    computed its CONTENT from a user-scoped record list, but wrote it to a
+    single shared trends.md -- so whichever profile's interview finished
+    processing last silently overwrote every other profile's trends file,
+    and any profile's dashboard would read back whoever wrote it last
+    regardless of who was actually logged in. Each user must get their own
+    file now."""
+
+    def test_different_users_get_different_trends_files(self, tmp_path):
+        cfg = _config(tmp_path)
+        path_a = write_trends_report([], cfg, user_id=1)
+        path_b = write_trends_report([], cfg, user_id=2)
+
+        assert path_a != path_b
+        assert path_a.exists()
+        assert path_b.exists()
+
+    def test_trends_report_path_is_deterministic_per_user(self, tmp_path):
+        cfg = _config(tmp_path)
+        assert trends_report_path(cfg, user_id=1) == trends_report_path(cfg, user_id=1)
+        assert trends_report_path(cfg, user_id=1) != trends_report_path(cfg, user_id=2)
+
+    def test_writing_one_users_trends_does_not_touch_another_users_file(self, tmp_path):
+        cfg = _config(tmp_path)
+        record_a = _record(1, "Zoom", {
+            "qa_pairs": [], "session_summary": {"top_strengths": [], "top_issues": ["Rambling"],
+                                                  "one_thing_to_practice_next": ""},
+        })
+        write_trends_report([record_a], cfg, user_id=1)
+        path_b = write_trends_report([], cfg, user_id=2)
+
+        content_a = trends_report_path(cfg, user_id=1).read_text(encoding="utf-8")
+        content_b = path_b.read_text(encoding="utf-8")
+        assert "Rambling" in content_a
+        assert "Rambling" not in content_b
+
+    def test_no_user_id_falls_back_to_the_bare_shared_filename(self, tmp_path):
+        """Only relevant for contexts with no login concept at all -- not
+        used by the normal tray+dashboard app, which always has a user_id."""
+        cfg = _config(tmp_path)
+        path = trends_report_path(cfg, user_id=None)
+        assert path.name == "trends.md"

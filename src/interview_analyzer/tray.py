@@ -119,6 +119,7 @@ class TrayIcon:
         watcher,
         open_dashboard: Callable[[], None],
         on_quit: Callable[[], None],
+        on_logout: Optional[Callable[[], None]] = None,
     ):
         if pystray is None:
             raise RuntimeError(
@@ -128,6 +129,7 @@ class TrayIcon:
         self.watcher = watcher
         self._open_dashboard = open_dashboard
         self._on_quit = on_quit
+        self._on_logout = on_logout
         self._icon = pystray.Icon(
             "interview_analyzer",
             icon=_make_icon_image("idle"),
@@ -156,6 +158,11 @@ class TrayIcon:
             ),
             pystray.Menu.SEPARATOR,
             pystray.MenuItem("Open dashboard", lambda icon, item: self._open_dashboard(), default=True),
+            pystray.MenuItem(
+                "Log out",
+                lambda icon, item: self._logout(),
+                visible=lambda item: self._on_logout is not None and self.watcher.status.get("state") == "idle",
+            ),
             pystray.MenuItem("Quit", lambda icon, item: self._quit()),
         )
 
@@ -175,6 +182,14 @@ class TrayIcon:
 
     def _quit(self) -> None:
         self._on_quit()
+        self._icon.stop()
+
+    def _logout(self) -> None:
+        # only visible while idle (see _build_menu) -- logging out mid-call
+        # would silently abandon an active recording, so that's blocked at
+        # the menu level rather than needing a confirmation dialog here
+        if self._on_logout is not None:
+            self._on_logout()
         self._icon.stop()
 
     def refresh(self) -> None:
