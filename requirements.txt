@@ -1,0 +1,12 @@
+pyyaml>=6.0
+ruamel.yaml>=0.18          # comment-preserving config.yaml edits from the Settings tab
+psutil>=5.9
+pyaudiowpatch>=0.2.12.6   # WASAPI loopback capture on Windows
+pywin32>=306              # window title enumeration on Windows
+pystray>=0.19.5            # system tray icon
+Pillow>=10.0                # tray icon image generation
+faster-whisper>=1.0.0
+pyannote.audio>=3.1        # diarization (optional; needs a free HF token to download models)
+requests>=2.31
+numpy>=1.26
+soundfile>=0.12

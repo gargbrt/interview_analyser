@@ -1,0 +1,177 @@
+"""SQLite storage layer.
+
+Design goal: raw audio is transient (deleted after retention_days), but the
+transcript and analysis JSON are tiny and kept forever so trend analysis
+across many interviews stays cheap.
+"""
+from __future__ import annotations
+
+import datetime as dt
+import json
+import pathlib
+import sqlite3
+import threading
+from dataclasses import dataclass
+from typing import Any, Optional
+
+SCHEMA = """
+CREATE TABLE IF NOT EXISTS interviews (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id INTEGER,
+    started_at TEXT NOT NULL,
+    ended_at TEXT,
+    source_app TEXT,
+    audio_path TEXT,
+    audio_expires_at TEXT,
+    audio_deleted INTEGER DEFAULT 0,
+    transcript TEXT,
+    analysis_json TEXT,
+    report_path TEXT,
+    FOREIGN KEY (user_id) REFERENCES users(id)
+);
+"""
+
+
+@dataclass
+class InterviewRecord:
+    id: int
+    user_id: Optional[int]
+    started_at: str
+    ended_at: Optional[str]
+    source_app: Optional[str]
+    audio_path: Optional[str]
+    audio_expires_at: Optional[str]
+    audio_deleted: bool
+    transcript: Optional[str]
+    analysis_json: Optional[str]
+    report_path: Optional[str]
+
+    @property
+    def analysis(self) -> Optional[dict[str, Any]]:
+        return json.loads(self.analysis_json) if self.analysis_json else None
+
+
+class InterviewDB:
+    """A watcher, its tray icon, and its dashboard all share one InterviewDB
+    from different threads (the watcher's background loop, the dashboard's
+    own Tk thread). sqlite3 connections aren't safe to use across threads
+    without `check_same_thread=False` plus our own serialization, since
+    Python's sqlite3 module doesn't guarantee thread-safe concurrent access
+    to a single connection on its own."""
+
+    def __init__(self, db_path: pathlib.Path | str):
+        from .auth import ensure_users_table
+
+        self.db_path = pathlib.Path(db_path)
+        self.db_path.parent.mkdir(parents=True, exist_ok=True)
+        self._conn = sqlite3.connect(self.db_path, check_same_thread=False)
+        self._conn.row_factory = sqlite3.Row
+        self._lock = threading.Lock()
+        ensure_users_table(self._conn)  # users table must exist before interviews FK is used
+        self._conn.execute(SCHEMA)
+        self._conn.commit()
+
+    def start_interview(
+        self, source_app: str, audio_path: str, retention_days: int, user_id: Optional[int] = None
+    ) -> int:
+        started_at = dt.datetime.now().isoformat()
+        expires_at = (dt.datetime.now() + dt.timedelta(days=retention_days)).isoformat()
+        with self._lock:
+            cur = self._conn.execute(
+                "INSERT INTO interviews (user_id, started_at, source_app, audio_path, audio_expires_at) "
+                "VALUES (?, ?, ?, ?, ?)",
+                (user_id, started_at, source_app, audio_path, expires_at),
+            )
+            self._conn.commit()
+            return cur.lastrowid
+
+    def end_interview(self, interview_id: int) -> None:
+        with self._lock:
+            self._conn.execute(
+                "UPDATE interviews SET ended_at = ? WHERE id = ?",
+                (dt.datetime.now().isoformat(), interview_id),
+            )
+            self._conn.commit()
+
+    def save_transcript(self, interview_id: int, transcript: str) -> None:
+        with self._lock:
+            self._conn.execute(
+                "UPDATE interviews SET transcript = ? WHERE id = ?", (transcript, interview_id)
+            )
+            self._conn.commit()
+
+    def save_analysis(self, interview_id: int, analysis: dict[str, Any]) -> None:
+        with self._lock:
+            self._conn.execute(
+                "UPDATE interviews SET analysis_json = ? WHERE id = ?",
+                (json.dumps(analysis), interview_id),
+            )
+            self._conn.commit()
+
+    def save_report_path(self, interview_id: int, report_path: str) -> None:
+        with self._lock:
+            self._conn.execute(
+                "UPDATE interviews SET report_path = ? WHERE id = ?", (report_path, interview_id)
+            )
+            self._conn.commit()
+
+    def update_audio_path(self, interview_id: int, audio_path: str) -> None:
+        with self._lock:
+            self._conn.execute(
+                "UPDATE interviews SET audio_path = ? WHERE id = ?", (audio_path, interview_id)
+            )
+            self._conn.commit()
+
+    def mark_audio_deleted(self, interview_id: int) -> None:
+        with self._lock:
+            self._conn.execute(
+                "UPDATE interviews SET audio_deleted = 1 WHERE id = ?", (interview_id,)
+            )
+            self._conn.commit()
+
+    def get(self, interview_id: int) -> Optional[InterviewRecord]:
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT * FROM interviews WHERE id = ?", (interview_id,)
+            ).fetchone()
+            return self._row_to_record(row) if row else None
+
+    def list_all(self, user_id: Optional[int] = None) -> list[InterviewRecord]:
+        with self._lock:
+            if user_id is not None:
+                rows = self._conn.execute(
+                    "SELECT * FROM interviews WHERE user_id = ? ORDER BY started_at ASC", (user_id,)
+                ).fetchall()
+            else:
+                rows = self._conn.execute("SELECT * FROM interviews ORDER BY started_at ASC").fetchall()
+            return [self._row_to_record(r) for r in rows]
+
+    def list_expired_audio(self) -> list[InterviewRecord]:
+        now = dt.datetime.now().isoformat()
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT * FROM interviews WHERE audio_deleted = 0 AND audio_expires_at IS NOT NULL "
+                "AND audio_expires_at <= ? AND audio_path IS NOT NULL",
+                (now,),
+            ).fetchall()
+            return [self._row_to_record(r) for r in rows]
+
+    @staticmethod
+    def _row_to_record(row: sqlite3.Row) -> InterviewRecord:
+        return InterviewRecord(
+            id=row["id"],
+            user_id=row["user_id"],
+            started_at=row["started_at"],
+            ended_at=row["ended_at"],
+            source_app=row["source_app"],
+            audio_path=row["audio_path"],
+            audio_expires_at=row["audio_expires_at"],
+            audio_deleted=bool(row["audio_deleted"]),
+            transcript=row["transcript"],
+            analysis_json=row["analysis_json"],
+            report_path=row["report_path"],
+        )
+
+    def close(self) -> None:
+        with self._lock:
+            self._conn.close()

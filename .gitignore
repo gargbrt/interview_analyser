@@ -1,0 +1,11 @@
+.venv/
+__pycache__/
+*.pyc
+data/
+output/
+*.wav
+*.opus
+*.mp3
+.env
+.claude/
+.pytest_cache/
