@@ -153,6 +153,10 @@ def test_full_pipeline_end_to_end_with_consent_granted(tmp_path):
     assert trends_path.exists()
     assert "Lacks structure" in trends_path.read_text()
 
+    trends_infographic_path_ = tmp_path / "output" / "trends_user1_infographic.html"
+    assert trends_infographic_path_.exists()
+    assert "Lacks structure" in trends_infographic_path_.read_text(encoding="utf-8")
+
 
 def test_full_pipeline_consent_declined_skips_recording(tmp_path):
     cfg = _test_config(tmp_path)

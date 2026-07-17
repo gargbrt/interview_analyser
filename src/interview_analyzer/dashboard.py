@@ -23,7 +23,7 @@ from typing import Callable, Optional
 
 from . import api_keys
 from .confidence import format_confidence
-from .infographic import write_interview_infographic
+from .infographic import write_interview_infographic, write_trends_infographic
 from .language_packs import LANGUAGE_PACKS, PackActionDialog, is_pack_installed
 from .model_setup import (
     MODEL_CATALOG,
@@ -1249,8 +1249,11 @@ class Dashboard:
         frame.columnconfigure(0, weight=1)
         frame.rowconfigure(1, weight=1)
 
-        ttk.Button(frame, text="Refresh", command=self._on_refresh_trends).grid(
-            row=0, column=0, columnspan=2, sticky="w", pady=(0, 6)
+        toolbar = ttk.Frame(frame)
+        toolbar.grid(row=0, column=0, columnspan=2, sticky="w", pady=(0, 6))
+        ttk.Button(toolbar, text="Refresh", command=self._on_refresh_trends).pack(side="left")
+        ttk.Button(toolbar, text="View infographic", command=self._on_view_trends_infographic).pack(
+            side="left", padx=(8, 0)
         )
 
         text = tk.Text(frame, wrap="word", padx=10, pady=8, state="disabled", relief="flat")
@@ -1284,6 +1287,20 @@ class Dashboard:
     def _on_refresh_trends(self) -> None:
         self._refresh_trends()
         self._wake_ollama_async()
+
+    def _on_view_trends_infographic(self) -> None:
+        """Regenerates (so it always reflects the current DB state, same
+        "always fresh" approach as _refresh_trends) and opens the HTML
+        trends infographic -- see infographic.py's write_trends_infographic."""
+        records = self.watcher.db.list_all(user_id=self.watcher.user_id)
+        try:
+            path = write_trends_infographic(records, self.watcher.cfg, user_id=self.watcher.user_id)
+            _open_with_os_default(path)
+        except Exception as e:  # noqa: BLE001
+            logger.exception("Failed to open the trends infographic")
+            self._trends_text.config(state="normal")
+            render_into_text_widget(self._trends_text, f"# Couldn't open infographic\n\n{e}")
+            self._trends_text.config(state="disabled")
 
     # -- Settings tab -----------------------------------------------------
 

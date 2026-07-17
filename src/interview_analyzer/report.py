@@ -128,11 +128,13 @@ def trends_report_path(cfg: Config, user_id: Optional[int] = None) -> pathlib.Pa
     return out_dir / f"{stem}_user{user_id}{ext}"
 
 
-def write_trends_report(records: list[InterviewRecord], cfg: Config, user_id: Optional[int] = None) -> pathlib.Path:
-    out_dir = cfg.resolve(cfg.output.get("output_dir", "output"))
-    out_dir.mkdir(parents=True, exist_ok=True)
-    trends_path = trends_report_path(cfg, user_id)
-
+def aggregate_trends(records: list[InterviewRecord]) -> dict:
+    """Counts recurring issues/strengths across every analyzed interview in
+    `records` -- shared by write_trends_report (markdown) and
+    infographic.py's write_trends_infographic (HTML bar charts), so the two
+    can never disagree about what "most frequent" means. Records with no
+    usable analysis (parse_error, no_speech_detected, or none at all) are
+    skipped, same as an individual report would treat them."""
     issue_counter: collections.Counter[str] = collections.Counter()
     strength_counter: collections.Counter[str] = collections.Counter()
     analyzed_count = 0
@@ -151,6 +153,19 @@ def write_trends_report(records: list[InterviewRecord], cfg: Config, user_id: Op
             for issue in qa.get("issues", []):
                 category = issue.get("category", "unspecified") if isinstance(issue, dict) else _stringify(issue)
                 issue_counter[category] += 1
+
+    return {"issue_counter": issue_counter, "strength_counter": strength_counter, "analyzed_count": analyzed_count}
+
+
+def write_trends_report(records: list[InterviewRecord], cfg: Config, user_id: Optional[int] = None) -> pathlib.Path:
+    out_dir = cfg.resolve(cfg.output.get("output_dir", "output"))
+    out_dir.mkdir(parents=True, exist_ok=True)
+    trends_path = trends_report_path(cfg, user_id)
+
+    agg = aggregate_trends(records)
+    issue_counter = agg["issue_counter"]
+    strength_counter = agg["strength_counter"]
+    analyzed_count = agg["analyzed_count"]
 
     lines = [
         "# Recurring Issues Across Interviews",

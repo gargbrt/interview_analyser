@@ -1,13 +1,19 @@
 """Tests for infographic.py: the HTML "report card" generated alongside
 the markdown report (see report.py) and opened via the History tab's
-"View infographic" button."""
+"View infographic" button, and its trends counterpart opened via the
+Trends tab."""
 from __future__ import annotations
 
 import json
 
 from interview_analyzer.config_loader import Config
 from interview_analyzer.db import InterviewRecord
-from interview_analyzer.infographic import infographic_path, write_interview_infographic
+from interview_analyzer.infographic import (
+    infographic_path,
+    trends_infographic_path,
+    write_interview_infographic,
+    write_trends_infographic,
+)
 
 VALID_ANALYSIS = {
     "qa_pairs": [
@@ -166,3 +172,96 @@ def test_infographic_path_is_alongside_the_markdown_report(tmp_path):
 
     assert path.name == "2026-07-16_Zoom_1_infographic.html"
     assert path.parent == cfg.resolve(cfg.output.get("output_dir")) / "reports"
+
+
+class TestTrendsInfographic:
+    def test_path_is_alongside_the_markdown_trends_report(self, tmp_path):
+        cfg = _cfg(tmp_path)
+        path = trends_infographic_path(cfg, user_id=1)
+        assert path.name == "trends_user1_infographic.html"
+
+    def test_zero_analyzed_interviews_still_writes_a_real_page(self, tmp_path):
+        cfg = _cfg(tmp_path)
+        path = write_trends_infographic([], cfg, user_id=1)
+
+        assert path.exists()
+        content = path.read_text(encoding="utf-8")
+        assert content.startswith("<!doctype html>")
+        assert "No analyzed interviews yet" in content
+
+    def test_includes_bar_rows_for_recurring_issues_and_strengths(self, tmp_path):
+        cfg = _cfg(tmp_path)
+        records = [
+            _record(tmp_path, id=1, analysis_json=json.dumps({
+                "qa_pairs": [],
+                "session_summary": {
+                    "top_strengths": ["Clear communication"],
+                    "top_issues": ["Rambling"],
+                    "one_thing_to_practice_next": "",
+                },
+            })),
+            _record(tmp_path, id=2, analysis_json=json.dumps({
+                "qa_pairs": [],
+                "session_summary": {
+                    "top_strengths": ["Clear communication"],
+                    "top_issues": ["Rambling"],
+                    "one_thing_to_practice_next": "",
+                },
+            })),
+        ]
+
+        content = write_trends_infographic(records, cfg, user_id=1).read_text(encoding="utf-8")
+
+        assert "Rambling" in content
+        assert "Clear communication" in content
+        assert "based on 2 analyzed interview(s)" in content
+        # both interviews flagged the same issue/strength -- count should show 2
+        assert ">2<" in content
+
+    def test_skips_records_with_no_usable_analysis(self, tmp_path):
+        cfg = _cfg(tmp_path)
+        records = [
+            _record(tmp_path, id=1, analysis_json=json.dumps({"raw": "bad", "parse_error": True})),
+            _record(tmp_path, id=2, analysis_json=json.dumps({"no_speech_detected": True})),
+            _record(tmp_path, id=3, analysis_json=None),
+        ]
+
+        content = write_trends_infographic(records, cfg, user_id=1).read_text(encoding="utf-8")
+
+        assert "based on 0 analyzed interview(s)" in content
+        assert "No analyzed interviews yet" in content
+
+    def test_escapes_html_special_characters(self, tmp_path):
+        cfg = _cfg(tmp_path)
+        records = [_record(tmp_path, id=1, analysis_json=json.dumps({
+            "qa_pairs": [],
+            "session_summary": {
+                "top_strengths": ["<script>alert(1)</script>"],
+                "top_issues": [],
+                "one_thing_to_practice_next": "",
+            },
+        }))]
+
+        content = write_trends_infographic(records, cfg, user_id=1).read_text(encoding="utf-8")
+
+        assert "<script>alert" not in content
+        assert "&lt;script&gt;" in content
+
+    def test_lists_all_interviews_regardless_of_analysis_status(self, tmp_path):
+        """The "all interviews" list itself (like the markdown trends
+        report's) includes every interview regardless of whether it has
+        usable analysis -- only the bar-chart counts are analysis-only."""
+        cfg = _cfg(tmp_path)
+        records = [
+            _record(tmp_path, id=1, source_app="Zoom", started_at="2026-07-16T11:00:00"),  # has VALID_ANALYSIS
+            _record(tmp_path, id=2, source_app="Meet", started_at="2026-07-17T09:00:00", analysis_json=None),
+        ]
+
+        content = write_trends_infographic(records, cfg, user_id=1).read_text(encoding="utf-8")
+
+        assert "2026-07-16" in content
+        assert "Zoom" in content
+        assert "2026-07-17" in content
+        assert "Meet" in content
+        assert "not yet generated" in content
+        assert "not yet generated" in content

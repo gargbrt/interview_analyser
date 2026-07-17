@@ -338,6 +338,34 @@ class TestRefreshButtonsAlsoWakeOllama:
         dashboard._wake_ollama_async.assert_called_once()
 
 
+class TestViewTrendsInfographicButton:
+    def test_clicking_generates_and_opens_the_trends_infographic(self, tmp_path):
+        watcher = _watcher(tmp_path)
+        iid = watcher.db.start_interview("Zoom", str(tmp_path / "a.wav"), retention_days=3, user_id=1)
+        watcher.db.save_analysis(iid, VALID_ANALYSIS)
+        dashboard = Dashboard(watcher)
+
+        with patch("interview_analyzer.dashboard._open_with_os_default") as mock_open:
+            dashboard._on_view_trends_infographic()
+
+        mock_open.assert_called_once()
+        opened_path = mock_open.call_args.args[0]
+        assert opened_path.exists()
+        assert "trends" in opened_path.name and "infographic" in opened_path.name
+
+    def test_shows_an_error_in_the_trends_pane_if_opening_fails(self, tmp_path):
+        dashboard = Dashboard(_watcher(tmp_path))
+        dashboard._trends_text = MagicMock()
+
+        with patch("interview_analyzer.dashboard._open_with_os_default", side_effect=OSError("no default browser")):
+            dashboard._on_view_trends_infographic()
+
+        inserted_text = "".join(
+            call.args[1] for call in dashboard._trends_text.insert.call_args_list if len(call.args) > 1
+        )
+        assert "Couldn't open infographic" in inserted_text
+
+
 class TestParseTranscriptLines:
     def test_parses_speaker_and_text(self):
         transcript = "[Interviewer] Hello there\n[You] Hi, nice to meet you"

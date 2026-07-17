@@ -32,7 +32,7 @@ from .control_panel import RecordingControlPanel
 from .db import InterviewDB
 from .live_transcribe import LiveTranscriptionWorker
 from .recorder import SystemAudioRecorder
-from .infographic import write_interview_infographic
+from .infographic import write_interview_infographic, write_trends_infographic
 from .report import write_interview_report, write_trends_report
 from .transcriber import TranscriptionCancelled, transcribe
 
@@ -632,7 +632,7 @@ class MeetingWatcher:
             record = self.db.get(interview_id)
             report_path = write_interview_report(record, self.cfg)
             self.db.save_report_path(interview_id, str(report_path))
-            write_trends_report(self.db.list_all(user_id=self.user_id), self.cfg, user_id=self.user_id)
+            self._write_trends()
             logger.info("Interview #%s: no speech detected; skipped analysis.", interview_id)
             return
 
@@ -669,8 +669,20 @@ class MeetingWatcher:
         except Exception:  # noqa: BLE001
             logger.warning("Couldn't generate the infographic for interview #%s.", interview_id, exc_info=True)
 
-        write_trends_report(self.db.list_all(user_id=self.user_id), self.cfg, user_id=self.user_id)
+        self._write_trends()
         logger.info("Interview #%s processed. Report: %s", interview_id, report_path)
+
+    def _write_trends(self) -> None:
+        """Regenerates both the markdown trends report and its HTML
+        infographic counterpart from the current DB state. The infographic
+        is best-effort -- a failure there shouldn't take down the markdown
+        report, which the History/Trends tabs actually depend on."""
+        records = self.db.list_all(user_id=self.user_id)
+        write_trends_report(records, self.cfg, user_id=self.user_id)
+        try:
+            write_trends_infographic(records, self.cfg, user_id=self.user_id)
+        except Exception:  # noqa: BLE001
+            logger.warning("Couldn't generate the trends infographic.", exc_info=True)
 
     def reprocess_interview(self, interview_id: int) -> None:
         """Re-run transcribe/analyze/report for an interview that has audio
