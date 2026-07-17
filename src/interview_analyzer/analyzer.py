@@ -207,12 +207,25 @@ class GroqEngine(AnalysisEngine):
 
     def run(self, prompt: str, on_progress: Optional[Callable[[float], None]] = None) -> str:
         # No incremental progress signal for this engine -- see AnthropicEngine.run.
+        #
+        # max_tokens is set explicitly and generously (default GPT-OSS
+        # models are "reasoning" models -- reproduced directly: a real
+        # long-transcript request spent 2790 tokens on internal reasoning
+        # before writing any answer). Without a high enough budget, the
+        # reasoning phase alone can exhaust Groq's default limit, leaving
+        # nothing for the actual JSON answer -- observed as either an
+        # empty/truncated response that fails strict-schema validation, or
+        # (further truncated) an outright error from Groq. 8000 comfortably
+        # covers reasoning plus a large multi-question rubric response
+        # (verified against a real ~25K-character transcript: 2790
+        # reasoning tokens + a complete 19-question answer, well under budget).
         resp = requests.post(
             "https://api.groq.com/openai/v1/chat/completions",
             headers={"Authorization": f"Bearer {self.api_key}", "content-type": "application/json"},
             json={
                 "model": self.model,
                 "messages": [{"role": "user", "content": prompt}],
+                "max_tokens": 8000,
                 "response_format": {
                     "type": "json_schema",
                     "json_schema": {

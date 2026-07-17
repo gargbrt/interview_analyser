@@ -316,6 +316,25 @@ class TestGroqEngineRequest:
         assert sent["response_format"]["json_schema"]["schema"] == RESULT_JSON_SCHEMA
         assert mock_post.call_args.kwargs["headers"]["Authorization"] == "Bearer gsk-from-env"
 
+    def test_sets_a_generous_max_tokens_for_the_reasoning_model(self, monkeypatch):
+        """Regression coverage for a real bug: GPT-OSS is a reasoning
+        model that spends real tokens "thinking" before answering
+        (reproduced directly: 2790 reasoning tokens on one real
+        transcript) -- without an explicit, generous max_tokens, the
+        reasoning phase alone could exhaust Groq's default budget, leaving
+        nothing for the actual JSON answer and causing analysis to fail
+        outright on a long transcript."""
+        monkeypatch.setenv("INTERVIEW_ANALYZER_API_KEY", "gsk-from-env")
+        engine = GroqEngine({})
+        fake_resp = MagicMock()
+        fake_resp.json.return_value = {"choices": [{"message": {"content": "{}"}}]}
+        fake_resp.raise_for_status.return_value = None
+
+        with patch("interview_analyzer.analyzer.requests.post", return_value=fake_resp) as mock_post:
+            engine.run("prompt")
+
+        assert mock_post.call_args.kwargs["json"]["max_tokens"] >= 8000
+
     def test_uses_a_custom_model_when_configured(self, monkeypatch):
         monkeypatch.setenv("INTERVIEW_ANALYZER_API_KEY", "gsk-from-env")
         engine = GroqEngine({"llm_model": "llama-3.1-8b-instant"})
