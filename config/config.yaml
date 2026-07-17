@@ -18,6 +18,20 @@ watched_processes:
   - "webexmta.exe"
   - "Zoom.exe"
   - "AmazonChime.exe"
+  # macOS-only variant of desktop_apps -- used instead of the list above
+  # when running on macOS (see watcher.py's _platform_process_list()).
+  # macOS process names have no ".exe" suffix and often differ from the
+  # Windows executable name entirely; these are the common ones as of
+  # writing, but app updates can rename the actual process -- if detection
+  # ever misses a real call, check the real process name (Activity Monitor)
+  # and update this list, or use the dashboard's "Start recording" button
+  # as a manual fallback in the meantime.
+  desktop_apps_macos:
+  - "Microsoft Teams"
+  - "Teams"               # new Teams client
+  - "Webex"
+  - "Amazon Chime"
+  - "zoom.us"
   browser_tab_keywords:
     # Matched against browser window/tab titles when a browser process
     # (chrome.exe, msedge.exe, firefox.exe) is running. This is inherently
@@ -44,6 +58,13 @@ watched_processes:
   - "chrome.exe"
   - "msedge.exe"
   - "firefox.exe"
+  # macOS-only variant of browser_processes (see desktop_apps_macos above
+  # for why these lists differ per platform).
+  browser_processes_macos:
+  - "Google Chrome"
+  - "Microsoft Edge"
+  - "firefox"
+  - "Safari"
 
 # How often (seconds) the watcher polls running processes/window titles.
 poll_interval_seconds: 5.0

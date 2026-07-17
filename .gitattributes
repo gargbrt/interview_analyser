@@ -1,0 +1,9 @@
+# Shell scripts must always have LF line endings -- a CRLF shebang line
+# breaks execution on macOS/Linux ("bad interpreter" or silent failure).
+# Force this regardless of a contributor's local core.autocrlf setting.
+*.command text eol=lf
+*.sh text eol=lf
+
+# Windows-only scripts: keep CRLF, which is their native/expected form.
+*.bat text eol=crlf
+*.ps1 text eol=crlf

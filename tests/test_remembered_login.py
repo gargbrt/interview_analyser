@@ -6,6 +6,7 @@ actually true, and that's the property worth verifying."""
 from __future__ import annotations
 
 import json
+from unittest.mock import MagicMock, patch
 
 from interview_analyzer.config_loader import Config
 from interview_analyzer.remembered_login import forget, load, remember
@@ -78,3 +79,76 @@ def test_load_handles_corrupted_file_gracefully(tmp_path):
     path.write_text("not valid json{{{", encoding="utf-8")
 
     assert load(cfg) is None
+
+
+class _FakeKeyring:
+    """In-memory stand-in for `keyring`'s module API -- exercises the macOS
+    Keychain-backed code path from this (Windows) dev/CI machine; real
+    behavior is also covered for real by the macos-latest CI job."""
+
+    def __init__(self):
+        self._store: dict[tuple[str, str], str] = {}
+
+    def set_password(self, service, username, password):
+        self._store[(service, username)] = password
+
+    def get_password(self, service, username):
+        return self._store.get((service, username))
+
+    def delete_password(self, service, username):
+        if (service, username) not in self._store:
+            raise KeyError("not found")
+        del self._store[(service, username)]
+
+
+def _macos_with_fake_keyring(fake=None):
+    fake = fake if fake is not None else _FakeKeyring()
+    return (
+        patch("interview_analyzer.remembered_login.sys.platform", "darwin"),
+        patch("interview_analyzer.remembered_login.keyring", fake),
+    )
+
+
+class TestMacOsUsesKeychainNotDpapi:
+    def test_username_is_still_plain_json_password_goes_to_keychain(self, tmp_path):
+        cfg = _cfg(tmp_path)
+        p1, p2 = _macos_with_fake_keyring()
+        with p1, p2:
+            remember(cfg, "alice", "hunter2")
+
+            raw = json.loads((tmp_path / "data" / ".remembered_login.json").read_text(encoding="utf-8"))
+            assert raw["username"] == "alice"
+            assert "password_enc" not in raw  # never touches the Windows DPAPI field
+
+            result = load(cfg)
+        assert result.username == "alice"
+        assert result.password == "hunter2"
+
+    def test_forget_clears_both_the_file_and_the_keychain_entry(self, tmp_path):
+        cfg = _cfg(tmp_path)
+        fake = _FakeKeyring()
+        p1, p2 = _macos_with_fake_keyring(fake)
+        with p1, p2:
+            remember(cfg, "alice", "hunter2")
+            forget(cfg)
+            assert load(cfg) is None
+        assert fake.get_password("InterviewAnalyzer-RememberedLogin", "alice") is None
+
+    def test_username_only_remember_does_not_touch_keychain(self, tmp_path):
+        cfg = _cfg(tmp_path)
+        fake = _FakeKeyring()
+        p1, p2 = _macos_with_fake_keyring(fake)
+        with p1, p2:
+            remember(cfg, "alice", None)
+            result = load(cfg)
+        assert result.username == "alice"
+        assert result.password is None
+
+    def test_falls_back_gracefully_when_keyring_package_unavailable(self, tmp_path):
+        cfg = _cfg(tmp_path)
+        with patch("interview_analyzer.remembered_login.sys.platform", "darwin"), \
+             patch("interview_analyzer.remembered_login.keyring", None):
+            remember(cfg, "alice", "hunter2")
+            result = load(cfg)
+        assert result.username == "alice"
+        assert result.password is None  # not remembered, but doesn't crash either

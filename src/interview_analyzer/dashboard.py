@@ -14,6 +14,8 @@ import datetime as dt
 import logging
 import os
 import pathlib
+import subprocess
+import sys
 import threading
 from typing import Callable, Optional
 
@@ -41,6 +43,18 @@ _TRANSCRIPTION_LANGUAGES = ["auto", "en", "hi", "hinglish"]
 # feedback panel's Comboboxes -- selecting it and saving is how you clear
 # a previously-given score.
 _FEEDBACK_SCORE_VALUES = ["Not rated"] + [str(i) for i in range(1, 11)]
+
+
+def _open_with_os_default(path) -> None:
+    """Opens `path` with whatever the OS would use for a double-click --
+    Explorer/the default player on Windows, Finder/the default player on
+    macOS (`open`, not `os.startfile`, which doesn't exist there)."""
+    if sys.platform == "win32":
+        os.startfile(path)  # noqa: S606
+    elif sys.platform == "darwin":
+        subprocess.run(["open", str(path)], check=True)
+    else:
+        raise RuntimeError(f"Don't know how to open a path with the OS default on {sys.platform!r}.")
 
 
 def _format_elapsed(seconds: float) -> str:
@@ -406,7 +420,7 @@ class Dashboard:
         folder = cfg.resolve(cfg.audio.get("raw_dir", "data/audio"))
         try:
             folder.mkdir(parents=True, exist_ok=True)
-            os.startfile(folder)  # noqa: S606 -- opens with Explorer, Windows-only app
+            _open_with_os_default(folder)
         except Exception:  # noqa: BLE001
             logger.exception("Failed to open recordings folder %s", folder)
 
@@ -863,7 +877,7 @@ class Dashboard:
         if record is None or not has_audio(record):
             return
         try:
-            os.startfile(record.audio_path)  # noqa: S606 -- opens with the OS default player, Windows-only app
+            _open_with_os_default(record.audio_path)
         except Exception as e:  # noqa: BLE001
             logger.exception("Failed to open audio for interview #%s", record.id)
             self._history_text.config(state="normal")

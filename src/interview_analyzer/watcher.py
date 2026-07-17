@@ -15,6 +15,7 @@ from __future__ import annotations
 import datetime as dt
 import logging
 import pathlib
+import sys
 import threading
 import time
 from typing import Any, Callable, Optional
@@ -40,10 +41,17 @@ try:
 except ImportError:  # pragma: no cover
     win32gui = None
 
+# Quartz (via pyobjc) is macOS-only; imported lazily so this module still
+# imports fine on Windows without it installed.
+try:
+    import Quartz  # type: ignore
+except ImportError:  # pragma: no cover
+    Quartz = None
 
-def _enumerate_window_titles() -> list[str]:
-    if win32gui is None:
-        return []
+_macos_permission_warned = False
+
+
+def _enumerate_window_titles_windows() -> list[str]:
     titles: list[str] = []
 
     def _cb(hwnd, _):
@@ -54,6 +62,55 @@ def _enumerate_window_titles() -> list[str]:
 
     win32gui.EnumWindows(_cb, None)
     return titles
+
+
+def _enumerate_window_titles_macos() -> list[str]:
+    """Reading other apps' window titles on macOS requires the user to grant
+    this app Screen Recording permission (System Settings > Privacy &
+    Security > Screen Recording) -- without it, CGWindowListCopyWindowInfo
+    still returns window entries but with no name/title, which would make
+    browser-tab detection silently never match. Warned once, not every
+    poll, since it'd otherwise spam the log every few seconds."""
+    global _macos_permission_warned
+    options = Quartz.kCGWindowListOptionOnScreenOnly | Quartz.kCGWindowListExcludeDesktopElements
+    window_list = Quartz.CGWindowListCopyWindowInfo(options, Quartz.kCGNullWindowID) or []
+    titles: list[str] = []
+    saw_any_window = False
+    for window in window_list:
+        saw_any_window = True
+        title = window.get("kCGWindowName")
+        if title:
+            titles.append(title)
+    if saw_any_window and not titles and not _macos_permission_warned:
+        _macos_permission_warned = True
+        logger.warning(
+            "No window titles were readable (browser-tab meeting detection needs this). "
+            "Grant Screen Recording permission: System Settings > Privacy & Security > "
+            "Screen Recording > enable it for this app, then restart the app."
+        )
+    return titles
+
+
+def _enumerate_window_titles() -> list[str]:
+    if win32gui is not None:
+        return _enumerate_window_titles_windows()
+    if Quartz is not None:
+        return _enumerate_window_titles_macos()
+    return []
+
+
+def _platform_process_list(watched: dict, base_key: str) -> list[str]:
+    """Picks the "_macos" variant of `base_key` (e.g. "desktop_apps_macos")
+    when running on macOS and one is present in config.yaml, else falls
+    back to the base key. This keeps Windows behavior byte-for-byte
+    unchanged -- same key, same list -- regardless of macOS support
+    existing; only macOS gets a different list, and only if config.yaml
+    actually defines one (see config.yaml's watched_processes comments)."""
+    if sys.platform == "darwin":
+        macos_key = f"{base_key}_macos"
+        if macos_key in watched:
+            return watched.get(macos_key, [])
+    return watched.get(base_key, [])
 
 
 def detect_active_meeting(cfg: Config) -> Optional[tuple[str, bool]]:
@@ -72,11 +129,11 @@ def detect_active_meeting(cfg: Config) -> Optional[tuple[str, bool]]:
     watched = cfg.watched_processes
     running = {p.name() for p in psutil.process_iter(["name"])}
 
-    for proc_name in watched.get("desktop_apps", []):
+    for proc_name in _platform_process_list(watched, "desktop_apps"):
         if proc_name in running:
             return proc_name.replace(".exe", ""), True
 
-    browser_running = any(b in running for b in watched.get("browser_processes", []))
+    browser_running = any(b in running for b in _platform_process_list(watched, "browser_processes"))
     if browser_running:
         titles = _enumerate_window_titles()
         for title in titles:

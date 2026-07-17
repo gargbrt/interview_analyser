@@ -13,7 +13,12 @@ from unittest.mock import MagicMock, patch
 
 import numpy as np
 
-from interview_analyzer.recorder import SystemAudioRecorder, _mix_pcm16
+from interview_analyzer.recorder import (
+    SystemAudioRecorder,
+    _MacAudioRecorder,
+    _WindowsAudioRecorder,
+    _mix_pcm16,
+)
 
 FRAME = b"\x00\x01" * 1024  # 1024 samples of 16-bit mono silence-ish data
 
@@ -241,3 +246,181 @@ def test_mix_pcm16_pads_shorter_chunk_with_silence():
     mixed = np.frombuffer(_mix_pcm16(a, b), dtype=np.int16)
 
     assert list(mixed) == [15, 20, 30]
+
+
+# -- SystemAudioRecorder() platform dispatch --------------------------------
+# Windows behavior (the only platform this has ever run on for real, and
+# what every test above exercises via the real pyaudiowpatch-backed class)
+# must never change based on macOS support existing -- these confirm the
+# factory function routes to the right backend and nothing else.
+
+class TestPlatformDispatch:
+    def test_returns_windows_backend_on_win32(self):
+        with patch("interview_analyzer.recorder.sys.platform", "win32"), \
+             patch("interview_analyzer.recorder.pyaudio", MagicMock()):
+            rec = SystemAudioRecorder()
+        assert isinstance(rec, _WindowsAudioRecorder)
+
+    def test_returns_mac_backend_on_darwin(self):
+        with patch("interview_analyzer.recorder.sys.platform", "darwin"), \
+             patch("interview_analyzer.recorder.sd", MagicMock()):
+            rec = SystemAudioRecorder()
+        assert isinstance(rec, _MacAudioRecorder)
+
+    def test_raises_a_clear_error_on_an_unsupported_platform(self):
+        with patch("interview_analyzer.recorder.sys.platform", "linux"):
+            try:
+                SystemAudioRecorder()
+                assert False, "expected RuntimeError"
+            except RuntimeError as e:
+                assert "linux" in str(e)
+
+
+# -- macOS backend (_MacAudioRecorder) --------------------------------------
+# Real capture needs a real Mac with a virtual loopback device installed
+# (see docs/macos_setup.md), so `sounddevice` is faked here the same way
+# `pyaudiowpatch` is faked above for Windows -- everything downstream of "a
+# stream that yields frames" is real code under test. This is the one area
+# of this port that most needs real-hardware verification on an actual Mac
+# (see PR/README notes) -- these tests cover the logic, not real audio I/O.
+
+class _FakeSdStream:
+    def __init__(self, **kwargs):
+        self.kwargs = kwargs
+
+    def start(self):
+        pass
+
+    def stop(self):
+        pass
+
+    def close(self):
+        pass
+
+    def read(self, n):
+        raise RuntimeError("fake stream produces no frames; tests drive frames directly")
+
+
+class _FakeSoundDevice:
+    """Mimics the bits of the `sounddevice` module _MacAudioRecorder uses."""
+
+    def __init__(self, devices=None, default_input_index=0, mic_open_fails=False):
+        self._devices = devices if devices is not None else [
+            {"name": "BlackHole 2ch", "max_input_channels": 1, "max_output_channels": 2, "default_samplerate": 16000.0},
+            {"name": "MacBook Pro Microphone", "max_input_channels": 1, "max_output_channels": 0, "default_samplerate": 16000.0},
+        ]
+        self.default = MagicMock()
+        self.default.device = [default_input_index, 1]
+        self._mic_open_fails = mic_open_fails
+        self.InputStream = self._make_input_stream
+
+    def query_devices(self, index=None):
+        if index is not None:
+            return self._devices[index]
+        return self._devices
+
+    def _make_input_stream(self, **kwargs):
+        if self._mic_open_fails and kwargs.get("device") == self.default.device[0]:
+            raise OSError("Access denied (no microphone permission)")
+        return _FakeSdStream(**kwargs)
+
+
+@contextmanager
+def _fake_mac_recorder(mic_available: bool = False, mic_open_fails: bool = False, include_microphone: bool = True):
+    devices = [
+        {"name": "BlackHole 2ch", "max_input_channels": 1, "max_output_channels": 2, "default_samplerate": 16000.0},
+    ]
+    default_input_index = -1
+    if mic_available:
+        devices.append(
+            {"name": "MacBook Pro Microphone", "max_input_channels": 1, "max_output_channels": 0, "default_samplerate": 16000.0}
+        )
+        default_input_index = 1
+
+    fake_sd = _FakeSoundDevice(devices=devices, default_input_index=default_input_index, mic_open_fails=mic_open_fails)
+    with patch("interview_analyzer.recorder.sd", fake_sd):
+        yield _MacAudioRecorder(sample_rate=16000, channels=1, include_microphone=include_microphone)
+
+
+def test_mac_recorder_writes_frames_when_not_paused(tmp_path):
+    with _fake_mac_recorder() as rec:
+        out_path = tmp_path / "call.wav"
+        rec.start(out_path)
+        rec._handle_frame(FRAME)
+        rec._handle_frame(FRAME)
+        rec.stop()
+
+    with wave.open(str(out_path), "rb") as wf:
+        assert wf.getnframes() == 2048
+
+
+def test_mac_recorder_pause_resume(tmp_path):
+    with _fake_mac_recorder() as rec:
+        rec.start(tmp_path / "call.wav")
+        rec.pause()
+        assert rec.is_paused is True
+        rec.resume()
+        assert rec.is_paused is False
+        rec.stop()
+
+
+def test_mac_recorder_elapsed_seconds_tracks_written_frames(tmp_path):
+    with _fake_mac_recorder() as rec:
+        rec.start(tmp_path / "call.wav")
+        rec._handle_frame(FRAME)
+        assert rec.elapsed_seconds == 1024 / 16000
+        rec.stop()
+
+
+def test_mac_recorder_raises_clear_error_when_no_loopback_device_found(tmp_path):
+    fake_sd = _FakeSoundDevice(devices=[
+        {"name": "MacBook Pro Microphone", "max_input_channels": 1, "max_output_channels": 0, "default_samplerate": 16000.0},
+    ])
+    with patch("interview_analyzer.recorder.sd", fake_sd):
+        rec = _MacAudioRecorder()
+        try:
+            rec.start(tmp_path / "call.wav")
+            assert False, "expected RuntimeError"
+        except RuntimeError as e:
+            assert "BlackHole" in str(e)
+            assert "macos_setup.md" in str(e)
+
+
+def test_mac_recorder_is_capturing_microphone_true_when_available(tmp_path):
+    with _fake_mac_recorder(mic_available=True) as rec:
+        assert rec.is_capturing_microphone is False
+        rec.start(tmp_path / "call.wav")
+        assert rec.is_capturing_microphone is True
+        rec.stop()
+
+
+def test_mac_recorder_is_capturing_microphone_false_when_disabled(tmp_path):
+    with _fake_mac_recorder(mic_available=True, include_microphone=False) as rec:
+        rec.start(tmp_path / "call.wav")
+        assert rec.is_capturing_microphone is False
+        rec.stop()
+
+
+def test_mac_recorder_is_capturing_microphone_false_when_no_default_mic(tmp_path):
+    with _fake_mac_recorder(mic_available=False) as rec:
+        rec.start(tmp_path / "call.wav")
+        assert rec.is_capturing_microphone is False
+        rec.stop()
+
+
+def test_mac_recorder_is_capturing_microphone_false_when_opening_it_fails(tmp_path):
+    """e.g. macOS blocking microphone access in System Settings -- must
+    fall back to system-audio-only, not crash the whole recording."""
+    with _fake_mac_recorder(mic_available=True, mic_open_fails=True) as rec:
+        rec.start(tmp_path / "call.wav")
+        assert rec.is_capturing_microphone is False
+        rec.stop()
+
+
+def test_mac_recorder_requires_sounddevice_installed():
+    with patch("interview_analyzer.recorder.sd", None):
+        try:
+            _MacAudioRecorder()
+            assert False, "expected RuntimeError"
+        except RuntimeError as e:
+            assert "sounddevice" in str(e)

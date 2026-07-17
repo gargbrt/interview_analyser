@@ -2,10 +2,16 @@
 openai_api), entered via the Settings tab instead of only via an
 environment variable.
 
-Same reasoning and mechanism as remembered_login.py's password storage:
-encrypted at rest with Windows DPAPI (`CryptProtectData`), tied to the
-current Windows user account, never written in plaintext. An environment
-variable (the original, still-supported mechanism -- see
+Storage is platform-specific, but the public functions below
+(save_key/load_key/clear_key/has_key) behave identically either way:
+
+  - **Windows**: encrypted at rest with DPAPI (`CryptProtectData`), tied to
+    the current Windows user account, in a local JSON file -- never written
+    in plaintext.
+  - **macOS**: stored in the macOS Keychain via the `keyring` package --
+    the OS's own credential store, not a file this app manages at all.
+
+An environment variable (the original, still-supported mechanism -- see
 docs/using_cloud_apis.md) always takes precedence over a locally-stored
 key, so power users/CI setups that already set one are unaffected.
 
@@ -22,6 +28,7 @@ import base64
 import json
 import logging
 import pathlib
+import sys
 from typing import Optional
 
 from .config_loader import PROJECT_ROOT
@@ -33,8 +40,14 @@ try:
 except ImportError:  # pragma: no cover
     win32crypt = None
 
+try:
+    import keyring  # macOS Keychain backend (cross-platform package, only used on macOS here)
+except ImportError:  # pragma: no cover
+    keyring = None
+
 _DESCRIPTION = "Interview Analyzer cloud API key"
 _STORE_PATH = PROJECT_ROOT / "data" / ".api_keys.json"
+_KEYRING_SERVICE = "InterviewAnalyzer"
 
 
 def _encrypt(value: str) -> Optional[str]:
@@ -72,9 +85,20 @@ def _load_all() -> dict:
 
 def save_key(provider: str, key: str) -> bool:
     """Encrypts and saves `key` under `provider` (e.g. "anthropic_api").
-    Returns False (and saves nothing) if DPAPI isn't available -- callers
-    should tell the user to use the environment-variable route instead in
-    that case rather than silently doing nothing."""
+    Returns False (and saves nothing) if the platform's secure-storage
+    mechanism isn't available -- callers should tell the user to use the
+    environment-variable route instead in that case rather than silently
+    doing nothing."""
+    if sys.platform == "darwin":
+        if keyring is None:
+            return False
+        try:
+            keyring.set_password(_KEYRING_SERVICE, provider, key)
+            return True
+        except Exception:  # noqa: BLE001
+            logger.warning("Couldn't save API key for %s to the macOS Keychain.", provider, exc_info=True)
+            return False
+
     encrypted = _encrypt(key)
     if encrypted is None:
         return False
@@ -90,6 +114,15 @@ def save_key(provider: str, key: str) -> bool:
 
 
 def load_key(provider: str) -> Optional[str]:
+    if sys.platform == "darwin":
+        if keyring is None:
+            return None
+        try:
+            return keyring.get_password(_KEYRING_SERVICE, provider)
+        except Exception:  # noqa: BLE001
+            logger.warning("Couldn't read API key for %s from the macOS Keychain.", provider, exc_info=True)
+            return None
+
     encrypted = _load_all().get(provider)
     if not encrypted:
         return None
@@ -97,6 +130,18 @@ def load_key(provider: str) -> Optional[str]:
 
 
 def clear_key(provider: str) -> None:
+    if sys.platform == "darwin":
+        if keyring is None:
+            return
+        try:
+            keyring.delete_password(_KEYRING_SERVICE, provider)
+        except Exception:  # noqa: BLE001
+            # covers both "nothing was saved" (keyring.errors.PasswordDeleteError)
+            # and any other backend error -- either way, clearing an unset key
+            # should be a no-op, same as the Windows path below
+            pass
+        return
+
     data = _load_all()
     if provider in data:
         del data[provider]
@@ -107,6 +152,8 @@ def clear_key(provider: str) -> None:
 
 
 def has_key(provider: str) -> bool:
+    if sys.platform == "darwin":
+        return load_key(provider) is not None
     return provider in _load_all()
 
 

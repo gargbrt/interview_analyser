@@ -1,9 +1,10 @@
 # Interview Analyzer
 
 Automatically records your **online interview calls** (Teams, Google Meet, Webex,
-Zoom, Amazon Chime — app or browser, any of them) on Windows, transcribes them,
-and produces a structured feedback report highlighting communication and answer
--quality issues — free by default, fully local, no meeting-bot APIs required.
+Zoom, Amazon Chime — app or browser, any of them) on **Windows or macOS**,
+transcribes them, and produces a structured feedback report highlighting
+communication and answer-quality issues — free by default, fully local, no
+meeting-bot APIs required.
 
 It does **not** join your meeting as a bot/participant, and it does **not**
 record silently. It watches for a known conferencing app/tab to start,
@@ -31,7 +32,9 @@ consent.py     →  pop-up: "Record this call for interview analysis?"
                    (times out to "No" if unanswered — never records silently)
                        │  Yes
                        ▼
-recorder.py    →  starts system-audio (loopback) + mic recording
+recorder.py    →  starts system-audio (loopback) + mic recording -- WASAPI
+                   on Windows, a virtual audio device (e.g. BlackHole) on
+                   macOS, picked automatically based on the OS
 control_panel.py→ small always-on-top Pause/Resume/Stop control shown for
                    the duration of the recording
                        │  (compressed mono opus, ~1MB/min)
@@ -99,13 +102,20 @@ meeting app/tab has closed — you never have to remember to turn it off.
 
 ## Requirements (all free)
 
-- Windows 10/11
+- **Windows 10/11**, or **macOS** (12+) -- the right platform-specific
+  dependencies (see `requirements.txt`) install automatically via
+  `pip install -r requirements.txt`, no manual platform selection needed.
 - Python 3.10+
 - [Ollama](https://ollama.com) installed locally -- the app offers to pull
   a model for you on first run (see "First run" below), so a manual
   `ollama pull` beforehand is optional, not required
-- A WASAPI loopback-capable audio backend (handled via `pyaudiowpatch`,
-  no extra driver install needed on Windows 10/11)
+- **Windows**: a WASAPI loopback-capable audio backend (handled via
+  `pyaudiowpatch`, no extra driver install needed on Windows 10/11)
+- **macOS**: a virtual audio loopback driver (e.g. free/open-source
+  [BlackHole](https://github.com/ExistentialAudio/BlackHole)) -- macOS has
+  no built-in equivalent of WASAPI loopback, so this is a required one-time
+  setup step, not optional. See `docs/macos_setup.md` for the full walkthrough
+  (driver install, Multi-Output Device, permissions).
 
 No paid API keys are required for the default configuration. You can
 optionally swap the analyzer to use a hosted LLM API by editing
@@ -115,6 +125,7 @@ optionally swap the analyzer to use a hosted LLM API by editing
 
 ## Setup
 
+**Windows:**
 ```bash
 git clone https://github.com/gargbrt/interview_analyser.git
 cd interview_analyser
@@ -123,6 +134,21 @@ python -m venv .venv
 pip install -r requirements.txt
 pip install -e .
 ```
+
+**macOS:** same idea, POSIX venv activation, plus a required one-time audio
+driver install first -- see `docs/macos_setup.md` for the full walkthrough:
+```bash
+git clone https://github.com/gargbrt/interview_analyser.git
+cd interview_analyser
+python3 -m venv .venv
+source .venv/bin/activate
+pip install -r requirements.txt
+pip install -e .
+```
+
+`requirements.txt` installs the right platform-specific packages
+automatically (pip evaluates the `sys_platform` markers in it) -- there's
+no separate "macOS requirements file" or install flag to remember.
 
 `pip install -e .` registers the package so `python -m interview_analyzer.app`
 (and the launch shortcut below) work from anywhere — without it you'd need
@@ -134,16 +160,21 @@ on first launch (next section). If you'd rather do it upfront anyway:
 
 ### Launch shortcut (optional)
 
+**Windows:**
 ```powershell
 powershell -ExecutionPolicy Bypass -File scripts\create_shortcut.ps1
 ```
-
 Creates an **"Interview Analyzer.lnk"** shortcut in the project folder
 (with the app's icon) that launches it with no console window — double-click
 it any time instead of typing the run command. It's machine-specific
 (git-ignored), so run this once per clone/machine. `run_app.bat` (what the
 shortcut points to) also works directly if you'd rather not create a
 shortcut.
+
+**macOS:** `run_app.command` is the equivalent — double-click it in Finder
+(right-click → Open the first time, since it's unsigned) or run it from a
+terminal. No separate shortcut-generator script needed; it's already a
+double-clickable launcher on its own.
 
 Edit `config/config.yaml` (or the dashboard's Settings tab, once running) to adjust:
 - `retention_days` — how long raw audio is kept before auto-deletion (default: 3)
@@ -168,8 +199,9 @@ window**, both described below.
 1. **Login dialog** — create/select your local profile (just a name,
    password optional). Use `--username yourname` to skip it. Check
    **"Remember me on this computer"** to pre-fill your profile name (and
-   password, encrypted with Windows DPAPI — never stored in plaintext —
-   see `remembered_login.py`) the next time you log in.
+   password, encrypted with Windows DPAPI or stored in the macOS Keychain
+   depending on your OS — never stored in plaintext — see
+   `remembered_login.py`) the next time you log in.
 2. **Dashboard** opens automatically.
 3. **First run only**: an **analysis model setup** dialog, if the
    configured local model (`llama3.1:8b` by default) isn't already
@@ -234,8 +266,8 @@ future analysis prompts. See `docs/feedback_and_confidence.md` for details.
 The default is free and local (Ollama). To use Anthropic's or OpenAI's API
 instead: Settings tab → **Cloud API key** — paste a real API key (from
 console.anthropic.com / platform.openai.com), **Save key** (encrypted
-locally with Windows DPAPI, never in `config.yaml`), then set **Analysis
-engine** to `anthropic_api`/`openai_api`. **A claude.ai or ChatGPT
+locally with Windows DPAPI or the macOS Keychain, never in `config.yaml`),
+then set **Analysis engine** to `anthropic_api`/`openai_api`. **A claude.ai or ChatGPT
 *subscription* does not work here** — API access is a separate,
 separately-billed credential; there's no "log in with your account" option
 because no such integration exists for either provider. See
@@ -305,27 +337,28 @@ independent of which entry point started the watcher); see
 
 ```
 pyproject.toml               - packaging (pip install -e . -- makes `python -m interview_analyzer.app` work anywhere)
-run_app.bat                  - portable launcher (used by the generated shortcut)
-scripts/create_shortcut.ps1  - generates "Interview Analyzer.lnk" in the project folder
+run_app.bat                  - Windows portable launcher (used by the generated shortcut)
+run_app.command               - macOS portable launcher (double-clickable in Finder)
+scripts/create_shortcut.ps1  - generates "Interview Analyzer.lnk" in the project folder (Windows)
 assets/icon.ico               - app icon
-.github/workflows/tests.yml    - CI: runs the test suite on push/PR (Windows runners)
+.github/workflows/tests.yml    - CI: runs the test suite on push/PR, on both Windows and macOS runners
 config/config.yaml               - all user settings
 src/interview_analyzer/
   app.py                          - GUI entry point: login/logout loop + tray + dashboard per session
-  watcher.py                       - detects meeting app start/stop, drives the pipeline
+  watcher.py                       - detects meeting app start/stop, drives the pipeline (platform-specific window enumeration)
   tray.py                           - system tray icon (status, pause/resume/stop, log out, quit)
   dashboard.py                       - dashboard window (status/history/trends/settings tabs)
   login_dialog.py                     - GUI login dialog (app.py's counterpart to auth.py's console prompt)
-  remembered_login.py                   - "remember me" storage (DPAPI-encrypted password, never plaintext)
-  single_instance.py                      - prevents two copies of the app running at once
+  remembered_login.py                   - "remember me" storage (DPAPI on Windows, Keychain on macOS, never plaintext)
+  single_instance.py                      - prevents two copies of the app running at once (msvcrt/fcntl)
   settings_editor.py                        - comment-preserving config.yaml edits for the Settings tab
   model_setup.py                              - first-run + on-demand local model install (size-confirmed downloads)
   language_packs.py                             - optional per-language transcription packs, install/uninstall any time
-  api_keys.py                                     - local cloud API key storage (DPAPI-encrypted, never plaintext)
+  api_keys.py                                     - local cloud API key storage (DPAPI on Windows, Keychain on macOS)
   report_view.py                                    - renders report/trend markdown into the dashboard's Text widgets
   consent.py                                        - pop-up permission prompt before recording
   auth.py                                             - local login/profile system
-  recorder.py                                           - system-audio loopback recording (with pause/resume)
+  recorder.py                                           - system-audio recording: WASAPI loopback (Windows) or a virtual-device capture (macOS), see docs/macos_setup.md
   control_panel.py                                        - Pause/Resume/Stop control shown during recording
   compress.py                                               - shrinks WAV to small opus/mp3
   transcriber.py                                              - faster-whisper transcription + diarization + language packs
@@ -337,7 +370,7 @@ src/interview_analyzer/
   cleanup.py                                                              - retention/auto-delete of audio
   report.py                                                                 - per-interview + per-user trend markdown reports
   config_loader.py                                                            - loads config.yaml
-tests/                        - automated test suite (240+ tests; see "Testing" below)
+tests/                        - automated test suite (265+ tests; see "Testing" below)
 ```
 
 ## Testing
@@ -360,17 +393,29 @@ widgets, editing and saving a real settings form, and confirming rendered
 report/trend content — since none of that renders meaningfully under a
 mocked Tk/pystray backend.
 
+CI runs the full suite on both **windows-latest** and **macos-latest**
+(`.github/workflows/tests.yml`), so the macOS-specific code paths
+(`_MacAudioRecorder`, Quartz window enumeration, Keychain storage, `fcntl`
+locking) are exercised for real on every push/PR too, not just mocked --
+see "Known limitation" in `docs/macos_setup.md` for what that does and
+doesn't cover (real hardware/live-call testing on macOS specifically).
+
 **What's verified automatically:** all orchestration logic, file lifecycle,
 consent gating (including "don't re-prompt for the same ongoing call"),
-retention deletion, and report/trend content.
+retention deletion, report/trend content, and (on both OSes via CI) that
+the platform-specific modules import and their pure logic behaves
+correctly.
 
-**What's *not* verified automatically** (needs a real Windows machine with a
-live call, which isn't available in CI/dev sandboxes): actual WASAPI
-loopback audio capture, actual faster-whisper transcription quality, and
-actual Ollama/API responses. Those three boundaries are mocked in tests —
-please treat first real-world runs as a manual verification step, and open
-an issue if `recorder.py`'s device selection doesn't work on your audio
-setup (this is the most hardware-dependent part).
+**What's *not* verified automatically** (needs a real machine with a live
+call, which isn't available in CI/dev sandboxes): actual loopback audio
+capture end-to-end (WASAPI on Windows; a real BlackHole-routed capture on
+macOS), actual faster-whisper transcription quality, and actual Ollama/API
+responses. Those boundaries are mocked in tests — please treat first
+real-world runs as a manual verification step, and open an issue if
+`recorder.py`'s device selection doesn't work on your audio setup (this is
+the most hardware-dependent part, and the macOS backend in particular has
+had less real-world mileage than the Windows one — see
+`docs/macos_setup.md`).
 
 Run tests with pytest (recommended, once installed):
 ```bash

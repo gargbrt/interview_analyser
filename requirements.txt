@@ -1,8 +1,6 @@
 pyyaml>=6.0
 ruamel.yaml>=0.18          # comment-preserving config.yaml edits from the Settings tab
 psutil>=5.9
-pyaudiowpatch>=0.2.12.6   # WASAPI loopback capture on Windows
-pywin32>=306              # window title enumeration on Windows
 pystray>=0.19.5            # system tray icon
 Pillow>=10.0                # tray icon image generation
 faster-whisper>=1.0.0
@@ -11,3 +9,16 @@ indic-transliteration>=2.3  # romanizes Devanagari for the optional "hinglish" l
 requests>=2.31
 numpy>=1.26
 soundfile>=0.12
+
+# --- Windows-only ---
+pyaudiowpatch>=0.2.12.6; sys_platform == "win32"   # WASAPI loopback capture
+pywin32>=306; sys_platform == "win32"               # window title enumeration, DPAPI credential storage
+
+# --- macOS-only ---
+# System-audio loopback capture on macOS needs a virtual audio device (e.g.
+# BlackHole, free) that the user installs and routes output through --
+# there's no OS-level loopback API like WASAPI. See docs/macos_setup.md.
+sounddevice>=0.4; sys_platform == "darwin"           # audio capture (loopback device + microphone)
+pyobjc-framework-Quartz>=10.0; sys_platform == "darwin"  # browser-tab window title enumeration
+pyobjc-framework-Cocoa>=10.0; sys_platform == "darwin"   # tray icon backend (pystray) support
+keyring>=24.0; sys_platform == "darwin"              # Keychain-backed credential storage

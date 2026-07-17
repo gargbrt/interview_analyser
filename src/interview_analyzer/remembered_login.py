@@ -2,14 +2,18 @@
 (and, if opted in, the password) the next time the login dialog opens after
 logging out or restarting the app.
 
-The username alone isn't sensitive, so it's stored as plain JSON. A
-remembered password is different -- it's encrypted at rest with Windows
-DPAPI (`CryptProtectData`), which ties the ciphertext to the current
-Windows user account: the file is useless if copied to another machine or
-opened under a different Windows login, and nothing is ever written in
-plaintext. If pywin32's `win32crypt` isn't available for some reason, the
-password simply isn't remembered (falls back to username-only) rather than
-falling back to plaintext storage.
+The username alone isn't sensitive, so it's always stored as plain JSON.
+The password (if remembered) is stored more carefully, platform-specific:
+
+  - **Windows**: encrypted at rest with DPAPI (`CryptProtectData`), which
+    ties the ciphertext to the current Windows user account -- the file is
+    useless if copied to another machine or opened under a different
+    Windows login, and nothing is ever written in plaintext. If pywin32's
+    `win32crypt` isn't available for some reason, the password simply isn't
+    remembered (falls back to username-only) rather than falling back to
+    plaintext storage.
+  - **macOS**: stored in the macOS Keychain via the `keyring` package
+    (keyed by username) rather than in the JSON file at all.
 """
 from __future__ import annotations
 
@@ -17,6 +21,7 @@ import base64
 import json
 import logging
 import pathlib
+import sys
 from dataclasses import dataclass
 from typing import Optional
 
@@ -27,7 +32,13 @@ try:
 except ImportError:  # pragma: no cover
     win32crypt = None
 
+try:
+    import keyring  # macOS Keychain backend (cross-platform package, only used on macOS here)
+except ImportError:  # pragma: no cover
+    keyring = None
+
 _DESCRIPTION = "Interview Analyzer remembered login"
+_KEYRING_SERVICE = "InterviewAnalyzer-RememberedLogin"
 
 
 @dataclass
@@ -68,15 +79,22 @@ def _decrypt(encoded: str) -> Optional[str]:
 
 
 def remember(cfg, username: str, password: Optional[str]) -> None:
-    """Saves `username` (plaintext) and `password` (DPAPI-encrypted, or
-    simply omitted if that's unavailable) for next time. Overwrites
-    whatever was previously remembered."""
+    """Saves `username` (plaintext) and `password` (encrypted/Keychain-
+    stored, or simply omitted if that's unavailable) for next time.
+    Overwrites whatever was previously remembered."""
     path = _remember_path(cfg)
     data: dict = {"username": username}
     if password:
-        encrypted = _encrypt(password)
-        if encrypted is not None:
-            data["password_enc"] = encrypted
+        if sys.platform == "darwin":
+            if keyring is not None:
+                try:
+                    keyring.set_password(_KEYRING_SERVICE, username, password)
+                except Exception:  # noqa: BLE001
+                    logger.warning("Couldn't save remembered password to the macOS Keychain.", exc_info=True)
+        else:
+            encrypted = _encrypt(password)
+            if encrypted is not None:
+                data["password_enc"] = encrypted
     try:
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(json.dumps(data), encoding="utf-8")
@@ -88,6 +106,13 @@ def forget(cfg) -> None:
     """Clears any remembered login -- called when "Remember me" is left
     unchecked on submit, so unchecking it actually stops remembering rather
     than just not updating a stale saved password."""
+    if sys.platform == "darwin" and keyring is not None:
+        existing = load(cfg)
+        if existing is not None:
+            try:
+                keyring.delete_password(_KEYRING_SERVICE, existing.username)
+            except Exception:  # noqa: BLE001
+                pass  # nothing was saved there, or backend error -- either way, a no-op
     try:
         _remember_path(cfg).unlink(missing_ok=True)
     except OSError:
@@ -106,7 +131,15 @@ def load(cfg) -> Optional[RememberedLogin]:
     username = data.get("username")
     if not username:
         return None
+
     password = None
-    if data.get("password_enc"):
+    if sys.platform == "darwin":
+        if keyring is not None:
+            try:
+                password = keyring.get_password(_KEYRING_SERVICE, username)
+            except Exception:  # noqa: BLE001
+                logger.warning("Couldn't read remembered password from the macOS Keychain.", exc_info=True)
+    elif data.get("password_enc"):
         password = _decrypt(data["password_enc"])
+
     return RememberedLogin(username=username, password=password)

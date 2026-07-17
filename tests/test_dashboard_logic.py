@@ -5,10 +5,10 @@ do that). The rest of the dashboard's Tk UI remains a manual-verification
 boundary, same as elsewhere in this project."""
 from __future__ import annotations
 
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 from interview_analyzer.config_loader import Config
-from interview_analyzer.dashboard import Dashboard
+from interview_analyzer.dashboard import Dashboard, _open_with_os_default
 from interview_analyzer.db import InterviewDB
 
 
@@ -151,3 +151,29 @@ class TestDeleteFeedback:
         dashboard._history_tree = MagicMock()
         dashboard._history_tree.selection.return_value = []
         dashboard._on_delete_feedback()  # must not raise
+
+
+class TestOpenWithOsDefault:
+    """Regression coverage: os.startfile doesn't exist on macOS at all
+    (an AttributeError, not a no-op) -- _open_with_os_default must branch
+    before ever touching it there."""
+
+    def test_uses_os_startfile_on_windows(self):
+        with patch("interview_analyzer.dashboard.sys.platform", "win32"), \
+             patch("interview_analyzer.dashboard.os.startfile", create=True) as mock_startfile:
+            _open_with_os_default("C:\\some\\path")
+        mock_startfile.assert_called_once_with("C:\\some\\path")
+
+    def test_uses_open_command_on_macos(self):
+        with patch("interview_analyzer.dashboard.sys.platform", "darwin"), \
+             patch("interview_analyzer.dashboard.subprocess.run") as mock_run:
+            _open_with_os_default("/some/path")
+        mock_run.assert_called_once_with(["open", "/some/path"], check=True)
+
+    def test_raises_on_an_unsupported_platform(self):
+        with patch("interview_analyzer.dashboard.sys.platform", "linux"):
+            try:
+                _open_with_os_default("/some/path")
+                assert False, "expected RuntimeError"
+            except RuntimeError as e:
+                assert "linux" in str(e)

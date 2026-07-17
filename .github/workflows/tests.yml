@@ -8,12 +8,14 @@ on:
 
 jobs:
   test:
-    # Windows-only: pywin32/pyaudiowpatch (WASAPI loopback capture, window
-    # title enumeration, single-instance locking) only work on Windows,
-    # matching this app's own documented OS requirement.
-    runs-on: windows-latest
+    # Both platforms this app supports -- see requirements.txt's
+    # Windows-only/macOS-only sections and docs/macos_setup.md. fail-fast
+    # is off so a failure on one OS doesn't hide results from the other.
+    runs-on: ${{ matrix.os }}
     strategy:
+      fail-fast: false
       matrix:
+        os: [windows-latest, macos-latest]
         python-version: ["3.10", "3.11"]
 
     steps:
