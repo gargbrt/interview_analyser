@@ -273,6 +273,38 @@ class TestLiveTranscriptionWorkerFinish:
         assert result is None
         assert worker._failed is True
 
+    def test_finish_gives_the_final_segment_a_bigger_retry_budget_than_a_periodic_one(self, tmp_path):
+        """There's no next cycle to fall back on for the final segment
+        (unlike a periodic mid-recording one), so it's worth trying harder
+        before giving up and forcing the whole-file fallback."""
+        worker, recorder = self._worker(tmp_path)
+        worker._model = MagicMock()
+
+        with patch("interview_analyzer.live_transcribe._extract_segment", side_effect=OSError("busy")) as mock_extract, \
+             patch("interview_analyzer.live_transcribe.time.sleep"):
+            worker.finish(timeout=5)
+
+        assert mock_extract.call_count == 6  # vs. 3 for a periodic segment -- see _process_range
+
+    def test_finish_fails_closed_if_coverage_somehow_falls_short(self, tmp_path):
+        """Hard safety net for "no missing bits": even if _process_range
+        reports success without actually advancing _last_frame all the way
+        to the recording's true final frame count (shouldn't happen by
+        construction, but this is deliberately not trusted blindly), finish()
+        must refuse to return a possibly-incomplete transcript."""
+        worker, recorder = self._worker(tmp_path, total_seconds=30)
+        worker._model = MagicMock()
+
+        def _fake_process_range(start_frame, end_frame):
+            # simulates a bug that "succeeds" without covering everything
+            worker._transcript_parts.append("[You] partial")
+            worker._last_frame = start_frame + 1  # doesn't reach end_frame
+
+        with patch.object(worker, "_process_range", side_effect=_fake_process_range):
+            result = worker.finish(timeout=5)
+
+        assert result is None
+
     def test_finish_is_safe_to_call_twice(self, tmp_path):
         worker, recorder = self._worker(tmp_path)
         with patch("interview_analyzer.live_transcribe.load_whisper_model", return_value=MagicMock()), \

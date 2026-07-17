@@ -40,6 +40,24 @@ class FakeBrokenEngine(AnalysisEngine):
         return "this is not json"
 
 
+class FakeWrongShapeEngine(AnalysisEngine):
+    """Simulates a real failure mode reproduced on an actual interview:
+    llama3.1:8b returned syntactically valid JSON that completely ignored
+    the requested qa_pairs/session_summary schema -- a generic-looking
+    {"title": ..., "topics": [...]} object instead. This used to sail
+    through as a "successful" analysis and produce a blank report with no
+    way to reprocess it."""
+
+    def run(self, prompt: str) -> str:
+        return json.dumps({
+            "title": "Product Management Interview",
+            "speaker": "Interviewee",
+            "topics": ["product roadmap", "market analysis"],
+            "time": 15,
+            "date": "2023-03-16",
+        })
+
+
 def _make_config(engine_name: str) -> Config:
     return Config(raw={"analysis": {"engine": engine_name}})
 
@@ -67,6 +85,33 @@ def test_analyzer_handles_non_json_response_gracefully():
 def test_unknown_engine_raises_helpful_error():
     with pytest.raises(ValueError, match="Unknown analysis engine"):
         get_engine("totally_made_up_engine", {})
+
+
+def test_analyzer_treats_wrong_shaped_json_the_same_as_a_parse_error():
+    register_engine("fake_wrong_shape", lambda acfg: FakeWrongShapeEngine())
+    cfg = _make_config("fake_wrong_shape")
+
+    result = analyze_transcript("[Interviewer] Hi\n[You] Hello", cfg)
+
+    assert result["parse_error"] is True
+    assert "raw" in result
+    assert json.loads(result["raw"])["title"] == "Product Management Interview"
+
+
+def test_analyzer_accepts_an_empty_qa_pairs_list_as_valid_shape():
+    """qa_pairs=[] is legitimate (e.g. a very short call) -- must not be
+    mistaken for the wrong-shape case just because it's empty."""
+    class _EmptyButValidEngine(AnalysisEngine):
+        def run(self, prompt: str) -> str:
+            return json.dumps({"qa_pairs": [], "session_summary": {"top_strengths": [], "top_issues": []}})
+
+    register_engine("fake_empty_valid", lambda acfg: _EmptyButValidEngine())
+    cfg = _make_config("fake_empty_valid")
+
+    result = analyze_transcript("[Interviewer] Hi\n[You] Hello", cfg)
+
+    assert result.get("parse_error") is not True
+    assert result["qa_pairs"] == []
 
 
 def _ndjson_lines(*objs) -> list[bytes]:
@@ -118,7 +163,8 @@ class TestOllamaEngineStreamingProgress:
 
     def test_analyze_transcript_passes_progress_callback_through_to_ollama(self):
         cfg = Config(raw={"analysis": {"engine": "ollama"}})
-        lines = _ndjson_lines({"response": '{"qa_pairs": []}', "eval_count": 100, "done": True})
+        response_json = '{"qa_pairs": [], "session_summary": {"top_strengths": [], "top_issues": []}}'
+        lines = _ndjson_lines({"response": response_json, "eval_count": 100, "done": True})
         fake_resp = MagicMock()
         fake_resp.iter_lines.return_value = lines
         fake_resp.raise_for_status.return_value = None
@@ -130,7 +176,7 @@ class TestOllamaEngineStreamingProgress:
                 "[Interviewer] Hi\n[You] Hello", cfg, on_progress=progress_calls.append
             )
 
-        assert result == {"qa_pairs": []}
+        assert result == {"qa_pairs": [], "session_summary": {"top_strengths": [], "top_issues": []}}
         assert progress_calls[-1] == 1.0
 
 

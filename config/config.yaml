@@ -144,8 +144,10 @@ transcription:
   # details. Automatically falls back to transcribing the whole call
   # afterwards (today's original behavior) if anything about this fails,
   # so turning it off is only ever a speed tradeoff, never a correctness
-  # one. Set to false to disable.
-  live_during_recording: true
+  # one -- also toggleable from the Settings tab ("Live transcription").
+  # Off by default: this is a newer code path than plain whole-file
+  # transcription, so it's opt-in until you've tried it and trust it.
+  live_during_recording: false
   # How often (seconds of actually-recorded audio, i.e. pause time doesn't
   # count) a chunk gets transcribed during the call. Smaller = the final
   # post-call wait is shorter, but more overhead reloading/re-running

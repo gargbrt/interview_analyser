@@ -109,6 +109,20 @@ def test_save_editable_settings_can_add_a_new_language_key(tmp_path):
     assert settings["transcription.whisper_model"] == "small"  # untouched
 
 
+def test_save_editable_settings_can_add_a_new_live_during_recording_key(tmp_path):
+    """transcription.live_during_recording didn't exist in older
+    config.yaml files (added with the live transcription feature) --
+    saving it must add the key rather than requiring it to already be
+    present, same as transcription.language above."""
+    path = _write_sample(tmp_path)
+
+    save_editable_settings(path, {"transcription.live_during_recording": True})
+
+    settings = load_editable_settings(path)
+    assert settings["transcription.live_during_recording"] is True
+    assert settings["transcription.whisper_model"] == "small"  # untouched
+
+
 def test_save_editable_settings_rejects_unknown_field(tmp_path):
     path = _write_sample(tmp_path)
     try:

@@ -228,6 +228,45 @@ def test_elapsed_seconds_is_zero_before_start(tmp_path):
         assert rec.elapsed_seconds == 0.0
 
 
+def test_frames_written_and_actual_sample_rate_are_public_and_match_internal_state(tmp_path):
+    """live_transcribe.py reads these two properties from another thread
+    while a recording is in progress -- regression guard that they exist,
+    are public, and track the same values elapsed_seconds is derived from."""
+    with _fake_recorder() as rec:
+        rec.start(tmp_path / "call.wav")
+        assert rec.frames_written == 0
+        assert rec.actual_sample_rate == 16000
+
+        rec._handle_frame(FRAME)
+        assert rec.frames_written == 1024
+        assert rec.frames_written == rec._frames_written
+
+        rec.stop()
+
+
+def test_wav_file_is_opened_unbuffered_so_a_concurrent_reader_sees_writes_immediately(tmp_path):
+    """Regression guard for a real bug found building live transcription:
+    a buffered writer can leave a concurrent reader seeing stale/empty
+    data for small writes (Python's `wave` module only patches the header
+    in its internal buffer, which isn't visible to another file handle
+    until that buffer is flushed). live_transcribe.py depends on every
+    write being immediately visible on disk."""
+    import wave as wave_module
+
+    wav_path = tmp_path / "call.wav"
+    with _fake_recorder() as rec:
+        rec.start(wav_path)
+        rec._handle_frame(FRAME)
+
+        # a completely separate read handle, opened while the recorder's
+        # writer is still open -- must see the frame just written, with no
+        # explicit flush() call from the test
+        with wave_module.open(str(wav_path), "rb") as r:
+            assert r.getnframes() == 1024
+
+        rec.stop()
+
+
 # -- microphone capture (its own channel, separate from loopback) ----------
 
 def test_is_capturing_microphone_true_when_available(tmp_path):
@@ -616,6 +655,37 @@ def test_mac_recorder_elapsed_seconds_tracks_written_frames(tmp_path):
         rec.start(tmp_path / "call.wav")
         rec._handle_frame(FRAME)
         assert rec.elapsed_seconds == 1024 / 16000
+        rec.stop()
+
+
+def test_mac_recorder_frames_written_and_actual_sample_rate_are_public(tmp_path):
+    """See the matching Windows test -- live_transcribe.py needs these on
+    both platforms."""
+    with _fake_mac_recorder() as rec:
+        rec.start(tmp_path / "call.wav")
+        assert rec.frames_written == 0
+        assert rec.actual_sample_rate == 16000
+
+        rec._handle_frame(FRAME)
+        assert rec.frames_written == 1024
+        assert rec.frames_written == rec._frames_written
+
+        rec.stop()
+
+
+def test_mac_recorder_wav_file_is_opened_unbuffered(tmp_path):
+    """See the matching Windows test's docstring -- same fix, same reason,
+    applied to both recorder backends identically."""
+    import wave as wave_module
+
+    wav_path = tmp_path / "call.wav"
+    with _fake_mac_recorder() as rec:
+        rec.start(wav_path)
+        rec._handle_frame(FRAME)
+
+        with wave_module.open(str(wav_path), "rb") as r:
+            assert r.getnframes() == 1024
+
         rec.stop()
 
 

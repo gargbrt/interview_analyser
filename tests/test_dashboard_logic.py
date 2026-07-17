@@ -8,7 +8,14 @@ from __future__ import annotations
 from unittest.mock import MagicMock, patch
 
 from interview_analyzer.config_loader import Config
-from interview_analyzer.dashboard import Dashboard, _friendly_error_markdown, _open_with_os_default
+from interview_analyzer.dashboard import (
+    Dashboard,
+    _friendly_error_markdown,
+    _group_transcript_by_speaker,
+    _open_with_os_default,
+    _parse_transcript_lines,
+    _speaker_color,
+)
 from interview_analyzer.db import InterviewDB
 
 
@@ -322,3 +329,109 @@ class TestRefreshButtonsAlsoWakeOllama:
 
         dashboard._refresh_trends.assert_called_once()
         dashboard._wake_ollama_async.assert_called_once()
+
+
+class TestParseTranscriptLines:
+    def test_parses_speaker_and_text(self):
+        transcript = "[Interviewer] Hello there\n[You] Hi, nice to meet you"
+        assert _parse_transcript_lines(transcript) == [
+            ("Interviewer", "Hello there"),
+            ("You", "Hi, nice to meet you"),
+        ]
+
+    def test_skips_blank_lines(self):
+        transcript = "[You] Hi\n\n\n[Interviewer] Hello"
+        assert _parse_transcript_lines(transcript) == [("You", "Hi"), ("Interviewer", "Hello")]
+
+    def test_keeps_an_unrecognized_line_under_an_empty_speaker_rather_than_dropping_it(self):
+        transcript = "not in the expected format\n[You] Hi"
+        assert _parse_transcript_lines(transcript) == [
+            ("", "not in the expected format"),
+            ("You", "Hi"),
+        ]
+
+
+class TestGroupTranscriptBySpeaker:
+    def test_merges_consecutive_same_speaker_lines_into_one_paragraph(self):
+        transcript = (
+            "[Interviewer] Welcome to the interview.\n"
+            "[Interviewer] Today we'll cover a few topics.\n"
+            "[You] Sounds good.\n"
+        )
+        assert _group_transcript_by_speaker(transcript) == [
+            ("Interviewer", "Welcome to the interview. Today we'll cover a few topics."),
+            ("You", "Sounds good."),
+        ]
+
+    def test_does_not_merge_across_a_different_speaker(self):
+        transcript = "[You] A\n[Interviewer] B\n[You] C\n"
+        assert _group_transcript_by_speaker(transcript) == [
+            ("You", "A"), ("Interviewer", "B"), ("You", "C"),
+        ]
+
+    def test_nothing_to_merge_when_transcript_has_a_single_line(self):
+        assert _group_transcript_by_speaker("[Speaker] hi") == [("Speaker", "hi")]
+
+    def test_empty_transcript_produces_no_paragraphs(self):
+        assert _group_transcript_by_speaker("") == []
+
+
+class TestSpeakerColor:
+    def test_you_and_interviewer_get_their_fixed_colors_case_insensitively(self):
+        assigned = {}
+        assert _speaker_color("You", assigned) == _speaker_color("you", assigned)
+        assert _speaker_color("Interviewer", assigned) != _speaker_color("You", assigned)
+
+    def test_an_unrecognized_speaker_gets_a_stable_color_within_one_render(self):
+        assigned = {}
+        first = _speaker_color("SPEAKER_00", assigned)
+        second = _speaker_color("SPEAKER_00", assigned)
+        assert first == second
+
+    def test_different_unrecognized_speakers_get_different_colors(self):
+        assigned = {}
+        color_a = _speaker_color("SPEAKER_00", assigned)
+        color_b = _speaker_color("SPEAKER_01", assigned)
+        assert color_a != color_b
+
+    def test_assigned_dict_is_not_shared_across_separate_render_calls(self):
+        """A fresh `assigned` dict per render call means an unrecognized
+        speaker's color depends only on the order speakers first appear
+        *within that transcript*, not on some other transcript rendered
+        earlier in the session."""
+        assert _speaker_color("SPEAKER_00", {}) == _speaker_color("SPEAKER_00", {})
+
+
+class TestRenderTranscriptWithSpeakerColors:
+    def test_creates_one_tag_pair_per_distinct_speaker_and_inserts_grouped_text(self, tmp_path):
+        dashboard = Dashboard(_watcher(tmp_path))
+        text_widget = MagicMock()
+        text_widget.tag_names.return_value = []
+
+        transcript = "[Interviewer] Welcome.\n[Interviewer] Let's begin.\n[You] Thanks!\n"
+        dashboard._render_transcript_with_speaker_colors(text_widget, transcript)
+
+        insert_calls = [call.args for call in text_widget.insert.call_args_list]
+        inserted_text = "".join(args[1] for args in insert_calls)
+        assert "Welcome. Let's begin." in inserted_text
+        assert "Thanks!" in inserted_text
+        assert inserted_text.count("[Interviewer]") == 1  # merged, not repeated per line
+        assert inserted_text.count("[You]") == 1
+
+        configured_tags = {call.args[0] for call in text_widget.tag_configure.call_args_list}
+        assert "speaker_label::Interviewer" in configured_tags
+        assert "speaker_body::Interviewer" in configured_tags
+        assert "speaker_label::You" in configured_tags
+
+    def test_does_not_reconfigure_a_tag_that_already_exists(self, tmp_path):
+        """Reusing an already-open History detail pane across selections
+        must not spam tag_configure calls (or, more importantly, thrash
+        colors) for speakers already seen."""
+        dashboard = Dashboard(_watcher(tmp_path))
+        text_widget = MagicMock()
+        text_widget.tag_names.return_value = ["speaker_label::You", "speaker_body::You"]
+
+        dashboard._render_transcript_with_speaker_colors(text_widget, "[You] Hi again")
+
+        configured_tags = [call.args[0] for call in text_widget.tag_configure.call_args_list]
+        assert "speaker_label::You" not in configured_tags

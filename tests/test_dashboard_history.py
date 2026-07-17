@@ -109,6 +109,33 @@ def test_can_reprocess_false_when_audio_file_does_not_exist(tmp_path):
     assert can_reprocess(r) is False
 
 
+def test_history_status_label_analysis_failed_when_report_exists_but_analysis_is_malformed(tmp_path):
+    """Regression coverage for a real bug: a report file got written from
+    a parse_error analysis (the LLM returned valid-but-wrong-shaped JSON),
+    and it was shown as "No issues flagged"/"Report generated" instead of
+    the actual failure, with Reprocess permanently grayed out."""
+    report_path = tmp_path / "report.md"
+    report_path.write_text("# report", encoding="utf-8")
+    r = _record(
+        ended_at="2026-07-16T12:00:00",
+        analysis_json=json.dumps({"raw": "{\"title\": \"...\"}", "parse_error": True}),
+        transcript="some transcript", report_path=str(report_path),
+    )
+    assert history_status_label(r) == "Analysis failed"
+
+
+def test_can_reprocess_true_when_report_exists_but_analysis_is_malformed(tmp_path):
+    audio_path = tmp_path / "call.wav"
+    audio_path.write_bytes(b"some audio bytes")
+    report_path = tmp_path / "report.md"
+    report_path.write_text("# report", encoding="utf-8")
+    r = _record(
+        ended_at="2026-07-16T12:00:00", audio_path=str(audio_path), report_path=str(report_path),
+        analysis_json=json.dumps({"raw": "{}", "parse_error": True}),
+    )
+    assert can_reprocess(r) is True
+
+
 def test_has_audio_true_when_file_exists_and_nonempty(tmp_path):
     audio_path = tmp_path / "call.wav"
     audio_path.write_bytes(b"some audio bytes")

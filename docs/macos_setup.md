@@ -99,3 +99,14 @@ project's development). If something doesn't work as described here,
 please open an issue with what you saw -- the mic/loopback mixing timing
 in particular (`_MacAudioRecorder`) is the part most likely to need
 real-world tuning.
+
+**Live transcription** (`transcription.live_during_recording`, off by
+default -- see the Settings tab) is implemented identically for both
+platforms: `_MacAudioRecorder` and `_WindowsAudioRecorder` both expose the
+same `frames_written`/`actual_sample_rate` properties and open their
+output WAV file the same way (unbuffered, so a background reader can
+follow along safely -- see `live_transcribe.py`'s module docstring), and
+everything above that layer (`live_transcribe.py`, `watcher.py`) is
+plain, platform-independent Python with no OS-specific calls. It should
+work the same way on macOS as on Windows, but -- like the rest of this
+list -- hasn't specifically been exercised on real Mac hardware yet.

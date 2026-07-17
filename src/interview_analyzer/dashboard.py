@@ -14,6 +14,7 @@ import datetime as dt
 import logging
 import os
 import pathlib
+import re
 import subprocess
 import sys
 import threading
@@ -90,6 +91,19 @@ def format_duration(record) -> str:
     return f"{mins:02d}:{secs:02d}"
 
 
+def _analysis_is_malformed(record) -> bool:
+    """True if analysis ran and a report file exists, but the analysis
+    itself was unusable (parse_error) -- e.g. the LLM returned syntactically
+    valid JSON that didn't match the expected qa_pairs/session_summary
+    shape at all (reproduced on a real interview: a long transcript
+    against llama3.1:8b returned an unrelated generic {"title": ...,
+    "topics": [...]} object). report.py still writes a report file in this
+    case, but it's a "could not be parsed" placeholder, not real content --
+    without this check, that placeholder file counted as "finished",
+    permanently graying out Reprocess with no way to retry from the UI."""
+    return bool(record.analysis and record.analysis.get("parse_error"))
+
+
 def history_status_label(record) -> str:
     """One-line status for the History list's Status column and as the
     basis for the detail pane's placeholder text when there's no report."""
@@ -97,7 +111,9 @@ def history_status_label(record) -> str:
         analysis = record.analysis
         if analysis and analysis.get("no_speech_detected"):
             return "No speech detected"
-        if analysis and not analysis.get("parse_error"):
+        if _analysis_is_malformed(record):
+            return "Analysis failed"
+        if analysis:
             issues = analysis.get("session_summary", {}).get("top_issues") or []
             return issues[0] if issues else "No issues flagged"
         return "Report generated"
@@ -120,11 +136,19 @@ def has_audio(record) -> bool:
 
 
 def can_reprocess(record) -> bool:
-    """True if this interview has recoverable audio but no finished report
-    -- i.e. the History tab's Reprocess button should be enabled for it
-    (subject also to the watcher not currently being busy -- see
-    Dashboard._update_action_buttons)."""
-    if record.report_path and pathlib.Path(record.report_path).exists():
+    """True if this interview has recoverable audio and no *usable*
+    finished report yet -- i.e. the History tab's Reprocess button should
+    be enabled for it (subject also to the watcher not currently being
+    busy -- see Dashboard._update_action_buttons). A report that exists
+    but came from a malformed analysis (see _analysis_is_malformed) does
+    NOT count as finished -- it's exactly the case Reprocess exists to
+    recover from."""
+    has_a_usable_report = (
+        record.report_path
+        and pathlib.Path(record.report_path).exists()
+        and not _analysis_is_malformed(record)
+    )
+    if has_a_usable_report:
         return False
     return has_audio(record)
 
@@ -166,6 +190,72 @@ def _configure_report_tags(text_widget) -> None:
     text_widget.tag_configure("bullet", lmargin1=14, lmargin2=28, spacing3=2)
     text_widget.tag_configure("quote", font=("Segoe UI", 9, "italic"), foreground="#5b645f")
     text_widget.tag_configure("text", spacing3=2)
+
+
+# Transcript speaker labels: [Speaker] text, one line per transcribed
+# segment -- faster-whisper often splits one continuous utterance across
+# several consecutive segments/lines, which is why _group_transcript_by_
+# speaker below merges consecutive same-speaker lines into one paragraph.
+_TRANSCRIPT_LINE_RE = re.compile(r"^\[(?P<speaker>[^\]]+)\]\s*(?P<text>.*)$")
+
+# Fixed, muted, professional colors (not saturated/neon -- easy to read
+# for long stretches) for the two speakers that appear in almost every
+# transcript (dual-channel recording -- see recorder.py). "speaker" covers
+# the mono/diarization-disabled fallback's generic single label.
+_FIXED_SPEAKER_COLORS = {
+    "you": "#2b6fa8",           # muted blue
+    "interviewer": "#7a4fa0",   # muted purple -- clearly distinct from blue, not clashing
+    "speaker": "#4a7a6a",       # muted teal -- the generic/no-diarization fallback label
+}
+# Rotated for any other speaker label this app didn't itself define (e.g.
+# raw pyannote diarization output like "SPEAKER_00", "SPEAKER_01").
+_SPEAKER_COLOR_PALETTE = ["#8a5a3a", "#5a5aa0", "#8a4a6a", "#3a7a3a", "#a05a5a"]
+
+
+def _parse_transcript_lines(transcript: str) -> list[tuple[str, str]]:
+    """Parses '[Speaker] text' lines into (speaker, text) pairs, skipping
+    blank lines. A line that doesn't match the expected format (shouldn't
+    happen for a transcript this app generated, but real-world text is
+    real-world text) is kept under an empty speaker label rather than
+    dropped, so nothing from the original transcript is ever lost."""
+    parsed: list[tuple[str, str]] = []
+    for line in transcript.splitlines():
+        if not line.strip():
+            continue
+        m = _TRANSCRIPT_LINE_RE.match(line)
+        if m:
+            parsed.append((m.group("speaker").strip(), m.group("text").strip()))
+        else:
+            parsed.append(("", line.strip()))
+    return parsed
+
+
+def _group_transcript_by_speaker(transcript: str) -> list[tuple[str, str]]:
+    """Merges consecutive same-speaker lines into one paragraph -- so a
+    continuous turn shows as one flowing paragraph instead of the same
+    `[Speaker]` label repeated on every line faster-whisper happened to
+    split it into."""
+    grouped: list[tuple[str, str]] = []
+    for speaker, text in _parse_transcript_lines(transcript):
+        if grouped and grouped[-1][0] == speaker:
+            prev_speaker, prev_text = grouped[-1]
+            grouped[-1] = (prev_speaker, f"{prev_text} {text}".strip())
+        else:
+            grouped.append((speaker, text))
+    return grouped
+
+
+def _speaker_color(speaker: str, assigned: dict[str, str]) -> str:
+    """A stable color per speaker for one transcript render -- `assigned`
+    is a fresh dict per render call (not shared/global), so an unrecognized
+    speaker label always gets the same palette color within one transcript
+    but colors aren't "reserved" globally across different interviews."""
+    fixed = _FIXED_SPEAKER_COLORS.get(speaker.strip().lower())
+    if fixed is not None:
+        return fixed
+    if speaker not in assigned:
+        assigned[speaker] = _SPEAKER_COLOR_PALETTE[len(assigned) % len(_SPEAKER_COLOR_PALETTE)]
+    return assigned[speaker]
 
 
 class Dashboard:
@@ -1062,11 +1152,35 @@ class Dashboard:
         self._history_text.delete("1.0", "end")
         self._history_text.insert("end", "Transcript\n", ("h1",))
         self._history_text.insert("end", "\n")
-        # inserted as plain text (not run through the markdown renderer) --
-        # it's a real transcript, not markdown, and a line that happens to
-        # start with "#"/"-"/">" shouldn't be misread as a heading/bullet/quote
-        self._history_text.insert("end", record.transcript, ("text",))
+        self._render_transcript_with_speaker_colors(self._history_text, record.transcript)
         self._history_text.config(state="disabled")
+
+    def _render_transcript_with_speaker_colors(self, text_widget, transcript: str) -> None:
+        """Renders '[Speaker] text' lines as color-coded, per-speaker
+        paragraphs (see _group_transcript_by_speaker/_speaker_color) --
+        consecutive same-speaker lines become one flowing paragraph
+        instead of repeating the label on every line. Colors are assigned
+        fresh each call (see _speaker_color), and Tk tags are created
+        on demand per speaker name actually present in this transcript."""
+        assigned_colors: dict[str, str] = {}
+        existing_tags = set(text_widget.tag_names())
+        for speaker, paragraph_text in _group_transcript_by_speaker(transcript):
+            if not speaker:
+                # a line that didn't match "[Speaker] text" at all --
+                # inserted as-is rather than dropped (see
+                # _parse_transcript_lines)
+                text_widget.insert("end", paragraph_text + "\n\n", ("text",))
+                continue
+            color = _speaker_color(speaker, assigned_colors)
+            label_tag = f"speaker_label::{speaker}"
+            body_tag = f"speaker_body::{speaker}"
+            if label_tag not in existing_tags:
+                text_widget.tag_configure(label_tag, foreground=color, font=("Segoe UI", 10, "bold"))
+                text_widget.tag_configure(body_tag, foreground=color)
+                existing_tags.add(label_tag)
+                existing_tags.add(body_tag)
+            text_widget.insert("end", f"[{speaker}] ", (label_tag,))
+            text_widget.insert("end", paragraph_text + "\n\n", (body_tag,))
 
     def _on_delete(self) -> None:
         record = self._selected_record()
@@ -1204,6 +1318,20 @@ class Dashboard:
         e = ttk.Checkbutton(form, variable=diarization_var, text="Separate speakers")
         e.var = diarization_var  # keep a reference so it isn't garbage-collected
         _row(r, "Diarization", "transcription.diarization", e); r += 1
+
+        live_transcribe_var = tk.BooleanVar(value=bool(current.get("transcription.live_during_recording", False)))
+        e = ttk.Checkbutton(form, variable=live_transcribe_var, text="Transcribe while recording")
+        e.var = live_transcribe_var
+        _row(r, "Live transcription", "transcription.live_during_recording", e); r += 1
+        ttk.Label(
+            form,
+            text="Off by default. When on, most of the transcript is already done by the time\n"
+                 "a call ends instead of only starting afterward -- but it's a newer path through\n"
+                 "the code, so it's opt-in until you've tried it. Any failure falls back "
+                 "automatically to\ntranscribing normally after the call ends; recording itself is "
+                 "never affected either way.",
+            foreground="#6b6b6b", justify="left",
+        ).grid(row=r, column=1, sticky="w"); r += 1
 
         e = ttk.Combobox(form, values=_TRANSCRIPTION_LANGUAGES, state="readonly", width=12)
         e.set(current.get("transcription.language", "auto"))

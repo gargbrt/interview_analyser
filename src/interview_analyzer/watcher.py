@@ -435,7 +435,7 @@ class MeetingWatcher:
             user_id=self.user_id,
         )
         self._live_worker = None
-        if self.cfg.transcription.get("live_during_recording", True):
+        if self.cfg.transcription.get("live_during_recording", False):
             # transcribes this call in the background as it's being
             # recorded, so most of the transcript is already done by the
             # time it ends -- see live_transcribe.py's module docstring

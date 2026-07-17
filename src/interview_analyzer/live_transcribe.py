@@ -180,7 +180,14 @@ class LiveTranscriptionWorker:
             return
         if self._model is None and not self._ensure_model_loaded():
             return
-        segment_path = self._extract_segment_with_retries(start_frame, end_frame)
+        # the final segment (see finish()) gets a bigger retry budget --
+        # there's no later cycle to fall back on for it, unlike a periodic
+        # mid-recording segment, so it's worth trying harder before giving
+        # up and forcing the (always-safe, just slower) whole-file fallback
+        if self._finishing:
+            segment_path = self._extract_segment_with_retries(start_frame, end_frame, attempts=6, delay=1.0)
+        else:
+            segment_path = self._extract_segment_with_retries(start_frame, end_frame)
         if segment_path is None:
             # a persistent race with the writer, or the file briefly not
             # being in the expected state -- don't advance _last_frame, so
@@ -231,5 +238,20 @@ class LiveTranscriptionWorker:
         final_frames = self._recorder.frames_written
         self._process_range(self._last_frame, final_frames)
         if self._failed:
+            return None
+        # Hard safety net for "no missing bits": _process_range is only
+        # ever supposed to advance _last_frame exactly up to the frame
+        # count it was asked to cover, so this should always hold by
+        # construction -- but given the whole point of this feature is
+        # never silently shipping an incomplete transcript, don't trust
+        # that reasoning alone. If any frame of the recording somehow
+        # isn't accounted for, fail closed into the whole-file fallback
+        # rather than return a transcript that might be missing audio.
+        if self._last_frame != final_frames:
+            logger.warning(
+                "Live transcription coverage mismatch (processed up to frame %s, recording "
+                "has %s) -- falling back to whole-file transcription to be safe.",
+                self._last_frame, final_frames,
+            )
             return None
         return "\n".join(part for part in self._transcript_parts if part.strip())

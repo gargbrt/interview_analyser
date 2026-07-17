@@ -167,6 +167,19 @@ register_engine("anthropic_api", lambda acfg: AnthropicEngine(acfg))
 register_engine("openai_api", lambda acfg: OpenAIEngine(acfg))
 
 
+def _has_the_expected_shape(parsed: dict) -> bool:
+    """True if `parsed` actually looks like the rubric's qa_pairs +
+    session_summary schema, not just any valid JSON. A real failure mode
+    (reproduced on a real interview: a long transcript against
+    llama3.1:8b) is the model returning well-formed JSON that ignores the
+    requested schema entirely -- e.g. a generic {"title": ..., "topics":
+    [...]} object -- which used to sail through as a "successful" analysis
+    and silently produce a blank report with no way to reprocess it (see
+    dashboard.py's can_reprocess/history_status_label, which key off this
+    same parse_error flag)."""
+    return isinstance(parsed.get("qa_pairs"), list) and isinstance(parsed.get("session_summary"), dict)
+
+
 def analyze_transcript(
     transcript: str,
     cfg: Config,
@@ -187,7 +200,16 @@ def analyze_transcript(
         raw = engine.run(prompt)
 
     try:
-        return json.loads(raw)
+        parsed = json.loads(raw)
     except json.JSONDecodeError:
         logger.warning("Analyzer returned non-JSON output; storing raw text under 'raw'.")
         return {"raw": raw, "parse_error": True}
+
+    if not isinstance(parsed, dict) or not _has_the_expected_shape(parsed):
+        logger.warning(
+            "Analyzer returned valid JSON but not the expected qa_pairs/session_summary "
+            "shape; treating it the same as a parse failure so it can be reprocessed."
+        )
+        return {"raw": raw, "parse_error": True}
+
+    return parsed

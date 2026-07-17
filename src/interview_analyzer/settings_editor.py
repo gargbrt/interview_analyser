@@ -29,6 +29,7 @@ EDITABLE_FIELDS: list[tuple[tuple[str, ...], type]] = [
     (("transcription", "whisper_model"), str),
     (("transcription", "diarization"), bool),
     (("transcription", "language"), str),
+    (("transcription", "live_during_recording"), bool),
     (("analysis", "engine"), str),
     (("analysis", "llm_model"), str),
     (("output", "output_dir"), str),
