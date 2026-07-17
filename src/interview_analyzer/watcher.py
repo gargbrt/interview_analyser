@@ -168,6 +168,16 @@ class MeetingWatcher:
         self._control_panel: Optional[RecordingControlPanel] = None
         self._current_interview_id: Optional[int] = None
         self._current_app_name: Optional[str] = None
+        # True for the lifetime of a recording that was started via the
+        # manual "Start recording" fallback rather than automatic
+        # detection -- see _tick()'s absence-handling branch for why this
+        # matters: automatic detection failing to see the call is *why*
+        # manual start exists, so treating that same failure-to-detect as
+        # "the meeting ended" would auto-stop a manually-started recording
+        # within stop_debounce_polls * poll_interval_seconds regardless of
+        # whether the call is still actually going -- a real bug that once
+        # silently cut a live interview recording after ~60 seconds.
+        self._current_recording_is_manual = False
         self._present_polls = 0
         self._absent_polls = 0
         self._audio_dir = cfg.resolve(cfg.audio.get("raw_dir", "data/audio"))
@@ -348,7 +358,7 @@ class MeetingWatcher:
             if self._current_interview_id is None:
                 self._declined_this_session.pop(app_name, None)
                 logger.info("Recording started manually for %s.", app_name)
-                self._start_recording(app_name)
+                self._start_recording(app_name, is_manual=True)
             return
 
         if self._manual_stop_requested.is_set():
@@ -389,7 +399,11 @@ class MeetingWatcher:
                     self._declined_this_session[app_name] = time.time()
         elif not app_name:
             self._declined_this_session.clear()
-            if self._current_interview_id is not None:
+            if self._current_interview_id is not None and not self._current_recording_is_manual:
+                # a manually-started recording is never auto-stopped by
+                # absence detection -- see _current_recording_is_manual's
+                # docstring. It only ends via explicit user action (Stop
+                # button in the control panel/dashboard/tray).
                 self._absent_polls += 1
                 if self._absent_polls >= self.cfg.stop_debounce_polls:
                     self._stop_and_process()
@@ -397,7 +411,7 @@ class MeetingWatcher:
             self._present_polls = 0
             self._absent_polls = 0
 
-    def _start_recording(self, app_name: str) -> None:
+    def _start_recording(self, app_name: str, is_manual: bool = False) -> None:
         timestamp = dt.datetime.now().strftime("%Y%m%d_%H%M%S")
         wav_path = self._audio_dir / f"{timestamp}_{app_name}.wav"
 
@@ -408,6 +422,7 @@ class MeetingWatcher:
         )
         self._recorder.start(wav_path)
         self._current_app_name = app_name
+        self._current_recording_is_manual = is_manual
         self._current_interview_id = self.db.start_interview(
             source_app=app_name,
             audio_path=str(wav_path),
@@ -434,6 +449,7 @@ class MeetingWatcher:
         interview_id = self._current_interview_id
         app_name = self._current_app_name
         self._current_interview_id = None
+        self._current_recording_is_manual = False
         # start the post-call cooldown (see _tick) from the moment recording
         # actually stops, not from whenever processing eventually finishes
         self._last_ended_app = app_name

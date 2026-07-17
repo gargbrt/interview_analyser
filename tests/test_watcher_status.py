@@ -283,6 +283,67 @@ def test_request_start_recording_starts_on_the_next_tick_without_detection_or_co
     assert watcher.status["app_name"] == "Meet"
 
 
+def test_manually_started_recording_is_never_auto_stopped_by_absence_detection(tmp_path):
+    """Regression test for a real bug: manual start exists specifically for
+    when automatic detection can't see the call -- so detect_active_meeting()
+    returning None on every subsequent tick (exactly what "can't see the
+    call" looks like) must never auto-stop a manually-started recording.
+    Before this fix, it did: stop_debounce_polls ticks of "absent" (60s at
+    the real default config) silently ended a live interview recording."""
+    cfg = _test_config(tmp_path)
+    watcher = MeetingWatcher(cfg, user_id=1)
+
+    with patch("interview_analyzer.watcher.detect_active_meeting", return_value=None) as mock_detect, \
+         patch("interview_analyzer.watcher.ask_consent") as mock_consent, \
+         patch("interview_analyzer.watcher.SystemAudioRecorder") as MockRecorder, \
+         patch("interview_analyzer.watcher.RecordingControlPanel"):
+        MockRecorder.return_value.is_paused = False
+        watcher.request_start_recording("Meet")
+        watcher._tick()  # starts the recording
+        assert watcher.status["state"] == "recording"
+
+        # stop_debounce_polls is 1 in this test config -- a normal
+        # (auto-detected) recording would already have been auto-stopped
+        # after just the next tick. Run many more to be sure.
+        for _ in range(20):
+            watcher._tick()
+
+    mock_consent.assert_not_called()
+    mock_detect.assert_called()  # detection still runs every tick, it's just not acted on
+    MockRecorder.return_value.stop.assert_not_called()
+    assert watcher.status["state"] == "recording"
+    assert watcher.status["app_name"] == "Meet"
+
+
+def test_manually_started_recording_still_stops_on_explicit_request(tmp_path):
+    """The fix above must not make manual recordings unstoppable -- explicit
+    Stop (control panel/dashboard/tray) still works normally."""
+    cfg = _test_config(tmp_path)
+    watcher = MeetingWatcher(cfg, user_id=1)
+
+    with patch("interview_analyzer.watcher.detect_active_meeting", return_value=None), \
+         patch("interview_analyzer.watcher.ask_consent"), \
+         patch("interview_analyzer.watcher.SystemAudioRecorder") as MockRecorder, \
+         patch("interview_analyzer.watcher.RecordingControlPanel"), \
+         patch("interview_analyzer.watcher.compress_audio"), \
+         patch("interview_analyzer.watcher.transcribe", return_value=""), \
+         patch("interview_analyzer.watcher.analyze_transcript"):
+        MockRecorder.return_value.is_paused = False
+        MockRecorder.return_value.stop.return_value = tmp_path / "audio" / "fake.wav"
+        (tmp_path / "audio").mkdir(parents=True, exist_ok=True)
+        (tmp_path / "audio" / "fake.wav").write_bytes(b"RIFF....WAVEfake")
+
+        watcher.request_start_recording("Meet")
+        watcher._tick()  # starts the recording
+        assert watcher.status["state"] == "recording"
+
+        watcher.request_stop_recording()
+        watcher._tick()  # processes the manual stop request
+
+    assert watcher.status["state"] == "idle"
+    MockRecorder.return_value.stop.assert_called_once()
+
+
 def test_request_start_recording_clears_a_stale_decline_for_that_app(tmp_path):
     cfg = _test_config(tmp_path)
     watcher = MeetingWatcher(cfg, user_id=1)
