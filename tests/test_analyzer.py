@@ -7,6 +7,7 @@ from interview_analyzer import api_keys
 from interview_analyzer.analyzer import AnthropicEngine, OllamaEngine, OpenAIEngine, analyze_transcript
 from interview_analyzer.config_loader import Config
 from interview_analyzer.engines import AnalysisEngine, get_engine, register_engine
+from interview_analyzer.rubric import RESULT_JSON_SCHEMA
 
 
 class FakeGoodEngine(AnalysisEngine):
@@ -146,6 +147,7 @@ class TestOllamaEngineStreamingProgress:
         assert raw == '{"qa_pairs": []}'
         assert progress_calls[-1] == 1.0
         assert progress_calls == sorted(progress_calls)  # monotonically increasing
+        assert mock_post.call_args.kwargs["json"]["format"] == RESULT_JSON_SCHEMA
         assert mock_post.call_args.kwargs["json"]["stream"] is True
 
     def test_without_on_progress_uses_the_plain_non_streaming_call(self):
@@ -160,6 +162,24 @@ class TestOllamaEngineStreamingProgress:
 
         assert raw == '{"qa_pairs": []}'
         assert mock_post.call_args.kwargs["json"]["stream"] is False
+
+    def test_sends_the_rubric_json_schema_not_just_a_bare_json_format_flag(self):
+        """Regression coverage for a real bug: asking Ollama for merely
+        "format": "json" only guarantees *some* valid JSON, not the
+        expected shape -- reproduced on a real interview, where the model
+        returned well-formed but completely unrelated JSON. Passing the
+        full schema as `format` constrains decoding to actually match it
+        (verified empirically against a real Ollama server)."""
+        engine = OllamaEngine({"ollama_host": "http://localhost:11434", "llm_model": "llama3.1:8b"})
+        fake_resp = MagicMock()
+        fake_resp.json.return_value = {"response": '{"qa_pairs": []}'}
+        fake_resp.raise_for_status.return_value = None
+
+        with patch("interview_analyzer.analyzer.ensure_ollama_running", return_value=True), \
+             patch("interview_analyzer.analyzer.requests.post", return_value=fake_resp) as mock_post:
+            engine.run("prompt")
+
+        assert mock_post.call_args.kwargs["json"]["format"] == RESULT_JSON_SCHEMA
 
     def test_analyze_transcript_passes_progress_callback_through_to_ollama(self):
         cfg = Config(raw={"analysis": {"engine": "ollama"}})

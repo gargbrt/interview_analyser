@@ -73,3 +73,56 @@ def build_prompt(transcript: str, calibration_notes: str = "") -> str:
     return ANALYSIS_PROMPT_TEMPLATE.format(
         categories=", ".join(CATEGORIES), transcript=transcript, calibration_section=calibration_section
     )
+
+
+# JSON Schema matching ANALYSIS_PROMPT_TEMPLATE's requested shape exactly,
+# for engines that support constrained/structured output (Ollama's
+# /api/generate `format` field accepts a full JSON Schema, not just the
+# string "json" -- see OllamaEngine.run() in analyzer.py). Reproduced on a
+# real interview: a long transcript against llama3.1:8b -- asking only for
+# "format": "json" (valid-JSON-but-any-shape) let the model return
+# syntactically valid JSON that ignored the schema entirely (e.g. a
+# generic {"title": ..., "topics": [...]} object). Verified empirically
+# that passing this schema as `format` instead forces the model's output
+# to match it, even when tested against a prompt totally unrelated to
+# interview analysis.
+RESULT_JSON_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "qa_pairs": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "question": {"type": "string"},
+                    "answer_summary": {"type": "string"},
+                    "issues": {
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "category": {"type": "string"},
+                                "detail": {"type": "string"},
+                                "excerpt": {"type": "string"},
+                            },
+                            "required": ["category", "detail", "excerpt"],
+                        },
+                    },
+                    "suggested_improvement": {"type": "string"},
+                },
+                "required": ["question", "answer_summary", "issues", "suggested_improvement"],
+            },
+        },
+        "session_summary": {
+            "type": "object",
+            "properties": {
+                "top_strengths": {"type": "array", "items": {"type": "string"}},
+                "top_issues": {"type": "array", "items": {"type": "string"}},
+                "one_thing_to_practice_next": {"type": "string"},
+                "confidence": {"type": "integer"},
+            },
+            "required": ["top_strengths", "top_issues", "one_thing_to_practice_next", "confidence"],
+        },
+    },
+    "required": ["qa_pairs", "session_summary"],
+}

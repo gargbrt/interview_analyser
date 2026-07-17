@@ -25,7 +25,7 @@ from . import api_keys
 from .config_loader import Config
 from .engines import AnalysisEngine, get_engine, register_engine
 from .model_setup import ensure_ollama_running
-from .rubric import build_prompt
+from .rubric import RESULT_JSON_SCHEMA, build_prompt
 
 logger = logging.getLogger(__name__)
 
@@ -46,11 +46,20 @@ class OllamaEngine(AnalysisEngine):
                 "Install it from https://ollama.com, or start it manually, then try again."
             )
 
+        # A full JSON Schema (not just the string "json") -- constrains
+        # Ollama's decoding to actually match the rubric's shape, not just
+        # produce *some* valid JSON. See rubric.py's RESULT_JSON_SCHEMA
+        # docstring for why: a plain "json" format let the model return a
+        # syntactically valid but completely unrelated object on a real
+        # long transcript, producing a blank report with no clear error.
+        # Constrained decoding is measurably slower than free-form
+        # generation (grammar-checked per token), hence the longer timeout
+        # than a plain generation call would need.
         if on_progress is None:
             resp = requests.post(
                 f"{self.host}/api/generate",
-                json={"model": self.model, "prompt": prompt, "stream": False, "format": "json"},
-                timeout=600,
+                json={"model": self.model, "prompt": prompt, "stream": False, "format": RESULT_JSON_SCHEMA},
+                timeout=1200,
             )
             resp.raise_for_status()
             return resp.json().get("response", "")
@@ -65,8 +74,8 @@ class OllamaEngine(AnalysisEngine):
         chunks = []
         resp = requests.post(
             f"{self.host}/api/generate",
-            json={"model": self.model, "prompt": prompt, "stream": True, "format": "json"},
-            timeout=600,
+            json={"model": self.model, "prompt": prompt, "stream": True, "format": RESULT_JSON_SCHEMA},
+            timeout=1200,
             stream=True,
         )
         resp.raise_for_status()
