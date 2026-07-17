@@ -12,7 +12,14 @@ from unittest.mock import MagicMock, patch
 import numpy as np
 
 from interview_analyzer.config_loader import Config
-from interview_analyzer.transcriber import _channel_count, load_whisper_model, transcribe
+from interview_analyzer.transcriber import (
+    TranscriptionCancelled,
+    _channel_count,
+    _groq_transcribe_file,
+    _transcribe_via_groq,
+    load_whisper_model,
+    transcribe,
+)
 
 
 def _fake_segment(start, end, text):
@@ -385,3 +392,144 @@ class TestDualChannelSpeakerLabeling:
                 assert False, "expected TranscriptionCancelled"
             except TranscriptionCancelled:
                 pass
+
+
+class TestGroqTranscribeFile:
+    """_groq_transcribe_file makes one blocking call to Groq's
+    /audio/transcriptions endpoint -- the Groq equivalent of a single
+    faster-whisper segment stream, just materialized all at once."""
+
+    def test_sends_the_expected_request_shape(self, tmp_path):
+        audio_path = tmp_path / "call.wav"
+        audio_path.write_bytes(b"fake audio bytes")
+        fake_resp = MagicMock()
+        fake_resp.json.return_value = {"segments": [{"start": 0.0, "end": 1.0, "text": "hi"}]}
+        fake_resp.raise_for_status.return_value = None
+
+        with patch("interview_analyzer.transcriber.requests.post", return_value=fake_resp) as mock_post:
+            segments = _groq_transcribe_file(audio_path, "whisper-large-v3-turbo", "en", "a prompt", "gsk-key", None)
+
+        assert segments == [{"start": 0.0, "end": 1.0, "text": "hi"}]
+        call = mock_post.call_args
+        assert call.args[0] == "https://api.groq.com/openai/v1/audio/transcriptions"
+        assert call.kwargs["headers"]["Authorization"] == "Bearer gsk-key"
+        assert call.kwargs["data"]["model"] == "whisper-large-v3-turbo"
+        assert call.kwargs["data"]["language"] == "en"
+        assert call.kwargs["data"]["prompt"] == "a prompt"
+        assert call.kwargs["data"]["response_format"] == "verbose_json"
+
+    def test_omits_language_and_prompt_when_not_given(self, tmp_path):
+        audio_path = tmp_path / "call.wav"
+        audio_path.write_bytes(b"fake audio bytes")
+        fake_resp = MagicMock()
+        fake_resp.json.return_value = {"segments": []}
+        fake_resp.raise_for_status.return_value = None
+
+        with patch("interview_analyzer.transcriber.requests.post", return_value=fake_resp) as mock_post:
+            _groq_transcribe_file(audio_path, "whisper-large-v3-turbo", None, None, "gsk-key", None)
+
+        data = mock_post.call_args.kwargs["data"]
+        assert "language" not in data
+        assert "prompt" not in data
+
+    def test_raises_cancelled_before_making_the_request_if_already_cancelled(self, tmp_path):
+        import threading
+
+        audio_path = tmp_path / "call.wav"
+        audio_path.write_bytes(b"fake audio bytes")
+        cancel_event = threading.Event()
+        cancel_event.set()
+
+        with patch("interview_analyzer.transcriber.requests.post") as mock_post:
+            try:
+                _groq_transcribe_file(audio_path, "whisper-large-v3-turbo", None, None, "gsk-key", cancel_event)
+                assert False, "expected TranscriptionCancelled"
+            except TranscriptionCancelled:
+                pass
+        mock_post.assert_not_called()
+
+
+class TestTranscribeViaGroq:
+    def _config(self, diarization=False, **overrides):
+        transcription = {"engine": "groq", "diarization": diarization}
+        transcription.update(overrides)
+        return Config(raw={"transcription": transcription})
+
+    def test_raises_a_clear_error_with_no_api_key(self, tmp_path, monkeypatch):
+        monkeypatch.delenv("INTERVIEW_ANALYZER_API_KEY", raising=False)
+        with patch("interview_analyzer.transcriber.api_keys.load_key", return_value=None):
+            try:
+                _transcribe_via_groq(tmp_path / "call.wav", self._config(), None, None)
+                assert False, "expected RuntimeError"
+            except RuntimeError as e:
+                assert "console.groq.com" in str(e)
+
+    def test_uses_saved_key_when_no_env_var_set(self, tmp_path, monkeypatch):
+        monkeypatch.delenv("INTERVIEW_ANALYZER_API_KEY", raising=False)
+        audio_path = tmp_path / "call.wav"
+        audio_path.write_bytes(b"fake")
+
+        with patch("interview_analyzer.transcriber.api_keys.load_key", return_value="gsk-saved"), \
+             patch("interview_analyzer.transcriber._channel_count", return_value=1), \
+             patch("interview_analyzer.transcriber._groq_transcribe_file", return_value=[]) as mock_file:
+            _transcribe_via_groq(audio_path, self._config(), None, None)
+
+        assert mock_file.call_args.args[4] == "gsk-saved"
+
+    def test_mono_no_diarization_returns_plain_speaker_labeled_segments(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("INTERVIEW_ANALYZER_API_KEY", "gsk-env")
+        audio_path = tmp_path / "call.wav"
+        audio_path.write_bytes(b"fake")
+
+        with patch("interview_analyzer.transcriber._channel_count", return_value=1), \
+             patch(
+                 "interview_analyzer.transcriber._groq_transcribe_file",
+                 return_value=[{"start": 0.0, "end": 1.0, "text": " hello "}],
+             ):
+            progress_calls = []
+            result = _transcribe_via_groq(audio_path, self._config(diarization=False), progress_calls.append, None)
+
+        assert result == [(0.0, 1.0, "Speaker", "hello")]
+        assert progress_calls == [1.0]
+
+    def test_dual_channel_merges_by_start_time_and_reports_progress(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("INTERVIEW_ANALYZER_API_KEY", "gsk-env")
+        audio_path = tmp_path / "call.wav"
+        audio_path.write_bytes(b"fake")
+        fake_audio = (np.zeros(10, dtype=np.float32), np.zeros(10, dtype=np.float32))
+
+        you_segments = [{"start": 1.0, "end": 2.0, "text": "Hi there"}]
+        interviewer_segments = [{"start": 0.0, "end": 1.0, "text": "Hello"}]
+
+        with patch("interview_analyzer.transcriber._channel_count", return_value=2), \
+             patch("faster_whisper.audio.decode_audio", return_value=fake_audio), \
+             patch("soundfile.write"), \
+             patch(
+                 "interview_analyzer.transcriber._groq_transcribe_file",
+                 side_effect=[you_segments, interviewer_segments],
+             ):
+            progress_calls = []
+            result = _transcribe_via_groq(audio_path, self._config(diarization=True), progress_calls.append, None)
+
+        # chronological order (interviewer spoke first at t=0), not upload order
+        assert result == [(0.0, 1.0, "Interviewer", "Hello"), (1.0, 2.0, "You", "Hi there")]
+        assert progress_calls == [0.5, 1.0]
+
+    def test_full_transcribe_dispatches_to_groq_when_configured(self, tmp_path, monkeypatch):
+        """The top-level transcribe() must route to the Groq path -- and
+        must not touch load_whisper_model() at all -- when
+        transcription.engine is "groq"."""
+        monkeypatch.setenv("INTERVIEW_ANALYZER_API_KEY", "gsk-env")
+        audio_path = tmp_path / "call.wav"
+        audio_path.write_bytes(b"fake")
+
+        with patch("interview_analyzer.transcriber._channel_count", return_value=1), \
+             patch(
+                 "interview_analyzer.transcriber._groq_transcribe_file",
+                 return_value=[{"start": 0.0, "end": 1.0, "text": "hello"}],
+             ), \
+             patch("interview_analyzer.transcriber.load_whisper_model") as mock_load_model:
+            transcript = transcribe(audio_path, self._config(diarization=False))
+
+        assert transcript == "[Speaker] hello"
+        mock_load_model.assert_not_called()

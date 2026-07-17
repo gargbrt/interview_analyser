@@ -435,7 +435,14 @@ class MeetingWatcher:
             user_id=self.user_id,
         )
         self._live_worker = None
-        if self.cfg.transcription.get("live_during_recording", False):
+        # only meaningful for the local engine -- Groq's hosted Whisper API
+        # (transcription.engine: "groq") is already fast enough at the end
+        # of a call (minutes -> well under a minute) that there's nothing
+        # for incremental during-the-call transcription to usefully save,
+        # and it would mean repeatedly uploading small segments to a free
+        # tier with its own rate limits for no real benefit
+        live_engine_supported = self.cfg.transcription.get("engine", "faster-whisper") == "faster-whisper"
+        if live_engine_supported and self.cfg.transcription.get("live_during_recording", False):
             # transcribes this call in the background as it's being
             # recorded, so most of the transcript is already done by the
             # time it ends -- see live_transcribe.py's module docstring

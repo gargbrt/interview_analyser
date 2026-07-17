@@ -86,6 +86,13 @@ def build_prompt(transcript: str, calibration_notes: str = "") -> str:
 # that passing this schema as `format` instead forces the model's output
 # to match it, even when tested against a prompt totally unrelated to
 # interview analysis.
+#
+# Every object also sets "additionalProperties": false and lists every
+# property as "required" -- not needed by Ollama, but required by Groq's
+# *strict* structured-output mode (GroqEngine in analyzer.py), which
+# rejects a schema that doesn't (optional fields there must be modeled as
+# nullable unions, which this rubric doesn't need since the prompt already
+# asks for every field unconditionally).
 RESULT_JSON_SCHEMA = {
     "type": "object",
     "properties": {
@@ -106,11 +113,13 @@ RESULT_JSON_SCHEMA = {
                                 "excerpt": {"type": "string"},
                             },
                             "required": ["category", "detail", "excerpt"],
+                            "additionalProperties": False,
                         },
                     },
                     "suggested_improvement": {"type": "string"},
                 },
                 "required": ["question", "answer_summary", "issues", "suggested_improvement"],
+                "additionalProperties": False,
             },
         },
         "session_summary": {
@@ -122,7 +131,9 @@ RESULT_JSON_SCHEMA = {
                 "confidence": {"type": "integer"},
             },
             "required": ["top_strengths", "top_issues", "one_thing_to_practice_next", "confidence"],
+            "additionalProperties": False,
         },
     },
     "required": ["qa_pairs", "session_summary"],
+    "additionalProperties": False,
 }

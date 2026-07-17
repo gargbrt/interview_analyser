@@ -1,7 +1,10 @@
-"""Local, free transcription via faster-whisper, with speaker labeling so
-the transcript distinguishes you from the interviewer.
+"""Transcription, via either a local model (faster-whisper, free, fully
+private -- the default) or Groq's hosted Whisper API (`transcription.engine:
+"groq"`, opt-in -- much faster on a CPU-only machine, but the audio leaves
+this machine; see docs/using_cloud_apis.md). Both paths produce the same
+speaker-labeled plain-text format.
 
-Speaker labeling has two mechanisms, tried in this order:
+Speaker labeling has two mechanisms, tried in this order, for either engine:
 
   1. **Channel separation** (the default, used whenever a recording has
      the microphone on its own channel -- see recorder.py's module
@@ -13,15 +16,22 @@ Speaker labeling has two mechanisms, tried in this order:
   2. **Acoustic diarization** via pyannote.audio (`_diarize_and_label`),
      used only as a fallback for mono recordings (e.g. the microphone
      wasn't available, so there's nothing to separate by channel) -- see
-     docs/diarization_setup.md for the one-time setup it needs.
+     docs/diarization_setup.md for the one-time setup it needs. Runs
+     locally regardless of which transcription engine produced the text.
 """
 from __future__ import annotations
 
 import logging
+import os
 import pathlib
+import tempfile
 import threading
+from types import SimpleNamespace
 from typing import Callable, Optional
 
+import requests
+
+from . import api_keys
 from .config_loader import Config
 
 logger = logging.getLogger(__name__)
@@ -99,19 +109,42 @@ def transcribe(
     [You] So, um, there was this one time...
 
     If given, `on_progress(fraction)` is called with a real 0.0-1.0 estimate
-    as transcription proceeds -- faster-whisper yields segments lazily as it
-    works through the audio, so each segment's end timestamp against the
-    total duration is an honest progress signal, not a fake animation.
+    as transcription proceeds.
 
-    If given, `cancel_event` is checked between segments; when set, raises
-    `TranscriptionCancelled` instead of returning (checked between segments
-    because that's the only natural interruption point faster-whisper's
-    synchronous, single-call API offers -- there's no mid-segment hook).
+    If given, `cancel_event` is checked between segments (local engine) or
+    before each upload (Groq engine); when set, raises
+    `TranscriptionCancelled` instead of returning.
 
     If given, `model` is used instead of loading a new one from `cfg` --
     see load_whisper_model()'s docstring for why a caller might already
-    have one loaded.
+    have one loaded. Ignored when `transcription.engine` is "groq" -- that
+    path has no local model to reuse.
     """
+    tcfg = cfg.transcription
+    if tcfg.get("engine", "faster-whisper") == "groq":
+        labeled = _transcribe_via_groq(audio_path, cfg, on_progress, cancel_event)
+    else:
+        labeled = _transcribe_local(audio_path, cfg, on_progress, cancel_event, model)
+
+    if tcfg.get("language", "auto") == "hinglish":
+        labeled = [(s, e, spk, _to_latin_if_available(text)) for s, e, spk, text in labeled]
+
+    lines = [f"[{spk}] {text}" for _, _, spk, text in labeled]
+    return "\n".join(lines)
+
+
+def _transcribe_local(
+    audio_path: pathlib.Path,
+    cfg: Config,
+    on_progress: Optional[Callable[[float], None]],
+    cancel_event: Optional[threading.Event],
+    model,
+) -> list[tuple[float, float, str, str]]:
+    """The default, local, fully-private transcription path via
+    faster-whisper. See transcribe()'s docstring for the shared contract;
+    this returns (start, end, speaker, text) tuples rather than the final
+    joined string, since transcribe() applies hinglish transliteration and
+    joins for both this path and _transcribe_via_groq identically."""
     tcfg = cfg.transcription
     if model is None:
         model = load_whisper_model(cfg)
@@ -165,11 +198,7 @@ def transcribe(
         else:
             labeled = [(seg.start, seg.end, "Speaker", seg.text.strip()) for seg in segments]
 
-    if tcfg.get("language", "auto") == "hinglish":
-        labeled = [(s, e, spk, _to_latin_if_available(text)) for s, e, spk, text in labeled]
-
-    lines = [f"[{spk}] {text}" for _, _, spk, text in labeled]
-    return "\n".join(lines)
+    return labeled
 
 
 def _transcribe_dual_channel(
@@ -214,6 +243,137 @@ def _transcribe_dual_channel(
                 labeled.append((seg.start, seg.end, speaker_label, text))
             if on_progress is not None and total_duration > 0:
                 on_progress(progress_offset + progress_share * min(seg.end / total_duration, 1.0))
+
+    _run_channel(you_audio, "You", 0.0, 0.5)
+    _run_channel(interviewer_audio, "Interviewer", 0.5, 0.5)
+
+    labeled.sort(key=lambda item: item[0])
+    return labeled
+
+
+def _transcribe_via_groq(
+    audio_path: pathlib.Path,
+    cfg: Config,
+    on_progress: Optional[Callable[[float], None]],
+    cancel_event: Optional[threading.Event],
+) -> list[tuple[float, float, str, str]]:
+    """Transcribes via Groq's hosted Whisper API instead of a local model --
+    much faster on a CPU-only machine (Groq's free tier processes audio at
+    up to ~228x real-time), at the real cost of the audio leaving this
+    machine and going to Groq's servers. See docs/using_cloud_apis.md.
+
+    Progress reporting is coarser than the local path: Groq's transcription
+    endpoint is a single blocking HTTP call with no streaming, so there's
+    no per-segment signal to report mid-call -- on_progress only fires
+    between channels (dual-channel) or once at the end (mono), rather than
+    continuously. Acceptable given how fast the call itself is.
+    """
+    env_var = cfg.analysis.get("cloud_api_key_env_var", "INTERVIEW_ANALYZER_API_KEY")
+    api_key = os.environ.get(env_var) or api_keys.load_key("groq")
+    if not api_key:
+        raise RuntimeError(
+            f"No Groq API key found. Get a free one (no credit card) at "
+            f"https://console.groq.com/keys, then set it in the Settings tab's "
+            f"\"Cloud API key\" section, or set the {env_var} environment variable."
+        )
+
+    tcfg = cfg.transcription
+    groq_model = tcfg.get("groq_whisper_model", "whisper-large-v3-turbo")
+    language = _resolve_whisper_language(tcfg.get("language", "auto"))
+    prompt = tcfg.get("initial_prompt") or None
+
+    if tcfg.get("diarization", True) and _channel_count(audio_path) >= 2:
+        return _groq_transcribe_dual_channel(
+            audio_path, groq_model, language, prompt, api_key, on_progress, cancel_event
+        )
+
+    segments = _groq_transcribe_file(audio_path, groq_model, language, prompt, api_key, cancel_event)
+    if on_progress is not None:
+        on_progress(1.0)
+    if tcfg.get("diarization", True):
+        # _diarize_and_label expects faster-whisper Segment-like objects
+        # (attribute access, not dict keys) -- a thin adapter so pyannote
+        # diarization works identically regardless of which engine
+        # produced the underlying segments
+        fake_segments = [SimpleNamespace(start=s["start"], end=s["end"], text=s["text"]) for s in segments]
+        return _diarize_and_label(audio_path, fake_segments)
+    return [(s["start"], s["end"], "Speaker", s["text"].strip()) for s in segments]
+
+
+def _groq_transcribe_file(
+    audio_path: pathlib.Path,
+    model: str,
+    language: Optional[str],
+    prompt: Optional[str],
+    api_key: str,
+    cancel_event: Optional[threading.Event],
+) -> list[dict]:
+    """One blocking call to Groq's /audio/transcriptions endpoint, returning
+    its segment list (each with "start"/"end"/"text") -- the Groq
+    equivalent of faster-whisper's segment stream, just materialized all
+    at once rather than yielded lazily (Groq's API isn't a streaming
+    endpoint)."""
+    if cancel_event is not None and cancel_event.is_set():
+        raise TranscriptionCancelled()
+
+    data = {"model": model, "response_format": "verbose_json", "timestamp_granularities[]": "segment"}
+    if language:
+        data["language"] = language
+    if prompt:
+        data["prompt"] = prompt
+
+    with open(audio_path, "rb") as f:
+        resp = requests.post(
+            "https://api.groq.com/openai/v1/audio/transcriptions",
+            headers={"Authorization": f"Bearer {api_key}"},
+            files={"file": (pathlib.Path(audio_path).name, f)},
+            data=data,
+            timeout=300,
+        )
+    resp.raise_for_status()
+    return resp.json().get("segments", [])
+
+
+def _groq_transcribe_dual_channel(
+    audio_path: pathlib.Path,
+    model: str,
+    language: Optional[str],
+    prompt: Optional[str],
+    api_key: str,
+    on_progress: Optional[Callable[[float], None]],
+    cancel_event: Optional[threading.Event],
+) -> list[tuple[float, float, str, str]]:
+    """Groq equivalent of _transcribe_dual_channel above -- same left=mic
+    ("You") / right=loopback ("Interviewer") convention, same merge-by-
+    start-time logic. Groq's API has no concept of multi-channel input, so
+    each channel is decoded and written to its own temp mono WAV file for
+    a separate upload, then the temp files are cleaned up immediately
+    after."""
+    from faster_whisper.audio import decode_audio
+
+    import soundfile as sf
+
+    you_audio, interviewer_audio = decode_audio(str(audio_path), sampling_rate=16000, split_stereo=True)
+
+    labeled: list[tuple[float, float, str, str]] = []
+
+    def _run_channel(audio_array, speaker_label: str, progress_offset: float, progress_share: float) -> None:
+        if cancel_event is not None and cancel_event.is_set():
+            raise TranscriptionCancelled()
+        fd, tmp_name = tempfile.mkstemp(suffix=".wav", prefix="groq_channel_")
+        os.close(fd)
+        tmp_path = pathlib.Path(tmp_name)
+        try:
+            sf.write(str(tmp_path), audio_array, 16000, subtype="PCM_16")
+            segments = _groq_transcribe_file(tmp_path, model, language, prompt, api_key, cancel_event)
+        finally:
+            tmp_path.unlink(missing_ok=True)
+        for seg in segments:
+            text = seg.get("text", "").strip()
+            if text:
+                labeled.append((seg["start"], seg["end"], speaker_label, text))
+        if on_progress is not None:
+            on_progress(progress_offset + progress_share)
 
     _run_channel(you_audio, "You", 0.0, 0.5)
     _run_channel(interviewer_audio, "Interviewer", 0.5, 0.5)

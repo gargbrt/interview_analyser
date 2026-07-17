@@ -26,6 +26,7 @@ EDITABLE_FIELDS: list[tuple[tuple[str, ...], type]] = [
     (("declined_cooldown_seconds",), float),
     (("audio", "bitrate_kbps"), int),
     (("audio", "include_microphone"), bool),
+    (("transcription", "engine"), str),
     (("transcription", "whisper_model"), str),
     (("transcription", "diarization"), bool),
     (("transcription", "language"), str),

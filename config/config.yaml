@@ -124,7 +124,18 @@ audio:
 
 # --- Transcription ---
 transcription:
-  engine: "faster-whisper"  # local, free
+  # "faster-whisper" (default) - local, free, fully private, no setup.
+  # "groq"           - Groq's hosted Whisper API. Free (no credit card,
+  #                    see docs/using_cloud_apis.md), and much faster on a
+  #                    CPU-only machine, but your audio leaves this
+  #                    machine and goes to Groq's servers -- a real
+  #                    privacy tradeoff, not just a technical detail.
+  #                    Needs a free API key (Settings tab or the
+  #                    INTERVIEW_ANALYZER_API_KEY env var).
+  engine: "faster-whisper"
+  # Only used when engine: "groq" -- "whisper-large-v3-turbo" (fast) or
+  # "whisper-large-v3" (slightly more accurate, slower).
+  groq_whisper_model: "whisper-large-v3-turbo"
   # tiny|base|small|medium|large-v3 (bigger = slower, more accurate). Bumped
   # from "small" -- Whisper's accuracy on accented (e.g. Indian) English
   # improves noticeably with model size, and "small" was producing visibly
@@ -145,6 +156,9 @@ transcription:
   # afterwards (today's original behavior) if anything about this fails,
   # so turning it off is only ever a speed tradeoff, never a correctness
   # one -- also toggleable from the Settings tab ("Live transcription").
+  # Only applies to engine: "faster-whisper" -- Groq is already fast
+  # enough at the end of a call that this has nothing useful to add, so
+  # it's ignored (not started at all) when engine: "groq".
   # Off by default: this is a newer code path than plain whole-file
   # transcription, so it's opt-in until you've tried it and trust it.
   live_during_recording: false
@@ -201,17 +215,28 @@ transcription:
 # Built-in options: "ollama" (free, local, default), "anthropic_api", "openai_api".
 # You can also register your own engine in code -- see docs/using_cloud_apis.md.
 analysis:
+  # "ollama" (default) - free, fully local. "groq_api" - free (no credit
+  # card, see docs/using_cloud_apis.md), much faster than local Ollama on
+  # a CPU-only machine, but your transcript leaves this machine.
+  # "anthropic_api"/"openai_api" - bring your own paid API key.
   engine: "ollama"
   # Free-tier model guidance:
-  #   llama3.1:8b   - fast, runs on most laptops, default below
+  #   llama3.1:8b   - fast, runs on most laptops, default for "ollama"
   #   qwen2.5:14b   - noticeably better reasoning/instruction-following for
   #                   this kind of structured rubric scoring, if your machine
   #                   has ~16GB+ RAM to spare. Recommended if you can run it.
+  #   openai/gpt-oss-20b - default for "groq_api". Groq only guarantees
+  #                   exact schema compliance (see rubric.py) on the
+  #                   GPT-OSS models; other Groq models (e.g.
+  #                   llama-3.1-8b-instant) work too but without that
+  #                   guarantee -- a malformed response still gets caught
+  #                   and made reprocessable rather than silently blank.
   llm_model: "llama3.1:8b"
   ollama_host: "http://localhost:11434"
-  # Only used when engine is "anthropic_api" or "openai_api". This must be a
-  # real API key from console.anthropic.com / platform.openai.com -- a
-  # claude.ai subscription does NOT provide API access.
+  # Only used when engine is "groq_api", "anthropic_api", or "openai_api".
+  # This must be a real API key -- console.groq.com/keys (free),
+  # console.anthropic.com, or platform.openai.com. A claude.ai/ChatGPT
+  # subscription does NOT provide API access.
   cloud_api_key_env_var: "INTERVIEW_ANALYZER_API_KEY"
 
 # --- Storage ---

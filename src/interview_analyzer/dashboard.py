@@ -41,7 +41,8 @@ from .tray import job_text
 logger = logging.getLogger(__name__)
 
 _WHISPER_MODELS = ["tiny", "base", "small", "medium", "large-v3"]
-_ANALYSIS_ENGINES = ["ollama", "anthropic_api", "openai_api"]
+_TRANSCRIPTION_ENGINES = ["faster-whisper", "groq"]
+_ANALYSIS_ENGINES = ["ollama", "groq_api", "anthropic_api", "openai_api"]
 _TRANSCRIPTION_LANGUAGES = ["auto", "en", "hi", "hinglish"]
 # "Not rated" (index 0) doubles as the clear-a-rating value for the
 # feedback panel's Comboboxes -- selecting it and saving is how you clear
@@ -1310,6 +1311,18 @@ class Dashboard:
         e.var = mic_var
         _row(r, "Record your voice", "audio.include_microphone", e); r += 1
 
+        e = ttk.Combobox(form, values=_TRANSCRIPTION_ENGINES, state="readonly", width=14)
+        e.set(current.get("transcription.engine", "faster-whisper"))
+        _row(r, "Transcription engine", "transcription.engine", e); r += 1
+        ttk.Label(
+            form,
+            text="faster-whisper = local, free, fully private (default). groq = Groq's hosted\n"
+                 "Whisper API -- free (no credit card), much faster on a slow machine, but your\n"
+                 "audio leaves this machine and goes to Groq's servers. Needs a Groq API key\n"
+                 "below (get one free at console.groq.com/keys).",
+            foreground="#6b6b6b", justify="left",
+        ).grid(row=r, column=1, sticky="w"); r += 1
+
         e = ttk.Combobox(form, values=_WHISPER_MODELS, state="readonly", width=12)
         e.set(current.get("transcription.whisper_model", "small"))
         _row(r, "Whisper model", "transcription.whisper_model", e); r += 1
@@ -1426,18 +1439,21 @@ class Dashboard:
         PackActionDialog(pack_id, action, ui_root=self._root, on_done=lambda _ok: self._refresh_language_pack_rows())
 
     def _build_api_key_row(self, form, tk, ttk, r: int) -> int:
-        """Cloud API key entry for anthropic_api/openai_api -- saved
+        """Cloud API key entry for groq/anthropic_api/openai_api -- saved
         locally, encrypted with Windows DPAPI (see api_keys.py), never
         written into config.yaml. A claude.ai/ChatGPT *subscription* does
         not grant API access -- this only ever stores a real API key you
-        paste in from console.anthropic.com / platform.openai.com."""
+        paste in from console.groq.com / console.anthropic.com /
+        platform.openai.com. One saved "groq" key covers both the
+        transcription engine and the "groq_api" analysis engine above --
+        Groq issues one key per account for everything."""
         row = ttk.Frame(form)
         row.grid(row=r, column=0, columnspan=2, sticky="ew", pady=2)
 
         self._api_key_provider = ttk.Combobox(
-            row, values=["anthropic_api", "openai_api"], state="readonly", width=13
+            row, values=["groq", "anthropic_api", "openai_api"], state="readonly", width=13
         )
-        self._api_key_provider.set("anthropic_api")
+        self._api_key_provider.set("groq")
         self._api_key_provider.pack(side="left")
         self._api_key_entry = ttk.Entry(row, show="*", width=24)
         self._api_key_entry.pack(side="left", padx=(6, 6))
@@ -1451,8 +1467,9 @@ class Dashboard:
         self._api_key_status_label.grid(row=r, column=1, sticky="w"); r += 1
         ttk.Label(
             form,
-            text="A claude.ai / ChatGPT subscription does NOT work here -- this needs a real API\n"
-                 "key from console.anthropic.com / platform.openai.com (separately billed).",
+            text="groq: free, no credit card -- get one at console.groq.com/keys. A claude.ai /\n"
+                 "ChatGPT subscription does NOT work for anthropic_api/openai_api -- those need a\n"
+                 "real API key from console.anthropic.com / platform.openai.com (separately billed).",
             foreground="#6b6b6b", justify="left",
         ).grid(row=r, column=1, sticky="w"); r += 1
 

@@ -84,6 +84,24 @@ class TestStartRecordingCreatesLiveWorker:
         MockWorker.assert_not_called()
         assert watcher._live_worker is None
 
+    def test_skips_the_live_worker_when_transcription_engine_is_not_local(self, tmp_path):
+        """Groq's hosted Whisper is already fast enough at the end of a
+        call that incremental during-the-call transcription has nothing
+        useful to save -- and would mean repeatedly uploading small
+        segments to a free tier with its own rate limits for no benefit."""
+        watcher = MeetingWatcher(_test_config(tmp_path, live_during_recording=True), user_id=1)
+        watcher.cfg.raw["transcription"]["engine"] = "groq"
+
+        with patch("interview_analyzer.watcher.detect_active_meeting", return_value=("Zoom", True)), \
+             patch("interview_analyzer.watcher.ask_consent", return_value=True), \
+             patch("interview_analyzer.watcher.SystemAudioRecorder"), \
+             patch("interview_analyzer.watcher.RecordingControlPanel"), \
+             patch("interview_analyzer.watcher.LiveTranscriptionWorker") as MockWorker:
+            watcher._tick()
+
+        MockWorker.assert_not_called()
+        assert watcher._live_worker is None
+
     def test_recording_still_starts_even_if_the_live_worker_fails_to_construct(self, tmp_path):
         """A bug or edge case in live transcription must never prevent the
         actual recording from starting -- this is the hard safety

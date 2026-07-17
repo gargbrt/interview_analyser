@@ -1,10 +1,14 @@
 """Runs the rubric-based analysis over a transcript using a pluggable
-AnalysisEngine (see engines.py). Ships with three built-in engines:
+AnalysisEngine (see engines.py). Ships with four built-in engines:
 
   - "ollama"        (default) - free, fully local. Best free-tier quality
                        tradeoff is Llama 3.1 8B for speed, or Qwen2.5 14B
                        for noticeably better reasoning if your machine can
                        run it (see config.yaml comment).
+  - "groq_api"       - bring your own (free, no-credit-card) Groq API key.
+                       Runs open models on Groq's own fast hardware --
+                       much faster than local Ollama on a CPU-only
+                       machine, but your transcript leaves your machine.
   - "anthropic_api"  - bring your own Anthropic API key (NOT the same as a
                        claude.ai subscription - this is billed separately
                        per token via console.anthropic.com).
@@ -171,9 +175,63 @@ class OpenAIEngine(AnalysisEngine):
         return resp.json()["choices"][0]["message"]["content"]
 
 
+class GroqEngine(AnalysisEngine):
+    """Bring-your-own-API-key Groq engine. Unlike the other two cloud
+    engines, Groq's free tier (console.groq.com/keys, no credit card) is
+    genuinely usable, not just a trial -- it runs open models (Llama,
+    GPT-OSS, Qwen, DeepSeek) on Groq's own fast hardware. The real
+    tradeoff versus Ollama isn't cost, it's privacy: your transcript
+    leaves your machine and goes to Groq's servers.
+
+    Defaults to openai/gpt-oss-20b rather than a Llama model because Groq's
+    *strict* structured-output mode (which guarantees the response matches
+    RESULT_JSON_SCHEMA exactly, instead of just being valid-JSON-shaped --
+    see rubric.py) is currently only supported on the GPT-OSS models. Even
+    if a user points this at a model that doesn't support strict mode,
+    analyze_transcript()'s own shape validation (see
+    _has_the_expected_shape) still catches a malformed response and marks
+    it reprocessable rather than silently shipping a blank report -- same
+    safety net as the Ollama engine.
+    """
+
+    def __init__(self, acfg: dict):
+        env_var = acfg.get("cloud_api_key_env_var", "INTERVIEW_ANALYZER_API_KEY")
+        self.api_key = os.environ.get(env_var) or api_keys.load_key("groq")
+        if not self.api_key:
+            raise RuntimeError(
+                f"No Groq API key found. Get a free one (no credit card) at "
+                f"https://console.groq.com/keys, then set it in the Settings tab's "
+                f"\"Cloud API key\" section, or set the {env_var} environment variable."
+            )
+        self.model = acfg.get("llm_model", "openai/gpt-oss-20b")
+
+    def run(self, prompt: str, on_progress: Optional[Callable[[float], None]] = None) -> str:
+        # No incremental progress signal for this engine -- see AnthropicEngine.run.
+        resp = requests.post(
+            "https://api.groq.com/openai/v1/chat/completions",
+            headers={"Authorization": f"Bearer {self.api_key}", "content-type": "application/json"},
+            json={
+                "model": self.model,
+                "messages": [{"role": "user", "content": prompt}],
+                "response_format": {
+                    "type": "json_schema",
+                    "json_schema": {
+                        "name": "interview_analysis",
+                        "strict": True,
+                        "schema": RESULT_JSON_SCHEMA,
+                    },
+                },
+            },
+            timeout=600,
+        )
+        resp.raise_for_status()
+        return resp.json()["choices"][0]["message"]["content"]
+
+
 register_engine("ollama", lambda acfg: OllamaEngine(acfg))
 register_engine("anthropic_api", lambda acfg: AnthropicEngine(acfg))
 register_engine("openai_api", lambda acfg: OpenAIEngine(acfg))
+register_engine("groq_api", lambda acfg: GroqEngine(acfg))
 
 
 def _has_the_expected_shape(parsed: dict) -> bool:

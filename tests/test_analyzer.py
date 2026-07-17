@@ -4,7 +4,7 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 from interview_analyzer import api_keys
-from interview_analyzer.analyzer import AnthropicEngine, OllamaEngine, OpenAIEngine, analyze_transcript
+from interview_analyzer.analyzer import AnthropicEngine, GroqEngine, OllamaEngine, OpenAIEngine, analyze_transcript
 from interview_analyzer.config_loader import Config
 from interview_analyzer.engines import AnalysisEngine, get_engine, register_engine
 from interview_analyzer.rubric import RESULT_JSON_SCHEMA
@@ -278,3 +278,52 @@ class TestCloudEngineApiKeyResolution:
         monkeypatch.setattr(api_keys, "load_key", lambda provider: None)
         with pytest.raises(RuntimeError, match="ChatGPT subscription"):
             OpenAIEngine({})
+
+    def test_groq_engine_falls_back_to_saved_key(self, monkeypatch):
+        monkeypatch.delenv("INTERVIEW_ANALYZER_API_KEY", raising=False)
+        monkeypatch.setattr(api_keys, "load_key", lambda provider: "gsk-saved" if provider == "groq" else None)
+        engine = GroqEngine({})
+        assert engine.api_key == "gsk-saved"
+
+    def test_groq_engine_raises_a_clear_error_with_neither(self, monkeypatch):
+        monkeypatch.delenv("INTERVIEW_ANALYZER_API_KEY", raising=False)
+        monkeypatch.setattr(api_keys, "load_key", lambda provider: None)
+        with pytest.raises(RuntimeError, match="console.groq.com"):
+            GroqEngine({})
+
+    def test_groq_engine_defaults_to_gpt_oss_for_strict_schema_support(self, monkeypatch):
+        monkeypatch.setenv("INTERVIEW_ANALYZER_API_KEY", "gsk-from-env")
+        engine = GroqEngine({})
+        assert engine.model == "openai/gpt-oss-20b"
+
+
+class TestGroqEngineRequest:
+    def test_sends_strict_json_schema_matching_the_rubric(self, monkeypatch):
+        monkeypatch.setenv("INTERVIEW_ANALYZER_API_KEY", "gsk-from-env")
+        engine = GroqEngine({})
+        fake_resp = MagicMock()
+        fake_resp.json.return_value = {"choices": [{"message": {"content": '{"qa_pairs": []}'}}]}
+        fake_resp.raise_for_status.return_value = None
+
+        with patch("interview_analyzer.analyzer.requests.post", return_value=fake_resp) as mock_post:
+            raw = engine.run("prompt")
+
+        assert raw == '{"qa_pairs": []}'
+        sent = mock_post.call_args.kwargs["json"]
+        assert sent["model"] == "openai/gpt-oss-20b"
+        assert sent["response_format"]["type"] == "json_schema"
+        assert sent["response_format"]["json_schema"]["strict"] is True
+        assert sent["response_format"]["json_schema"]["schema"] == RESULT_JSON_SCHEMA
+        assert mock_post.call_args.kwargs["headers"]["Authorization"] == "Bearer gsk-from-env"
+
+    def test_uses_a_custom_model_when_configured(self, monkeypatch):
+        monkeypatch.setenv("INTERVIEW_ANALYZER_API_KEY", "gsk-from-env")
+        engine = GroqEngine({"llm_model": "llama-3.1-8b-instant"})
+        fake_resp = MagicMock()
+        fake_resp.json.return_value = {"choices": [{"message": {"content": "{}"}}]}
+        fake_resp.raise_for_status.return_value = None
+
+        with patch("interview_analyzer.analyzer.requests.post", return_value=fake_resp) as mock_post:
+            engine.run("prompt")
+
+        assert mock_post.call_args.kwargs["json"]["model"] == "llama-3.1-8b-instant"

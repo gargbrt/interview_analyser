@@ -123,6 +123,16 @@ def test_save_editable_settings_can_add_a_new_live_during_recording_key(tmp_path
     assert settings["transcription.whisper_model"] == "small"  # untouched
 
 
+def test_save_editable_settings_can_switch_the_transcription_engine(tmp_path):
+    path = _write_sample(tmp_path)
+
+    save_editable_settings(path, {"transcription.engine": "groq"})
+
+    settings = load_editable_settings(path)
+    assert settings["transcription.engine"] == "groq"
+    assert settings["transcription.whisper_model"] == "small"  # untouched
+
+
 def test_save_editable_settings_rejects_unknown_field(tmp_path):
     path = _write_sample(tmp_path)
     try:
