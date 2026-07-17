@@ -15,7 +15,9 @@ from interview_analyzer.config_loader import Config
 from interview_analyzer.transcriber import (
     TranscriptionCancelled,
     _channel_count,
+    _filter_mic_bleed,
     _groq_transcribe_file,
+    _looks_like_mic_bleed,
     _transcribe_via_groq,
     load_whisper_model,
     transcribe,
@@ -533,3 +535,78 @@ class TestTranscribeViaGroq:
 
         assert transcript == "[Speaker] hello"
         mock_load_model.assert_not_called()
+
+
+class TestMicBleedFiltering:
+    """Regression coverage for a real bug found on an actual interview:
+    without headphones, a laptop mic picked up nearly an entire
+    interviewer sentence verbatim, which showed up as a duplicated line
+    mislabeled "[You]" -- well beyond the "stray word or two" caveat this
+    app's docs describe as an expected minor case."""
+
+    def test_looks_like_mic_bleed_true_for_a_near_verbatim_echo(self):
+        assert _looks_like_mic_bleed(
+            "Today's session is designed to see your analytical process in action.",
+            "Today's session is designed to see your analytical",
+        ) is True
+
+    def test_looks_like_mic_bleed_false_for_unrelated_text(self):
+        assert _looks_like_mic_bleed(
+            "Sure, let me walk through an example from my last role.",
+            "Can you describe a specific challenge you faced?",
+        ) is False
+
+    def test_looks_like_mic_bleed_false_for_short_text_even_if_identical(self):
+        """Avoids false-positiving on short, legitimately-overlapping
+        replies (e.g. echoing back a word or two of the question)."""
+        assert _looks_like_mic_bleed("Yes, exactly.", "Yes, exactly.") is False
+
+    def test_filter_mic_bleed_drops_the_duplicated_you_segment(self):
+        """The exact real-world shape of the bug: the interviewer's
+        sentence is split across two Interviewer segments, with a bleed
+        segment on the You channel landing in between, temporally
+        overlapping both."""
+        labeled = [
+            (0.0, 3.0, "Interviewer", "Welcome to the interview. Today's session is designed to see your analytical"),
+            (2.5, 5.5, "You", "Today's session is designed to see your analytical process in action."),
+            (3.0, 6.0, "Interviewer", "process in action and reason through a business problem under a time constraint."),
+        ]
+
+        result = _filter_mic_bleed(labeled)
+
+        assert result == [
+            (0.0, 3.0, "Interviewer", "Welcome to the interview. Today's session is designed to see your analytical"),
+            (3.0, 6.0, "Interviewer", "process in action and reason through a business problem under a time constraint."),
+        ]
+
+    def test_filter_mic_bleed_keeps_a_genuine_you_answer(self):
+        labeled = [
+            (0.0, 2.0, "Interviewer", "Can you describe a challenge you faced while managing a product?"),
+            (2.5, 10.0, "You", "Sure, there was a project where I redesigned the onboarding flow."),
+        ]
+
+        assert _filter_mic_bleed(labeled) == labeled
+
+    def test_filter_mic_bleed_never_drops_an_interviewer_segment(self):
+        """Bleed only runs mic-picks-up-speaker-output, not the reverse --
+        the interviewer's side has no way to hear (let alone transcribe)
+        your microphone."""
+        labeled = [
+            (0.0, 3.0, "You", "So the answer to that is roughly the same thing you just said."),
+            (0.5, 3.5, "Interviewer", "So the answer to that is roughly the same thing you just said."),
+        ]
+
+        result = _filter_mic_bleed(labeled)
+
+        assert ("Interviewer" in [spk for _, _, spk, _ in result])
+
+    def test_filter_mic_bleed_ignores_similar_text_far_apart_in_time(self):
+        """A recurring phrase used naturally much later in the interview
+        shouldn't be treated as bleed just because it's textually similar
+        to something the interviewer said long before."""
+        labeled = [
+            (0.0, 3.0, "Interviewer", "Let's talk about prioritization frameworks for a moment."),
+            (600.0, 603.0, "You", "Let's talk about prioritization frameworks for a moment, if that's okay."),
+        ]
+
+        assert _filter_mic_bleed(labeled) == labeled

@@ -7,6 +7,8 @@ from __future__ import annotations
 
 from unittest.mock import MagicMock, patch
 
+import json
+
 from interview_analyzer.config_loader import Config
 from interview_analyzer.dashboard import (
     Dashboard,
@@ -17,6 +19,11 @@ from interview_analyzer.dashboard import (
     _speaker_color,
 )
 from interview_analyzer.db import InterviewDB
+
+VALID_ANALYSIS = {
+    "qa_pairs": [],
+    "session_summary": {"top_strengths": [], "top_issues": [], "one_thing_to_practice_next": ""},
+}
 
 
 class _ImmediateThread:
@@ -435,3 +442,64 @@ class TestRenderTranscriptWithSpeakerColors:
 
         configured_tags = [call.args[0] for call in text_widget.tag_configure.call_args_list]
         assert "speaker_label::You" not in configured_tags
+
+
+class TestViewInfographicButton:
+    def _dashboard_with_selected(self, tmp_path, analysis=None):
+        watcher = _watcher(tmp_path)
+        iid = watcher.db.start_interview("Zoom", str(tmp_path / "a.wav"), retention_days=3, user_id=1)
+        if analysis is not None:
+            watcher.db.save_analysis(iid, analysis)
+
+        dashboard = Dashboard(watcher)
+        dashboard._history_tree = MagicMock()
+        dashboard._history_tree.selection.return_value = [str(iid)]
+        for attr in (
+            "_reprocess_btn", "_open_audio_btn", "_view_transcript_btn",
+            "_view_infographic_btn", "_delete_btn", "_cancel_btn",
+        ):
+            setattr(dashboard, attr, MagicMock())
+        dashboard._history_text = MagicMock()
+        return dashboard, iid
+
+    def test_button_enabled_when_analysis_is_valid(self, tmp_path):
+        dashboard, _ = self._dashboard_with_selected(tmp_path, analysis=VALID_ANALYSIS)
+
+        dashboard._update_action_buttons()
+
+        dashboard._view_infographic_btn.config.assert_called_with(state="normal")
+
+    def test_button_disabled_when_analysis_is_malformed(self, tmp_path):
+        dashboard, _ = self._dashboard_with_selected(
+            tmp_path, analysis={"raw": "not the right shape", "parse_error": True}
+        )
+
+        dashboard._update_action_buttons()
+
+        dashboard._view_infographic_btn.config.assert_called_with(state="disabled")
+
+    def test_button_disabled_when_no_analysis_yet(self, tmp_path):
+        dashboard, _ = self._dashboard_with_selected(tmp_path, analysis=None)
+
+        dashboard._update_action_buttons()
+
+        dashboard._view_infographic_btn.config.assert_called_with(state="disabled")
+
+    def test_clicking_generates_and_opens_the_infographic(self, tmp_path):
+        dashboard, iid = self._dashboard_with_selected(tmp_path, analysis=VALID_ANALYSIS)
+
+        with patch("interview_analyzer.dashboard._open_with_os_default") as mock_open:
+            dashboard._on_view_infographic()
+
+        mock_open.assert_called_once()
+        opened_path = mock_open.call_args.args[0]
+        assert opened_path.exists()
+        assert f"_{iid}_infographic.html" in opened_path.name
+
+    def test_clicking_with_no_usable_analysis_does_not_try_to_open_anything(self, tmp_path):
+        dashboard, _ = self._dashboard_with_selected(tmp_path, analysis=None)
+
+        with patch("interview_analyzer.dashboard._open_with_os_default") as mock_open:
+            dashboard._on_view_infographic()
+
+        mock_open.assert_not_called()

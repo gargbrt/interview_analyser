@@ -132,7 +132,7 @@ transcription:
   #                    privacy tradeoff, not just a technical detail.
   #                    Needs a free API key (Settings tab or the
   #                    INTERVIEW_ANALYZER_API_KEY env var).
-  engine: "faster-whisper"
+  engine: "groq"
   # Only used when engine: "groq" -- "whisper-large-v3-turbo" (fast) or
   # "whisper-large-v3" (slightly more accurate, slower).
   groq_whisper_model: "whisper-large-v3-turbo"
@@ -208,7 +208,9 @@ transcription:
   # speech (filler words, casual phrasing) that Whisper otherwise tends to
   # "clean up" into a different, less accurate sentence. See
   # docs/language_support.md. Set to "" to disable.
-  initial_prompt: "This is an unscripted, informal spoken interview in English, possibly with an Indian accent. Transcribe exactly what is said, including filler words like um, uh, so, actually, basically, and casual phrasing."
+  initial_prompt: "This is an unscripted, informal spoken interview in English, possibly
+    with an Indian accent. Transcribe exactly what is said, including filler words
+    like um, uh, so, actually, basically, and casual phrasing."
 
 # --- Analysis ---
 # "engine" selects which AnalysisEngine to use (see src/interview_analyzer/engines.py).
@@ -219,7 +221,7 @@ analysis:
   # card, see docs/using_cloud_apis.md), much faster than local Ollama on
   # a CPU-only machine, but your transcript leaves this machine.
   # "anthropic_api"/"openai_api" - bring your own paid API key.
-  engine: "ollama"
+  engine: "groq_api"
   # Free-tier model guidance:
   #   llama3.1:8b   - fast, runs on most laptops, default for "ollama"
   #   qwen2.5:14b   - noticeably better reasoning/instruction-following for

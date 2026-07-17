@@ -18,6 +18,7 @@ from unittest.mock import patch
 
 from interview_analyzer.config_loader import Config
 from interview_analyzer.db import InterviewDB
+from interview_analyzer.infographic import infographic_path
 from interview_analyzer.watcher import MeetingWatcher
 
 
@@ -140,6 +141,13 @@ def test_full_pipeline_end_to_end_with_consent_granted(tmp_path):
     content = report_path.read_text()
     assert "Tell me about a time you disagreed" in content
     assert "Rehearse 3 behavioral stories" in content
+
+    # the HTML infographic is generated alongside the markdown report
+    infographic = infographic_path(record, cfg)
+    assert infographic.exists()
+    infographic_content = infographic.read_text(encoding="utf-8")
+    assert "Tell me about a time you disagreed" in infographic_content
+    assert "Rehearse 3 behavioral stories" in infographic_content
 
     trends_path = tmp_path / "output" / "trends_user1.md"
     assert trends_path.exists()

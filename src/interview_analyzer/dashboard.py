@@ -23,6 +23,7 @@ from typing import Callable, Optional
 
 from . import api_keys
 from .confidence import format_confidence
+from .infographic import write_interview_infographic
 from .language_packs import LANGUAGE_PACKS, PackActionDialog, is_pack_installed
 from .model_setup import (
     MODEL_CATALOG,
@@ -305,6 +306,7 @@ class Dashboard:
         self._reprocess_btn = None
         self._open_audio_btn = None
         self._view_transcript_btn = None
+        self._view_infographic_btn = None
         self._delete_btn = None
         self._cancel_btn = None
         self._history_progress_label = None
@@ -803,6 +805,10 @@ class Dashboard:
             toolbar, text="View transcript", command=self._on_view_transcript, state="disabled"
         )
         self._view_transcript_btn.pack(side="left", padx=(8, 0))
+        self._view_infographic_btn = ttk.Button(
+            toolbar, text="View infographic", command=self._on_view_infographic, state="disabled"
+        )
+        self._view_infographic_btn.pack(side="left", padx=(8, 0))
         self._delete_btn = ttk.Button(
             toolbar, text="Delete", command=self._on_delete, state="disabled"
         )
@@ -1039,6 +1045,12 @@ class Dashboard:
         self._open_audio_btn.config(state="normal" if can_play else "disabled")
         can_view_transcript = record is not None and bool(record.transcript)
         self._view_transcript_btn.config(state="normal" if can_view_transcript else "disabled")
+        can_view_infographic = (
+            record is not None and bool(record.analysis)
+            and not _analysis_is_malformed(record)
+            and not record.analysis.get("no_speech_detected")
+        )
+        self._view_infographic_btn.config(state="normal" if can_view_infographic else "disabled")
         can_delete = record is not None and not busy
         self._delete_btn.config(state="normal" if can_delete else "disabled")
         self._cancel_btn.config(state="normal" if is_processing_this else "disabled")
@@ -1155,6 +1167,24 @@ class Dashboard:
         self._history_text.insert("end", "\n")
         self._render_transcript_with_speaker_colors(self._history_text, record.transcript)
         self._history_text.config(state="disabled")
+
+    def _on_view_infographic(self) -> None:
+        """Generates (or regenerates, so it always reflects the current
+        analysis) the HTML infographic for the selected interview and
+        opens it with the OS's default browser -- see infographic.py."""
+        record = self._selected_record()
+        if record is None:
+            return
+        try:
+            path = write_interview_infographic(record, self.watcher.cfg)
+            if path is None:
+                return  # no usable analysis to visualize -- button should already be disabled then
+            _open_with_os_default(path)
+        except Exception as e:  # noqa: BLE001
+            logger.exception("Failed to open infographic for interview #%s", record.id)
+            self._history_text.config(state="normal")
+            render_into_text_widget(self._history_text, f"# Couldn't open infographic\n\n{e}")
+            self._history_text.config(state="disabled")
 
     def _render_transcript_with_speaker_colors(self, text_widget, transcript: str) -> None:
         """Renders '[Speaker] text' lines as color-coded, per-speaker

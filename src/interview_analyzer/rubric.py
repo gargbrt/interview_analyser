@@ -17,7 +17,16 @@ ANALYSIS_PROMPT_TEMPLATE = """You are an expert interview coach reviewing a tran
 of a real job interview. Below is the full transcript with speakers labeled
 [Interviewer] and [You].
 
-Identify each distinct question the interviewer asked, and your corresponding answer.
+Go through the ENTIRE transcript from beginning to end and identify EVERY
+distinct question the interviewer asked, and your corresponding answer to
+each one -- not just a few representative examples. A real interview
+transcript this length typically contains many separate questions
+(follow-ups, sub-questions within a topic, and a change of topic all count
+as distinct questions); do not stop early, and do not merge multiple
+distinct questions into a single qa_pairs entry just because they're on
+the same topic. If the interviewer asked N distinct questions, return N
+separate entries in "qa_pairs", in the order they occurred.
+
 For EACH question/answer pair, evaluate the answer against these categories:
 {categories}
 

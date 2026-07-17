@@ -32,6 +32,7 @@ from .control_panel import RecordingControlPanel
 from .db import InterviewDB
 from .live_transcribe import LiveTranscriptionWorker
 from .recorder import SystemAudioRecorder
+from .infographic import write_interview_infographic
 from .report import write_interview_report, write_trends_report
 from .transcriber import TranscriptionCancelled, transcribe
 
@@ -661,6 +662,12 @@ class MeetingWatcher:
         record = self.db.get(interview_id)
         report_path = write_interview_report(record, self.cfg)
         self.db.save_report_path(interview_id, str(report_path))
+        # best-effort -- a failure here shouldn't take down report
+        # generation, which is the part that actually gates job completion
+        try:
+            write_interview_infographic(record, self.cfg)
+        except Exception:  # noqa: BLE001
+            logger.warning("Couldn't generate the infographic for interview #%s.", interview_id, exc_info=True)
 
         write_trends_report(self.db.list_all(user_id=self.user_id), self.cfg, user_id=self.user_id)
         logger.info("Interview #%s processed. Report: %s", interview_id, report_path)

@@ -21,6 +21,7 @@ Speaker labeling has two mechanisms, tried in this order, for either engine:
 """
 from __future__ import annotations
 
+import difflib
 import logging
 import os
 import pathlib
@@ -42,6 +43,61 @@ class TranscriptionCancelled(Exception):
     segments were already decoded are discarded -- there's no meaningful
     "resume from here" for a batch Whisper run, so a cancelled transcript
     is treated as fully cancelled, not partial."""
+
+
+def _looks_like_mic_bleed(you_text: str, interviewer_text: str) -> bool:
+    """True if `you_text` looks like it's substantially made of an echo of
+    `interviewer_text` picked up by the microphone through the speakers,
+    rather than something the user actually said. Reproduced on a real
+    interview: without headphones, a laptop mic can pick up nearly an
+    entire interviewer sentence verbatim -- well beyond the "stray word or
+    two" this app's docs describe as an expected minor caveat, and
+    disruptive enough to duplicate a whole line under the wrong speaker.
+
+    Measured as *coverage* (how much of `you_text` is found, in matching
+    blocks, within `interviewer_text`) rather than difflib's own overall
+    similarity ratio -- coverage is robust to `interviewer_text` being a
+    concatenation of several nearby segments with extra content around the
+    matching part (see _filter_mic_bleed, which spans real bleed across a
+    segment boundary this way), where a plain ratio would be pulled down
+    by the length mismatch even for a full duplication.
+
+    A length threshold avoids false-positiving on short replies that
+    legitimately share a few common words with the question."""
+    if len(you_text) < 20:
+        return False
+    matcher = difflib.SequenceMatcher(None, you_text.lower(), interviewer_text.lower())
+    matched_chars = sum(block.size for block in matcher.get_matching_blocks())
+    return (matched_chars / len(you_text)) >= 0.7
+
+
+def _filter_mic_bleed(labeled: list[tuple[float, float, str, str]]) -> list[tuple[float, float, str, str]]:
+    """Drops "You" segments that look like mic bleed of temporally-nearby
+    "Interviewer" segments (see _looks_like_mic_bleed) -- used by both
+    dual-channel transcription paths (local and Groq) right after merging,
+    since bleed is a property of the recording itself, not of which engine
+    transcribed it. Only ever drops "You" segments, never "Interviewer"
+    ones: bleed only runs mic-picks-up-speaker-output, not the reverse (the
+    interviewer's side has no way to hear -- let alone transcribe -- your
+    microphone).
+
+    Nearby Interviewer segments are concatenated into one block before
+    comparing, not checked one at a time -- real bleed of one continuous
+    interviewer sentence can land split across two of their segments (the
+    two channels' VAD boundaries don't line up), so no single Interviewer
+    segment alone would look similar enough on its own."""
+    interviewer_segments = [(s, e, t) for s, e, spk, t in labeled if spk == "Interviewer"]
+    filtered = []
+    for s, e, spk, t in labeled:
+        if spk == "You":
+            nearby_text = " ".join(
+                it for is_, ie, it in interviewer_segments
+                if s - 2.0 <= ie and is_ <= e + 2.0
+            )
+            if nearby_text and _looks_like_mic_bleed(t, nearby_text):
+                continue
+        filtered.append((s, e, spk, t))
+    return filtered
 
 
 def _channel_count(audio_path: pathlib.Path) -> int:
@@ -218,10 +274,12 @@ def _transcribe_dual_channel(
     duration.
 
     Note: a laptop microphone often picks up *some* of the other side's
-    audio through the speakers too (unless you're on headphones), so the
-    "You" channel can occasionally pick up a stray word or two of the
-    interviewer's -- there's no acoustic echo cancellation here to prevent
-    that, just channel separation for the dominant source on each side.
+    audio through the speakers too (unless you're on headphones) -- there's
+    no acoustic echo cancellation here, just channel separation for the
+    dominant source on each side. `_filter_mic_bleed` below catches the
+    disruptive case (a whole sentence duplicated under the wrong speaker);
+    a stray word or two blending into a real answer can still slip through
+    undetected.
     """
     from faster_whisper.audio import decode_audio
 
@@ -247,6 +305,7 @@ def _transcribe_dual_channel(
     _run_channel(you_audio, "You", 0.0, 0.5)
     _run_channel(interviewer_audio, "Interviewer", 0.5, 0.5)
 
+    labeled = _filter_mic_bleed(labeled)
     labeled.sort(key=lambda item: item[0])
     return labeled
 
@@ -378,6 +437,7 @@ def _groq_transcribe_dual_channel(
     _run_channel(you_audio, "You", 0.0, 0.5)
     _run_channel(interviewer_audio, "Interviewer", 0.5, 0.5)
 
+    labeled = _filter_mic_bleed(labeled)
     labeled.sort(key=lambda item: item[0])
     return labeled
 
