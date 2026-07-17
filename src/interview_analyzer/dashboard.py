@@ -610,7 +610,13 @@ class Dashboard:
 
         text = tk.Text(detail_container, wrap="word", padx=10, pady=8, state="disabled", relief="flat")
         _configure_report_tags(text)
+        # explicit scrollbar (not just relying on the mouse wheel, which
+        # works but gives no visual indicator there's more content below --
+        # e.g. a long transcript) so it's obvious there's more to scroll to
+        text_vsb = ttk.Scrollbar(detail_container, orient="vertical", command=text.yview)
+        text.configure(yscrollcommand=text_vsb.set)
         text.grid(row=0, column=0, sticky="nsew")
+        text_vsb.grid(row=0, column=1, sticky="ns")
         self._history_text = text
 
         self._fb_frame = self._build_feedback_panel(detail_container, tk, ttk)
@@ -935,12 +941,15 @@ class Dashboard:
         frame.rowconfigure(1, weight=1)
 
         ttk.Button(frame, text="Refresh", command=self._refresh_trends).grid(
-            row=0, column=0, sticky="w", pady=(0, 6)
+            row=0, column=0, columnspan=2, sticky="w", pady=(0, 6)
         )
 
         text = tk.Text(frame, wrap="word", padx=10, pady=8, state="disabled", relief="flat")
         _configure_report_tags(text)
+        text_vsb = ttk.Scrollbar(frame, orient="vertical", command=text.yview)
+        text.configure(yscrollcommand=text_vsb.set)
         text.grid(row=1, column=0, sticky="nsew")
+        text_vsb.grid(row=1, column=1, sticky="ns")
         self._trends_text = text
 
         return frame

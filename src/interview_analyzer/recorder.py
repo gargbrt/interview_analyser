@@ -10,9 +10,16 @@ Platform-specific capture backend, chosen automatically by `SystemAudioRecorder(
     installs that driver once and routes system output through it. See
     docs/macos_setup.md for the one-time setup this requires.
 
-Both backends also open the default microphone (unless disabled) and mix
-it in, so your own voice is in the transcript too -- loopback/virtual-
-device capture alone only ever gets the other side of the conversation.
+Both backends also open the default microphone (unless disabled). When it's
+available, the microphone and system-audio (loopback) streams are kept on
+**separate channels** of the output WAV -- left = you (microphone), right =
+the other side of the call (loopback) -- rather than mixed into one, so
+transcriber.py can label each speaker deterministically from which channel
+a segment came from. This is far more reliable than acoustic diarization
+(pyannote), and needs no extra setup (no Hugging Face token, no model
+download). Falls back to mono (loopback only) when no microphone is
+available, in which case transcriber.py falls back to pyannote if
+configured.
 
 `_WindowsAudioRecorder` and `_MacAudioRecorder` are two independent
 implementations (not a shared base class) so that porting/changing the
@@ -48,19 +55,37 @@ except ImportError:  # pragma: no cover
     sd = None
 
 
-def _mix_pcm16(a: bytes, b: bytes) -> bytes:
-    """Mix two 16-bit PCM chunks by sample-wise addition, clipped to avoid
-    wraparound distortion. If the chunks differ in length (one device
-    returned a partial read), the shorter one is zero-padded first."""
-    arr_a = np.frombuffer(a, dtype=np.int16)
-    arr_b = np.frombuffer(b, dtype=np.int16)
-    if len(arr_a) != len(arr_b):
-        n = max(len(arr_a), len(arr_b))
-        arr_a = np.pad(arr_a, (0, n - len(arr_a)))
-        arr_b = np.pad(arr_b, (0, n - len(arr_b)))
-    mixed = arr_a.astype(np.int32) + arr_b.astype(np.int32)
-    mixed = np.clip(mixed, -32768, 32767).astype(np.int16)
-    return mixed.tobytes()
+def _downmix_to_mono(data: bytes, channels: int) -> bytes:
+    """Downmixes interleaved 16-bit PCM audio with the given channel count
+    to mono by averaging across channels -- a no-op when already mono.
+    Used to normalize each source (mic, loopback) to one channel each
+    *before* placing them on separate output channels, regardless of a
+    device's native channel count (e.g. stereo speakers)."""
+    if channels <= 1:
+        return data
+    arr = np.frombuffer(data, dtype=np.int16)
+    usable = (len(arr) // channels) * channels  # drop a short trailing partial frame, if any
+    arr = arr[:usable].astype(np.int32).reshape(-1, channels)
+    mono = arr.mean(axis=1).astype(np.int16)
+    return mono.tobytes()
+
+
+def _interleave_stereo(left: bytes, right: bytes) -> bytes:
+    """Interleaves two mono 16-bit PCM chunks into one stereo (L,R,L,R,...)
+    chunk -- left=you (microphone), right=them (system audio) by
+    convention in this app (see transcriber.py). If the chunks differ in
+    length (one stream returned a partial read), the shorter one is
+    zero-padded first."""
+    arr_l = np.frombuffer(left, dtype=np.int16)
+    arr_r = np.frombuffer(right, dtype=np.int16)
+    if len(arr_l) != len(arr_r):
+        n = max(len(arr_l), len(arr_r))
+        arr_l = np.pad(arr_l, (0, n - len(arr_l)))
+        arr_r = np.pad(arr_r, (0, n - len(arr_r)))
+    stereo = np.empty(len(arr_l) * 2, dtype=np.int16)
+    stereo[0::2] = arr_l
+    stereo[1::2] = arr_r
+    return stereo.tobytes()
 
 
 def SystemAudioRecorder(sample_rate: int = 16000, channels: int = 1, include_microphone: bool = True):
@@ -110,11 +135,17 @@ class _WindowsAudioRecorder:
         self._stop_event = threading.Event()
         self._pause_event = threading.Event()
         self._out_path: Optional[pathlib.Path] = None
-        # the device's actual capture rate/channels can differ from the
-        # requested sample_rate/channels above; elapsed_seconds needs the
-        # real ones, set once start() picks a device
+        # the loopback device's actual capture rate/channels can differ
+        # from the requested sample_rate/channels above; elapsed_seconds
+        # needs the real rate, set once start() picks a device. Both mic
+        # and loopback are downmixed to mono at this channel count before
+        # being placed on separate output channels (see _record_loop).
         self._actual_sample_rate = sample_rate
         self._actual_channels = channels
+        # the OUTPUT wav's channel count -- 1 (mono, loopback only) or 2
+        # (stereo: left=mic/you, right=loopback/them) -- decided in start()
+        # once we know whether a microphone actually opened
+        self._output_channels = channels
         self._frames_written = 0  # only counts frames actually written (i.e. not while paused)
 
     def _get_loopback_device(self):
@@ -149,11 +180,6 @@ class _WindowsAudioRecorder:
         self._actual_sample_rate = int(device["defaultSampleRate"])
         self._frames_written = 0
 
-        self._wav_file = wave.open(str(out_path), "wb")
-        self._wav_file.setnchannels(self._actual_channels)
-        self._wav_file.setsampwidth(self._pa.get_sample_size(pyaudio.paInt16))
-        self._wav_file.setframerate(self._actual_sample_rate)
-
         self._stream = self._pa.open(
             format=pyaudio.paInt16,
             channels=self._actual_channels,
@@ -166,6 +192,16 @@ class _WindowsAudioRecorder:
         if self.include_microphone:
             self._open_microphone_stream()
 
+        # speaker separation (see module docstring) needs the mic on its
+        # own channel -- only possible once we know whether one actually
+        # opened successfully, so this must come after _open_microphone_stream
+        self._output_channels = 2 if self._mic_stream is not None else 1
+
+        self._wav_file = wave.open(str(out_path), "wb")
+        self._wav_file.setnchannels(self._output_channels)
+        self._wav_file.setsampwidth(self._pa.get_sample_size(pyaudio.paInt16))
+        self._wav_file.setframerate(self._actual_sample_rate)
+
         self._stop_event.clear()
         self._thread = threading.Thread(target=self._record_loop, daemon=True)
         self._thread.start()
@@ -176,10 +212,10 @@ class _WindowsAudioRecorder:
         if mic_device is None:
             return
         try:
-            # request the SAME rate/channels as the loopback stream rather
-            # than the mic's own native format -- WASAPI's shared-mode
-            # engine resamples transparently, and it's what lets the two
-            # streams be mixed sample-for-sample below
+            # request the SAME rate/channels as the loopback stream --
+            # WASAPI's shared-mode engine resamples transparently, and it's
+            # what lets the two streams be downmixed/interleaved
+            # sample-for-sample below
             self._mic_stream = self._pa.open(
                 format=pyaudio.paInt16,
                 channels=self._actual_channels,
@@ -187,7 +223,11 @@ class _WindowsAudioRecorder:
                 input=True,
                 input_device_index=mic_device["index"],
             )
-            logger.info("Also capturing microphone (%s), mixed into the recording.", mic_device.get("name"))
+            logger.info(
+                "Also capturing microphone (%s) on its own channel, separate from "
+                "system audio, so the transcript can label who said what.",
+                mic_device.get("name"),
+            )
         except Exception as e:  # noqa: BLE001
             self._mic_stream = None
             logger.warning(
@@ -208,16 +248,30 @@ class _WindowsAudioRecorder:
             except Exception as e:  # noqa: BLE001
                 logger.warning("Recording read error: %s", e)
                 break
+            loopback_mono = _downmix_to_mono(data, self._actual_channels)
 
+            if self._output_channels == 1:
+                self._handle_frame(loopback_mono)
+                continue
+
+            # stereo output: left = mic ("you"), right = loopback ("them")
+            mic_mono = None
             if self._mic_stream is not None:
                 try:
                     mic_data = self._mic_stream.read(1024, exception_on_overflow=False)
-                    data = _mix_pcm16(data, mic_data)
+                    mic_mono = _downmix_to_mono(mic_data, self._actual_channels)
                 except Exception as e:  # noqa: BLE001
-                    logger.warning("Microphone read error; continuing with system audio only: %s", e)
+                    logger.warning("Microphone read error; continuing with silence on your channel: %s", e)
                     self._mic_stream = None
+            if mic_mono is None:
+                # the mic dropped mid-recording (or was never opened this
+                # tick) -- the WAV header is already committed to stereo
+                # for this whole file, so keep writing silence on the mic
+                # channel rather than collapsing to mono, which would
+                # corrupt the frame layout for everything already written
+                mic_mono = b"\x00\x00" * (len(loopback_mono) // 2)
 
-            self._handle_frame(data)
+            self._handle_frame(_interleave_stereo(mic_mono, loopback_mono))
 
     def _handle_frame(self, data: bytes) -> None:
         """Write one chunk of captured audio, unless paused. Split out from
@@ -225,7 +279,7 @@ class _WindowsAudioRecorder:
         without needing a real background thread/audio device."""
         if not self._pause_event.is_set():
             self._wav_file.writeframes(data)
-            self._frames_written += len(data) // (2 * max(self._actual_channels, 1))
+            self._frames_written += len(data) // (2 * max(self._output_channels, 1))
 
     @property
     def elapsed_seconds(self) -> float:
@@ -321,6 +375,10 @@ class _MacAudioRecorder:
         self._out_path: Optional[pathlib.Path] = None
         self._actual_sample_rate = sample_rate
         self._actual_channels = channels
+        # the OUTPUT wav's channel count -- 1 (mono, loopback only) or 2
+        # (stereo: left=mic/you, right=loopback/them) -- decided in start()
+        # once we know whether a microphone actually opened
+        self._output_channels = channels
         self._frames_written = 0
 
     def _find_loopback_device(self) -> Optional[dict]:
@@ -362,11 +420,6 @@ class _MacAudioRecorder:
         self._actual_sample_rate = int(device.get("default_samplerate") or self.sample_rate)
         self._frames_written = 0
 
-        self._wav_file = wave.open(str(out_path), "wb")
-        self._wav_file.setnchannels(self._actual_channels)
-        self._wav_file.setsampwidth(2)  # 16-bit PCM
-        self._wav_file.setframerate(self._actual_sample_rate)
-
         self._stream = sd.InputStream(
             device=device["index"],
             channels=self._actual_channels,
@@ -380,6 +433,16 @@ class _MacAudioRecorder:
         if self.include_microphone:
             self._open_microphone_stream()
 
+        # speaker separation (see module docstring) needs the mic on its
+        # own channel -- only possible once we know whether one actually
+        # opened successfully, so this must come after _open_microphone_stream
+        self._output_channels = 2 if self._mic_stream is not None else 1
+
+        self._wav_file = wave.open(str(out_path), "wb")
+        self._wav_file.setnchannels(self._output_channels)
+        self._wav_file.setsampwidth(2)  # 16-bit PCM
+        self._wav_file.setframerate(self._actual_sample_rate)
+
         self._stop_event.clear()
         self._thread = threading.Thread(target=self._record_loop, daemon=True)
         self._thread.start()
@@ -391,8 +454,8 @@ class _MacAudioRecorder:
             return
         try:
             # request the SAME rate/channels as the loopback stream so the
-            # two streams can be mixed sample-for-sample below -- mirrors
-            # the Windows backend's approach
+            # two streams can be downmixed/interleaved sample-for-sample
+            # below -- mirrors the Windows backend's approach
             self._mic_stream = sd.InputStream(
                 device=mic_device["index"],
                 channels=self._actual_channels,
@@ -401,7 +464,11 @@ class _MacAudioRecorder:
                 blocksize=1024,
             )
             self._mic_stream.start()
-            logger.info("Also capturing microphone (%s), mixed into the recording.", mic_device.get("name"))
+            logger.info(
+                "Also capturing microphone (%s) on its own channel, separate from "
+                "system audio, so the transcript can label who said what.",
+                mic_device.get("name"),
+            )
         except Exception as e:  # noqa: BLE001
             self._mic_stream = None
             logger.warning(
@@ -422,21 +489,35 @@ class _MacAudioRecorder:
             except Exception as e:  # noqa: BLE001
                 logger.warning("Recording read error: %s", e)
                 break
+            loopback_mono = _downmix_to_mono(data, self._actual_channels)
 
+            if self._output_channels == 1:
+                self._handle_frame(loopback_mono)
+                continue
+
+            # stereo output: left = mic ("you"), right = loopback ("them")
+            mic_mono = None
             if self._mic_stream is not None:
                 try:
                     mic_data, _overflowed = self._mic_stream.read(1024)
-                    data = _mix_pcm16(data, mic_data.tobytes())
+                    mic_mono = _downmix_to_mono(mic_data.tobytes(), self._actual_channels)
                 except Exception as e:  # noqa: BLE001
-                    logger.warning("Microphone read error; continuing with system audio only: %s", e)
+                    logger.warning("Microphone read error; continuing with silence on your channel: %s", e)
                     self._mic_stream = None
+            if mic_mono is None:
+                # the mic dropped mid-recording (or was never opened this
+                # tick) -- the WAV header is already committed to stereo
+                # for this whole file, so keep writing silence on the mic
+                # channel rather than collapsing to mono, which would
+                # corrupt the frame layout for everything already written
+                mic_mono = b"\x00\x00" * (len(loopback_mono) // 2)
 
-            self._handle_frame(data)
+            self._handle_frame(_interleave_stereo(mic_mono, loopback_mono))
 
     def _handle_frame(self, data: bytes) -> None:
         if not self._pause_event.is_set():
             self._wav_file.writeframes(data)
-            self._frames_written += len(data) // (2 * max(self._actual_channels, 1))
+            self._frames_written += len(data) // (2 * max(self._output_channels, 1))
 
     @property
     def elapsed_seconds(self) -> float:

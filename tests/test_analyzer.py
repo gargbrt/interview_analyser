@@ -76,7 +76,11 @@ def _ndjson_lines(*objs) -> list[bytes]:
 class TestOllamaEngineStreamingProgress:
     """Ollama's streaming /api/generate endpoint reports eval_count (tokens
     generated so far) per NDJSON line -- used to estimate an analyzing %
-    for the dashboard, the same way transcription reports real progress."""
+    for the dashboard, the same way transcription reports real progress.
+
+    Every test here patches ensure_ollama_running to True since it's called
+    at the top of OllamaEngine.run() -- see TestOllamaEngineAutoStart for
+    coverage of ensure_ollama_running itself."""
 
     def test_calls_on_progress_with_increasing_fractions_and_reaches_1_0(self):
         engine = OllamaEngine({"ollama_host": "http://localhost:11434", "llm_model": "llama3.1:8b"})
@@ -89,7 +93,8 @@ class TestOllamaEngineStreamingProgress:
         fake_resp.iter_lines.return_value = lines
         fake_resp.raise_for_status.return_value = None
 
-        with patch("interview_analyzer.analyzer.requests.post", return_value=fake_resp) as mock_post:
+        with patch("interview_analyzer.analyzer.ensure_ollama_running", return_value=True), \
+             patch("interview_analyzer.analyzer.requests.post", return_value=fake_resp) as mock_post:
             progress_calls = []
             raw = engine.run("How many questions? ", on_progress=progress_calls.append)
 
@@ -104,7 +109,8 @@ class TestOllamaEngineStreamingProgress:
         fake_resp.json.return_value = {"response": '{"qa_pairs": []}'}
         fake_resp.raise_for_status.return_value = None
 
-        with patch("interview_analyzer.analyzer.requests.post", return_value=fake_resp) as mock_post:
+        with patch("interview_analyzer.analyzer.ensure_ollama_running", return_value=True), \
+             patch("interview_analyzer.analyzer.requests.post", return_value=fake_resp) as mock_post:
             raw = engine.run("prompt")
 
         assert raw == '{"qa_pairs": []}'
@@ -117,7 +123,8 @@ class TestOllamaEngineStreamingProgress:
         fake_resp.iter_lines.return_value = lines
         fake_resp.raise_for_status.return_value = None
 
-        with patch("interview_analyzer.analyzer.requests.post", return_value=fake_resp):
+        with patch("interview_analyzer.analyzer.ensure_ollama_running", return_value=True), \
+             patch("interview_analyzer.analyzer.requests.post", return_value=fake_resp):
             progress_calls = []
             result = analyze_transcript(
                 "[Interviewer] Hi\n[You] Hello", cfg, on_progress=progress_calls.append
@@ -125,6 +132,37 @@ class TestOllamaEngineStreamingProgress:
 
         assert result == {"qa_pairs": []}
         assert progress_calls[-1] == 1.0
+
+
+class TestOllamaEngineAutoStart:
+    """OllamaEngine.run() checks/starts Ollama before making any request --
+    see model_setup.ensure_ollama_running. Ollama doesn't auto-start with
+    the OS by default, so without this a machine reboot (or Ollama simply
+    not having been launched yet) surfaces as a raw ConnectionError instead
+    of the app just handling it."""
+
+    def test_run_starts_ollama_automatically_before_the_request(self):
+        engine = OllamaEngine({"ollama_host": "http://localhost:11434", "llm_model": "llama3.1:8b"})
+        fake_resp = MagicMock()
+        fake_resp.json.return_value = {"response": '{"qa_pairs": []}'}
+        fake_resp.raise_for_status.return_value = None
+
+        with patch("interview_analyzer.analyzer.ensure_ollama_running", return_value=True) as mock_ensure, \
+             patch("interview_analyzer.analyzer.requests.post", return_value=fake_resp):
+            raw = engine.run("prompt")
+
+        assert raw == '{"qa_pairs": []}'
+        mock_ensure.assert_called_once_with("http://localhost:11434")
+
+    def test_run_raises_a_clear_error_when_ollama_cannot_be_started(self):
+        engine = OllamaEngine({"ollama_host": "http://localhost:11434", "llm_model": "llama3.1:8b"})
+
+        with patch("interview_analyzer.analyzer.ensure_ollama_running", return_value=False), \
+             patch("interview_analyzer.analyzer.requests.post") as mock_post:
+            with pytest.raises(RuntimeError, match="couldn't be started automatically"):
+                engine.run("prompt")
+
+        mock_post.assert_not_called()
 
 
 class TestCloudEngineApiKeyResolution:

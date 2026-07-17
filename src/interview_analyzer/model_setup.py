@@ -11,8 +11,13 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import pathlib
+import shutil
+import subprocess
+import sys
 import threading
+import time
 from typing import Callable, Optional
 
 import requests
@@ -61,6 +66,70 @@ def ollama_is_reachable(host: str) -> bool:
         return True
     except requests.RequestException:
         return False
+
+
+def _ollama_executable_candidates() -> list[pathlib.Path]:
+    """Likely locations of the Ollama server executable, per platform --
+    used only to auto-start it if it's not already running (see
+    ensure_ollama_running). Ollama itself doesn't register as an OS
+    auto-start service on install, on either platform, which is *why*
+    "not running" is a real, common situation this needs to handle."""
+    if sys.platform == "win32":
+        base = pathlib.Path(os.environ.get("LOCALAPPDATA", ""))
+        return [base / "Programs" / "Ollama" / "ollama.exe"]
+    if sys.platform == "darwin":
+        return [
+            pathlib.Path("/Applications/Ollama.app/Contents/Resources/ollama"),
+            pathlib.Path("/opt/homebrew/bin/ollama"),
+            pathlib.Path("/usr/local/bin/ollama"),
+        ]
+    return []
+
+
+def ensure_ollama_running(host: str, timeout: float = 20) -> bool:
+    """Makes sure Ollama is reachable at `host`, starting it in the
+    background first if it isn't. Returns True once reachable (either it
+    already was, or this successfully started it), False if it couldn't be
+    reached even after trying (e.g. Ollama isn't installed at all).
+
+    Called automatically before every Ollama analysis request (see
+    analyzer.py's OllamaEngine) -- this is what lets background processing
+    and "Reprocess" just work even if Ollama wasn't already running,
+    instead of failing outright with a connection error the user then has
+    to notice and fix by hand.
+    """
+    if ollama_is_reachable(host):
+        return True
+
+    exe = shutil.which("ollama") or next(
+        (str(p) for p in _ollama_executable_candidates() if p.exists()), None
+    )
+    if exe is None:
+        logger.warning(
+            "Ollama isn't reachable at %s, and no Ollama installation was found "
+            "to start automatically. Install it from https://ollama.com.", host,
+        )
+        return False
+
+    try:
+        subprocess.Popen(
+            [exe, "serve"],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            creationflags=subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0,
+        )
+        logger.info("Ollama wasn't running; starting it automatically (%s).", exe)
+    except Exception:  # noqa: BLE001
+        logger.warning("Found Ollama at %s but couldn't start it.", exe, exc_info=True)
+        return False
+
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if ollama_is_reachable(host):
+            return True
+        time.sleep(0.5)
+    logger.warning("Started Ollama but it didn't become reachable within %ss.", timeout)
+    return False
 
 
 def list_installed_models(host: str) -> list[str]:

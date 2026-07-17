@@ -127,7 +127,18 @@ transcription:
   engine: "faster-whisper"  # local, free
   whisper_model: "small"    # tiny|base|small|medium|large-v3 (bigger = slower, more accurate)
   device: "cpu"             # set to "cuda" if you have a supported GPU
-  diarization: true          # separate speakers (you vs interviewer)
+  # Separate speakers (You vs Interviewer) in the transcript. Uses whichever
+  # mechanism is actually available for a given recording, automatically:
+  #   - Preferred: channel separation -- when the microphone was captured
+  #     (see audio.include_microphone above), it's recorded on its own
+  #     channel, separate from system audio, so labeling is a matter of
+  #     which channel a word came from rather than a guess. No extra setup.
+  #   - Fallback: acoustic diarization via pyannote.audio, only used for
+  #     recordings with no separate mic channel. Needs a one-time Hugging
+  #     Face account/token -- see docs/diarization_setup.md.
+  # Set to false to disable speaker labels entirely (a single "[Speaker]"
+  # label for everyone).
+  diarization: true
   # Voice-activity-detection pre-filter. Without this, Whisper decodes fixed
   # ~30s windows regardless of content -- a real bug found in testing: a
   # quiet utterance right after a long pause (e.g. waiting for participants

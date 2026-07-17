@@ -5,11 +5,14 @@ like the real library's output, so the progress-fraction math and the
 speaker-labeling around it are what's actually under test."""
 from __future__ import annotations
 
+import wave
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
+
+import numpy as np
 
 from interview_analyzer.config_loader import Config
-from interview_analyzer.transcriber import transcribe
+from interview_analyzer.transcriber import _channel_count, transcribe
 
 
 def _fake_segment(start, end, text):
@@ -163,3 +166,141 @@ class TestVadAndLanguageSettings:
             transcript = transcribe(tmp_path / "call.wav", cfg)
 
         assert "नमस्ते" in transcript  # left untouched, not dropped or crashed
+
+
+class TestChannelCount:
+    """_channel_count() is a real (not mocked) probe against an actual
+    file -- it's the one part of the dual-channel path cheap enough to
+    exercise directly rather than through faked faster-whisper internals."""
+
+    def _write_wav(self, path, channels: int, n_frames: int = 8):
+        with wave.open(str(path), "wb") as wf:
+            wf.setnchannels(channels)
+            wf.setsampwidth(2)
+            wf.setframerate(16000)
+            wf.writeframes(b"\x00\x00" * n_frames * channels)
+
+    def test_detects_mono(self, tmp_path):
+        path = tmp_path / "mono.wav"
+        self._write_wav(path, channels=1)
+        assert _channel_count(path) == 1
+
+    def test_detects_stereo(self, tmp_path):
+        path = tmp_path / "stereo.wav"
+        self._write_wav(path, channels=2)
+        assert _channel_count(path) == 2
+
+    def test_returns_one_for_a_missing_file(self, tmp_path):
+        assert _channel_count(tmp_path / "does_not_exist.wav") == 1
+
+
+class TestDualChannelSpeakerLabeling:
+    """Speaker labeling via separate mic/loopback channels (see
+    recorder.py) -- the default, tried before falling back to acoustic
+    diarization for mono recordings. faster_whisper.audio.decode_audio and
+    WhisperModel are both faked (real behavior needs a real stereo
+    recording, a manual-verification boundary like the rest of this
+    module's real-audio dependencies)."""
+
+    def _config(self, diarization=True) -> Config:
+        return Config(raw={
+            "transcription": {"whisper_model": "tiny", "device": "cpu", "diarization": diarization},
+        })
+
+    def test_merges_both_channels_by_start_time_with_correct_labels(self, tmp_path):
+        you_segments = [_fake_segment(1.0, 2.0, "Hi there")]
+        interviewer_segments = [_fake_segment(0.0, 1.0, "Hello")]
+        you_info = SimpleNamespace(duration=2.0)
+        interviewer_info = SimpleNamespace(duration=2.0)
+
+        fake_audio = (np.zeros(10, dtype=np.float32), np.zeros(10, dtype=np.float32))
+
+        with patch("interview_analyzer.transcriber._channel_count", return_value=2), \
+             patch("faster_whisper.audio.decode_audio", return_value=fake_audio), \
+             patch("faster_whisper.WhisperModel") as MockModel:
+            MockModel.return_value.feature_extractor.sampling_rate = 16000
+            MockModel.return_value.transcribe.side_effect = [
+                (iter(you_segments), you_info),
+                (iter(interviewer_segments), interviewer_info),
+            ]
+            transcript = transcribe(tmp_path / "call.wav", self._config())
+
+        # chronological order (interviewer spoke first at t=0), not
+        # channel-processing order (you channel is transcribed first)
+        assert transcript.splitlines() == ["[Interviewer] Hello", "[You] Hi there"]
+
+    def test_skips_empty_segments(self, tmp_path):
+        you_segments = [_fake_segment(0.0, 1.0, "   ")]  # whitespace-only, e.g. a VAD false positive
+        interviewer_segments = [_fake_segment(1.0, 2.0, "Real speech")]
+        info = SimpleNamespace(duration=2.0)
+        fake_audio = (np.zeros(10, dtype=np.float32), np.zeros(10, dtype=np.float32))
+
+        with patch("interview_analyzer.transcriber._channel_count", return_value=2), \
+             patch("faster_whisper.audio.decode_audio", return_value=fake_audio), \
+             patch("faster_whisper.WhisperModel") as MockModel:
+            MockModel.return_value.feature_extractor.sampling_rate = 16000
+            MockModel.return_value.transcribe.side_effect = [
+                (iter(you_segments), info),
+                (iter(interviewer_segments), info),
+            ]
+            transcript = transcribe(tmp_path / "call.wav", self._config())
+
+        assert transcript.splitlines() == ["[Interviewer] Real speech"]
+
+    def test_progress_split_evenly_across_both_channels(self, tmp_path):
+        you_segments = [_fake_segment(0.0, 5.0, "half")]
+        interviewer_segments = [_fake_segment(0.0, 10.0, "all")]
+        you_info = SimpleNamespace(duration=10.0)
+        interviewer_info = SimpleNamespace(duration=10.0)
+        fake_audio = (np.zeros(10, dtype=np.float32), np.zeros(10, dtype=np.float32))
+
+        with patch("interview_analyzer.transcriber._channel_count", return_value=2), \
+             patch("faster_whisper.audio.decode_audio", return_value=fake_audio), \
+             patch("faster_whisper.WhisperModel") as MockModel:
+            MockModel.return_value.feature_extractor.sampling_rate = 16000
+            MockModel.return_value.transcribe.side_effect = [
+                (iter(you_segments), you_info),
+                (iter(interviewer_segments), interviewer_info),
+            ]
+            progress_calls = []
+            transcribe(tmp_path / "call.wav", self._config(), on_progress=progress_calls.append)
+
+        # "you" channel: 5/10 duration -> 0.5 fraction -> 0.0 + 0.5*0.5 = 0.25
+        # "interviewer" channel: 10/10 -> 1.0 fraction -> 0.5 + 0.5*1.0 = 1.0
+        assert progress_calls == [0.25, 1.0]
+
+    def test_stereo_audio_falls_back_to_mono_path_when_diarization_disabled(self, tmp_path):
+        """diarization: false means "no speaker labels at all", even for a
+        stereo (mic-captured) recording -- must not take the dual-channel
+        path just because two channels are technically available."""
+        info = SimpleNamespace(duration=1.0)
+
+        with patch("interview_analyzer.transcriber._channel_count", return_value=2), \
+             patch("faster_whisper.WhisperModel") as MockModel:
+            MockModel.return_value.transcribe.return_value = (iter([_fake_segment(0, 1, "hi")]), info)
+            transcript = transcribe(tmp_path / "call.wav", self._config(diarization=False))
+
+        assert transcript == "[Speaker] hi"
+        MockModel.return_value.transcribe.assert_called_once()  # single pass, not two
+
+    def test_cancel_event_stops_a_dual_channel_transcription(self, tmp_path):
+        import threading
+
+        from interview_analyzer.transcriber import TranscriptionCancelled
+
+        you_segments = [_fake_segment(0.0, 1.0, "hi")]
+        info = SimpleNamespace(duration=1.0)
+        fake_audio = (np.zeros(10, dtype=np.float32), np.zeros(10, dtype=np.float32))
+        cancel_event = threading.Event()
+        cancel_event.set()
+
+        with patch("interview_analyzer.transcriber._channel_count", return_value=2), \
+             patch("faster_whisper.audio.decode_audio", return_value=fake_audio), \
+             patch("faster_whisper.WhisperModel") as MockModel:
+            MockModel.return_value.feature_extractor.sampling_rate = 16000
+            MockModel.return_value.transcribe.return_value = (iter(you_segments), info)
+            try:
+                transcribe(tmp_path / "call.wav", self._config(), cancel_event=cancel_event)
+                assert False, "expected TranscriptionCancelled"
+            except TranscriptionCancelled:
+                pass

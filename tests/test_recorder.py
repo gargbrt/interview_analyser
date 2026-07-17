@@ -1,12 +1,15 @@
-"""Tests for SystemAudioRecorder's pause/resume/stop behavior.
+"""Tests for SystemAudioRecorder's pause/resume/stop behavior, and the
+mic/loopback channel-separation logic used for speaker labeling (see
+transcriber.py).
 
 Real WASAPI loopback capture needs actual Windows audio hardware, so the
 `pyaudiowpatch` PyAudio object is faked here -- everything downstream of
-"a stream that yields frames" (pause/resume gating, WAV writing, stop/
-cleanup) is real code under test.
+"a stream that yields frames" (pause/resume gating, WAV writing, channel
+separation, stop/cleanup) is real code under test.
 """
 from __future__ import annotations
 
+import time
 import wave
 from contextlib import contextmanager
 from unittest.mock import MagicMock, patch
@@ -17,7 +20,8 @@ from interview_analyzer.recorder import (
     SystemAudioRecorder,
     _MacAudioRecorder,
     _WindowsAudioRecorder,
-    _mix_pcm16,
+    _downmix_to_mono,
+    _interleave_stereo,
 )
 
 FRAME = b"\x00\x01" * 1024  # 1024 samples of 16-bit mono silence-ish data
@@ -34,6 +38,27 @@ class _FakeStream:
 
     def read(self, n, exception_on_overflow=False):
         raise RuntimeError("fake stream produces no frames; tests drive frames directly")
+
+    def stop_stream(self):
+        pass
+
+    def close(self):
+        pass
+
+
+class _FakeReadableStream:
+    """Unlike _FakeStream, actually yields real (fake) data -- used to
+    exercise _record_loop's real channel-separation logic end-to-end,
+    rather than bypassing it via direct _handle_frame() calls."""
+
+    def __init__(self, chunks: list[bytes]):
+        self._chunks = iter(chunks)
+
+    def read(self, n, exception_on_overflow=False):
+        try:
+            return next(self._chunks)
+        except StopIteration:
+            raise RuntimeError("fake stream exhausted -- stops _record_loop cleanly")
 
     def stop_stream(self):
         pass
@@ -203,7 +228,7 @@ def test_elapsed_seconds_is_zero_before_start(tmp_path):
         assert rec.elapsed_seconds == 0.0
 
 
-# -- microphone capture (mixed into the loopback recording) ----------------
+# -- microphone capture (its own channel, separate from loopback) ----------
 
 def test_is_capturing_microphone_true_when_available(tmp_path):
     with _fake_recorder(mic_available=True) as rec:
@@ -236,24 +261,210 @@ def test_is_capturing_microphone_false_when_opening_it_fails(tmp_path):
         rec.stop()
 
 
-def test_mix_pcm16_adds_samples_and_clips_on_overflow():
-    a = np.array([100, -100, 32000], dtype=np.int16).tobytes()
-    b = np.array([50, -50, 32000], dtype=np.int16).tobytes()
+def test_output_is_mono_when_no_microphone(tmp_path):
+    with _fake_recorder(mic_available=False) as rec:
+        out_path = tmp_path / "call.wav"
+        rec.start(out_path)
+        rec.stop()
 
-    mixed = np.frombuffer(_mix_pcm16(a, b), dtype=np.int16)
-
-    assert mixed[0] == 150
-    assert mixed[1] == -150
-    assert mixed[2] == 32767  # 64000 clipped to int16 max, not wrapped around
+    with wave.open(str(out_path), "rb") as wf:
+        assert wf.getnchannels() == 1
 
 
-def test_mix_pcm16_pads_shorter_chunk_with_silence():
-    a = np.array([10, 20, 30], dtype=np.int16).tobytes()
-    b = np.array([5], dtype=np.int16).tobytes()  # a partial/short read
+def test_output_is_stereo_when_microphone_available(tmp_path):
+    with _fake_recorder(mic_available=True) as rec:
+        out_path = tmp_path / "call.wav"
+        rec.start(out_path)
+        rec.stop()
 
-    mixed = np.frombuffer(_mix_pcm16(a, b), dtype=np.int16)
+    with wave.open(str(out_path), "rb") as wf:
+        assert wf.getnchannels() == 2
 
-    assert list(mixed) == [15, 20, 30]
+
+# -- _downmix_to_mono / _interleave_stereo (pure functions) ----------------
+
+def test_downmix_to_mono_is_a_no_op_when_already_mono():
+    data = np.array([10, 20, 30], dtype=np.int16).tobytes()
+    assert _downmix_to_mono(data, 1) == data
+
+
+def test_downmix_to_mono_averages_stereo_channels():
+    # interleaved L,R,L,R: (10,20) -> 15, (30,40) -> 35
+    data = np.array([10, 20, 30, 40], dtype=np.int16).tobytes()
+    result = np.frombuffer(_downmix_to_mono(data, 2), dtype=np.int16)
+    assert list(result) == [15, 35]
+
+
+def test_downmix_to_mono_drops_a_short_trailing_partial_frame():
+    # 5 samples at "2 channels" -- the last sample has no pair, must not crash
+    data = np.array([10, 20, 30, 40, 999], dtype=np.int16).tobytes()
+    result = np.frombuffer(_downmix_to_mono(data, 2), dtype=np.int16)
+    assert list(result) == [15, 35]
+
+
+def test_interleave_stereo_puts_left_and_right_in_order():
+    left = np.array([1, 2, 3], dtype=np.int16).tobytes()
+    right = np.array([10, 20, 30], dtype=np.int16).tobytes()
+    result = np.frombuffer(_interleave_stereo(left, right), dtype=np.int16)
+    assert list(result) == [1, 10, 2, 20, 3, 30]
+
+
+def test_interleave_stereo_pads_the_shorter_chunk_with_silence():
+    left = np.array([1, 2, 3], dtype=np.int16).tobytes()
+    right = np.array([10], dtype=np.int16).tobytes()  # a partial/short read
+    result = np.frombuffer(_interleave_stereo(left, right), dtype=np.int16)
+    assert list(result) == [1, 10, 2, 0, 3, 0]
+
+
+# -- end-to-end channel separation via the real _record_loop ---------------
+# Unlike the tests above (which drive _handle_frame() directly for
+# deterministic pause/resume assertions), these exercise the actual
+# background-thread read/downmix/interleave path, to verify the WAV file
+# that comes out the other end genuinely has mic on the left channel and
+# loopback on the right -- the property transcriber.py's speaker labeling
+# depends on.
+
+def _wait_until(predicate, timeout=2.0):
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if predicate():
+            return True
+        time.sleep(0.01)
+    return False
+
+
+def test_record_loop_separates_mic_and_loopback_onto_left_and_right_channels(tmp_path):
+    loopback_chunk = np.array([100, 200, 300, 400], dtype=np.int16).tobytes()
+    mic_chunk = np.array([10, 20, 30, 40], dtype=np.int16).tobytes()
+
+    class _ParamFakePyAudio(_FakePyAudio):
+        def get_default_input_device_info(self):
+            return {
+                "name": "Microphone", "isLoopbackDevice": False,
+                "maxInputChannels": 1, "defaultSampleRate": 16000.0, "index": 1,
+            }
+
+        def open(self, **kwargs):
+            if kwargs.get("input_device_index") == 1:
+                return _FakeReadableStream([mic_chunk])
+            return _FakeReadableStream([loopback_chunk])
+
+    fake_module = MagicMock()
+    fake_module.PyAudio = _ParamFakePyAudio
+    fake_module.paInt16 = _FakePyAudio.paInt16
+    fake_module.paWASAPI = _FakePyAudio.paWASAPI
+
+    out_path = tmp_path / "call.wav"
+    with patch("interview_analyzer.recorder.pyaudio", fake_module):
+        rec = _WindowsAudioRecorder(sample_rate=16000, channels=1, include_microphone=True)
+        rec.start(out_path)
+        assert _wait_until(lambda: rec._frames_written > 0), "background thread never wrote a frame"
+        rec.stop()
+
+    with wave.open(str(out_path), "rb") as wf:
+        assert wf.getnchannels() == 2
+        arr = np.frombuffer(wf.readframes(wf.getnframes()), dtype=np.int16).reshape(-1, 2)
+    assert list(arr[:, 0]) == [10, 20, 30, 40]    # left = mic = "you"
+    assert list(arr[:, 1]) == [100, 200, 300, 400]  # right = loopback = "them"
+
+
+def test_record_loop_downmixes_a_stereo_loopback_device_before_placing_it_on_its_channel(tmp_path):
+    """Real hardware sometimes reports a native-stereo loopback device
+    (e.g. stereo speakers) -- that must be downmixed to mono before being
+    placed on the (single) loopback output channel, not passed through
+    raw (which would silently corrupt the interleaving)."""
+    # interleaved stereo loopback: (100,200)->150, (300,400)->350
+    loopback_chunk = np.array([100, 200, 300, 400], dtype=np.int16).tobytes()
+    # the mic is opened at the SAME channel count as the loopback device
+    # (2, here) -- see _open_microphone_stream -- so this is also 2
+    # interleaved stereo frames: (10,10)->10, (20,20)->20
+    mic_chunk = np.array([10, 10, 20, 20], dtype=np.int16).tobytes()
+
+    class _ParamFakePyAudio(_FakePyAudio):
+        def get_device_info_by_index(self, _idx):
+            return {
+                "name": "Speakers", "isLoopbackDevice": True,
+                "maxInputChannels": 2, "defaultSampleRate": 16000.0, "index": 0,
+            }
+
+        def get_default_input_device_info(self):
+            return {
+                "name": "Microphone", "isLoopbackDevice": False,
+                "maxInputChannels": 1, "defaultSampleRate": 16000.0, "index": 1,
+            }
+
+        def open(self, **kwargs):
+            if kwargs.get("input_device_index") == 1:
+                return _FakeReadableStream([mic_chunk])
+            return _FakeReadableStream([loopback_chunk])
+
+    fake_module = MagicMock()
+    fake_module.PyAudio = _ParamFakePyAudio
+    fake_module.paInt16 = _FakePyAudio.paInt16
+    fake_module.paWASAPI = _FakePyAudio.paWASAPI
+
+    out_path = tmp_path / "call.wav"
+    with patch("interview_analyzer.recorder.pyaudio", fake_module):
+        rec = _WindowsAudioRecorder(sample_rate=16000, channels=1, include_microphone=True)
+        rec.start(out_path)
+        assert _wait_until(lambda: rec._frames_written > 0), "background thread never wrote a frame"
+        rec.stop()
+
+    with wave.open(str(out_path), "rb") as wf:
+        arr = np.frombuffer(wf.readframes(wf.getnframes()), dtype=np.int16).reshape(-1, 2)
+    assert list(arr[:, 0]) == [10, 20]
+    assert list(arr[:, 1]) == [150, 350]
+
+
+def test_record_loop_fills_silence_on_mic_channel_if_mic_drops_mid_recording(tmp_path):
+    """The WAV header is already committed to stereo once a mic opens
+    successfully -- if it then fails mid-recording, subsequent frames must
+    keep the file's channel layout intact (silence on the mic side) rather
+    than corrupt it by writing mono frames into a stereo file."""
+    loopback_chunks = [
+        np.array([100, 200], dtype=np.int16).tobytes(),
+        np.array([300, 400], dtype=np.int16).tobytes(),
+    ]
+
+    class _FailingMicStream:
+        def read(self, n, exception_on_overflow=False):
+            raise OSError("microphone disconnected")
+
+        def stop_stream(self):
+            pass
+
+        def close(self):
+            pass
+
+    class _ParamFakePyAudio(_FakePyAudio):
+        def get_default_input_device_info(self):
+            return {
+                "name": "Microphone", "isLoopbackDevice": False,
+                "maxInputChannels": 1, "defaultSampleRate": 16000.0, "index": 1,
+            }
+
+        def open(self, **kwargs):
+            if kwargs.get("input_device_index") == 1:
+                return _FailingMicStream()
+            return _FakeReadableStream(loopback_chunks)
+
+    fake_module = MagicMock()
+    fake_module.PyAudio = _ParamFakePyAudio
+    fake_module.paInt16 = _FakePyAudio.paInt16
+    fake_module.paWASAPI = _FakePyAudio.paWASAPI
+
+    out_path = tmp_path / "call.wav"
+    with patch("interview_analyzer.recorder.pyaudio", fake_module):
+        rec = _WindowsAudioRecorder(sample_rate=16000, channels=1, include_microphone=True)
+        rec.start(out_path)
+        assert _wait_until(lambda: rec._frames_written >= 4), "background thread never wrote both frames"
+        rec.stop()
+
+    with wave.open(str(out_path), "rb") as wf:
+        assert wf.getnchannels() == 2  # stays stereo despite the mic dropping
+        arr = np.frombuffer(wf.readframes(wf.getnframes()), dtype=np.int16).reshape(-1, 2)
+    assert list(arr[:, 0]) == [0, 0, 0, 0]  # silence on the mic channel throughout
+    assert list(arr[:, 1]) == [100, 200, 300, 400]
 
 
 # -- SystemAudioRecorder() platform dispatch --------------------------------
@@ -309,10 +520,32 @@ class _FakeSdStream:
         raise RuntimeError("fake stream produces no frames; tests drive frames directly")
 
 
+class _FakeReadableSdStream:
+    def __init__(self, chunks: list, **kwargs):
+        self._chunks = iter(chunks)
+        self.kwargs = kwargs
+
+    def start(self):
+        pass
+
+    def stop(self):
+        pass
+
+    def close(self):
+        pass
+
+    def read(self, n):
+        try:
+            chunk = next(self._chunks)
+        except StopIteration:
+            raise RuntimeError("fake stream exhausted -- stops _record_loop cleanly")
+        return np.frombuffer(chunk, dtype=np.int16), False
+
+
 class _FakeSoundDevice:
     """Mimics the bits of the `sounddevice` module _MacAudioRecorder uses."""
 
-    def __init__(self, devices=None, default_input_index=0, mic_open_fails=False):
+    def __init__(self, devices=None, default_input_index=0, mic_open_fails=False, readable_chunks=None):
         self._devices = devices if devices is not None else [
             {"name": "BlackHole 2ch", "max_input_channels": 1, "max_output_channels": 2, "default_samplerate": 16000.0},
             {"name": "MacBook Pro Microphone", "max_input_channels": 1, "max_output_channels": 0, "default_samplerate": 16000.0},
@@ -320,6 +553,9 @@ class _FakeSoundDevice:
         self.default = MagicMock()
         self.default.device = [default_input_index, 1]
         self._mic_open_fails = mic_open_fails
+        # {device_index: [chunks]} -- if given, InputStream returns a
+        # _FakeReadableSdStream that actually yields data for that device
+        self._readable_chunks = readable_chunks or {}
         self.InputStream = self._make_input_stream
 
     def query_devices(self, index=None):
@@ -330,6 +566,9 @@ class _FakeSoundDevice:
     def _make_input_stream(self, **kwargs):
         if self._mic_open_fails and kwargs.get("device") == self.default.device[0]:
             raise OSError("Access denied (no microphone permission)")
+        device_index = kwargs.get("device")
+        if device_index in self._readable_chunks:
+            return _FakeReadableSdStream(self._readable_chunks[device_index], **kwargs)
         return _FakeSdStream(**kwargs)
 
 
@@ -432,3 +671,50 @@ def test_mac_recorder_requires_sounddevice_installed():
             assert False, "expected RuntimeError"
         except RuntimeError as e:
             assert "sounddevice" in str(e)
+
+
+def test_mac_recorder_output_is_mono_when_no_microphone(tmp_path):
+    with _fake_mac_recorder(mic_available=False) as rec:
+        out_path = tmp_path / "call.wav"
+        rec.start(out_path)
+        rec.stop()
+
+    with wave.open(str(out_path), "rb") as wf:
+        assert wf.getnchannels() == 1
+
+
+def test_mac_recorder_output_is_stereo_when_microphone_available(tmp_path):
+    with _fake_mac_recorder(mic_available=True) as rec:
+        out_path = tmp_path / "call.wav"
+        rec.start(out_path)
+        rec.stop()
+
+    with wave.open(str(out_path), "rb") as wf:
+        assert wf.getnchannels() == 2
+
+
+def test_mac_recorder_separates_mic_and_loopback_onto_left_and_right_channels(tmp_path):
+    loopback_chunk = np.array([100, 200, 300, 400], dtype=np.int16).tobytes()
+    mic_chunk = np.array([10, 20, 30, 40], dtype=np.int16).tobytes()
+
+    fake_sd = _FakeSoundDevice(
+        devices=[
+            {"name": "BlackHole 2ch", "max_input_channels": 1, "max_output_channels": 2, "default_samplerate": 16000.0},
+            {"name": "MacBook Pro Microphone", "max_input_channels": 1, "max_output_channels": 0, "default_samplerate": 16000.0},
+        ],
+        default_input_index=1,
+        readable_chunks={0: [loopback_chunk], 1: [mic_chunk]},
+    )
+
+    out_path = tmp_path / "call.wav"
+    with patch("interview_analyzer.recorder.sd", fake_sd):
+        rec = _MacAudioRecorder(sample_rate=16000, channels=1, include_microphone=True)
+        rec.start(out_path)
+        assert _wait_until(lambda: rec._frames_written > 0), "background thread never wrote a frame"
+        rec.stop()
+
+    with wave.open(str(out_path), "rb") as wf:
+        assert wf.getnchannels() == 2
+        arr = np.frombuffer(wf.readframes(wf.getnframes()), dtype=np.int16).reshape(-1, 2)
+    assert list(arr[:, 0]) == [10, 20, 30, 40]
+    assert list(arr[:, 1]) == [100, 200, 300, 400]

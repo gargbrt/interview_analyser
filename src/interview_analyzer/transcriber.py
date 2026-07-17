@@ -1,5 +1,19 @@
-"""Local, free transcription via faster-whisper, with optional speaker
-diarization so the transcript distinguishes you from the interviewer.
+"""Local, free transcription via faster-whisper, with speaker labeling so
+the transcript distinguishes you from the interviewer.
+
+Speaker labeling has two mechanisms, tried in this order:
+
+  1. **Channel separation** (the default, used whenever a recording has
+     the microphone on its own channel -- see recorder.py's module
+     docstring): the mic ("You") and system-audio loopback
+     ("Interviewer") channels are transcribed independently and merged by
+     timestamp. Which channel a word came from *is* who said it, not a
+     guess -- far more reliable than acoustic diarization, and needs no
+     extra setup (no Hugging Face account/token, no model download).
+  2. **Acoustic diarization** via pyannote.audio (`_diarize_and_label`),
+     used only as a fallback for mono recordings (e.g. the microphone
+     wasn't available, so there's nothing to separate by channel) -- see
+     docs/diarization_setup.md for the one-time setup it needs.
 """
 from __future__ import annotations
 
@@ -18,6 +32,22 @@ class TranscriptionCancelled(Exception):
     segments were already decoded are discarded -- there's no meaningful
     "resume from here" for a batch Whisper run, so a cancelled transcript
     is treated as fully cancelled, not partial."""
+
+
+def _channel_count(audio_path: pathlib.Path) -> int:
+    """Cheap channel-count probe (no full audio decode) via PyAV -- the
+    same library faster-whisper itself uses internally to decode audio, so
+    this works for whatever format is actually on disk (WAV before
+    compression, opus/mp3 after -- see compress.py, which preserves the
+    channel count). Returns 1 (safe/conservative default) if the file
+    can't be probed for any reason."""
+    import av
+
+    try:
+        with av.open(str(audio_path)) as container:
+            return container.streams.audio[0].channels
+    except Exception:  # noqa: BLE001
+        return 1
 
 
 def transcribe(
@@ -52,9 +82,7 @@ def transcribe(
 
     language = _resolve_whisper_language(tcfg.get("language", "auto"))
     vad_filter = tcfg.get("vad_filter", True)
-
-    segment_stream, info = model.transcribe(
-        str(audio_path),
+    transcribe_kwargs = dict(
         beam_size=5,
         language=language,
         # vad_filter segments the audio on actual speech first, instead of
@@ -74,25 +102,80 @@ def transcribe(
         condition_on_previous_text=False,
         no_speech_threshold=0.4,
     )
-    total_duration = info.duration or 0
-    segments = []
-    for seg in segment_stream:
-        if cancel_event is not None and cancel_event.is_set():
-            raise TranscriptionCancelled()
-        segments.append(seg)
-        if on_progress is not None and total_duration > 0:
-            on_progress(min(seg.end / total_duration, 1.0))
 
-    if tcfg.get("diarization", True):
-        labeled = _diarize_and_label(audio_path, segments)
+    if tcfg.get("diarization", True) and _channel_count(audio_path) >= 2:
+        labeled = _transcribe_dual_channel(model, audio_path, transcribe_kwargs, on_progress, cancel_event)
     else:
-        labeled = [(seg.start, seg.end, "Speaker", seg.text.strip()) for seg in segments]
+        segment_stream, info = model.transcribe(str(audio_path), **transcribe_kwargs)
+        total_duration = info.duration or 0
+        segments = []
+        for seg in segment_stream:
+            if cancel_event is not None and cancel_event.is_set():
+                raise TranscriptionCancelled()
+            segments.append(seg)
+            if on_progress is not None and total_duration > 0:
+                on_progress(min(seg.end / total_duration, 1.0))
+
+        if tcfg.get("diarization", True):
+            labeled = _diarize_and_label(audio_path, segments)
+        else:
+            labeled = [(seg.start, seg.end, "Speaker", seg.text.strip()) for seg in segments]
 
     if tcfg.get("language", "auto") == "hinglish":
         labeled = [(s, e, spk, _to_latin_if_available(text)) for s, e, spk, text in labeled]
 
     lines = [f"[{spk}] {text}" for _, _, spk, text in labeled]
     return "\n".join(lines)
+
+
+def _transcribe_dual_channel(
+    model,
+    audio_path: pathlib.Path,
+    transcribe_kwargs: dict,
+    on_progress: Optional[Callable[[float], None]],
+    cancel_event: Optional[threading.Event],
+) -> list[tuple[float, float, str, str]]:
+    """Transcribes the microphone ("You") and system-audio loopback
+    ("Interviewer") channels independently -- see recorder.py's module
+    docstring for why they're on separate channels -- then merges the two
+    segment lists by start time into one chronological transcript.
+
+    Progress is split evenly across the two passes (0-50% for "You", 50-
+    100% for "Interviewer") since both channels cover the same total
+    duration.
+
+    Note: a laptop microphone often picks up *some* of the other side's
+    audio through the speakers too (unless you're on headphones), so the
+    "You" channel can occasionally pick up a stray word or two of the
+    interviewer's -- there's no acoustic echo cancellation here to prevent
+    that, just channel separation for the dominant source on each side.
+    """
+    from faster_whisper.audio import decode_audio
+
+    sampling_rate = model.feature_extractor.sampling_rate
+    you_audio, interviewer_audio = decode_audio(
+        str(audio_path), sampling_rate=sampling_rate, split_stereo=True
+    )
+
+    labeled: list[tuple[float, float, str, str]] = []
+
+    def _run_channel(audio_array, speaker_label: str, progress_offset: float, progress_share: float) -> None:
+        segment_stream, info = model.transcribe(audio_array, **transcribe_kwargs)
+        total_duration = info.duration or 0
+        for seg in segment_stream:
+            if cancel_event is not None and cancel_event.is_set():
+                raise TranscriptionCancelled()
+            text = seg.text.strip()
+            if text:
+                labeled.append((seg.start, seg.end, speaker_label, text))
+            if on_progress is not None and total_duration > 0:
+                on_progress(progress_offset + progress_share * min(seg.end / total_duration, 1.0))
+
+    _run_channel(you_audio, "You", 0.0, 0.5)
+    _run_channel(interviewer_audio, "Interviewer", 0.5, 0.5)
+
+    labeled.sort(key=lambda item: item[0])
+    return labeled
 
 
 def _resolve_whisper_language(language_setting: str) -> Optional[str]:

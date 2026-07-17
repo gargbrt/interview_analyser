@@ -24,6 +24,7 @@ import requests
 from . import api_keys
 from .config_loader import Config
 from .engines import AnalysisEngine, get_engine, register_engine
+from .model_setup import ensure_ollama_running
 from .rubric import build_prompt
 
 logger = logging.getLogger(__name__)
@@ -35,6 +36,16 @@ class OllamaEngine(AnalysisEngine):
         self.model = acfg.get("llm_model", "llama3.1:8b")
 
     def run(self, prompt: str, on_progress: Optional[Callable[[float], None]] = None) -> str:
+        # Ollama is a separate local background service that doesn't
+        # auto-start with the OS by default -- without this, a machine
+        # reboot (or Ollama just not being launched yet) turns into a
+        # confusing raw ConnectionError here instead of just working.
+        if not ensure_ollama_running(self.host):
+            raise RuntimeError(
+                f"Ollama isn't running and couldn't be started automatically at {self.host}. "
+                "Install it from https://ollama.com, or start it manually, then try again."
+            )
+
         if on_progress is None:
             resp = requests.post(
                 f"{self.host}/api/generate",

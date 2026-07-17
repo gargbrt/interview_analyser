@@ -6,6 +6,7 @@ this covers the non-UI logic that decides *when* to ask and what to show."""
 from __future__ import annotations
 
 import json
+import pathlib
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -14,6 +15,7 @@ from interview_analyzer.config_loader import Config
 from interview_analyzer.model_setup import (
     MODEL_CATALOG,
     approx_size_gb,
+    ensure_ollama_running,
     is_model_installed,
     list_installed_models,
     mark_setup_done,
@@ -122,3 +124,76 @@ class TestSetupMarker:
         assert setup_already_done(cfg) is False
         mark_setup_done(cfg)
         assert setup_already_done(cfg) is True
+
+
+class TestEnsureOllamaRunning:
+    """ensure_ollama_running is what lets analysis (and Reprocess) just
+    work even if Ollama wasn't already running, instead of failing outright
+    with a raw connection error -- see analyzer.py's OllamaEngine.run."""
+
+    def test_returns_true_immediately_if_already_reachable(self):
+        with patch("interview_analyzer.model_setup.ollama_is_reachable", return_value=True), \
+             patch("interview_analyzer.model_setup.shutil.which") as mock_which, \
+             patch("interview_analyzer.model_setup.subprocess.Popen") as mock_popen:
+            assert ensure_ollama_running("http://localhost:11434") is True
+
+        mock_which.assert_not_called()
+        mock_popen.assert_not_called()
+
+    def test_starts_ollama_via_path_and_waits_until_reachable(self):
+        # not reachable at first, then reachable after the process starts
+        reachable_calls = iter([False, False, True])
+        with patch(
+            "interview_analyzer.model_setup.ollama_is_reachable",
+            side_effect=lambda host: next(reachable_calls),
+        ), patch("interview_analyzer.model_setup.shutil.which", return_value="/usr/local/bin/ollama"), \
+             patch("interview_analyzer.model_setup.subprocess.Popen") as mock_popen, \
+             patch("interview_analyzer.model_setup.time.sleep"):
+            assert ensure_ollama_running("http://localhost:11434", timeout=5) is True
+
+        mock_popen.assert_called_once()
+        assert mock_popen.call_args.args[0] == ["/usr/local/bin/ollama", "serve"]
+
+    def test_falls_back_to_platform_specific_candidate_paths_when_not_on_path(self):
+        fake_exe = pathlib.Path("/opt/homebrew/bin/ollama")
+        with patch("interview_analyzer.model_setup.ollama_is_reachable", side_effect=[False, True]), \
+             patch("interview_analyzer.model_setup.shutil.which", return_value=None), \
+             patch(
+                 "interview_analyzer.model_setup._ollama_executable_candidates",
+                 return_value=[fake_exe],
+             ), \
+             patch.object(pathlib.Path, "exists", return_value=True), \
+             patch("interview_analyzer.model_setup.subprocess.Popen") as mock_popen, \
+             patch("interview_analyzer.model_setup.time.sleep"):
+            assert ensure_ollama_running("http://localhost:11434", timeout=5) is True
+
+        assert mock_popen.call_args.args[0] == [str(fake_exe), "serve"]
+
+    def test_returns_false_when_ollama_cannot_be_found_anywhere(self):
+        with patch("interview_analyzer.model_setup.ollama_is_reachable", return_value=False), \
+             patch("interview_analyzer.model_setup.shutil.which", return_value=None), \
+             patch("interview_analyzer.model_setup._ollama_executable_candidates", return_value=[]), \
+             patch("interview_analyzer.model_setup.subprocess.Popen") as mock_popen:
+            assert ensure_ollama_running("http://localhost:11434") is False
+
+        mock_popen.assert_not_called()
+
+    def test_returns_false_if_it_never_becomes_reachable_within_timeout(self):
+        with patch("interview_analyzer.model_setup.ollama_is_reachable", return_value=False), \
+             patch("interview_analyzer.model_setup.shutil.which", return_value="/usr/local/bin/ollama"), \
+             patch("interview_analyzer.model_setup.subprocess.Popen"), \
+             patch("interview_analyzer.model_setup.time.sleep"), \
+             patch(
+                 "interview_analyzer.model_setup.time.monotonic",
+                 side_effect=[0, 1, 2, 999],  # jumps past the deadline
+             ):
+            assert ensure_ollama_running("http://localhost:11434", timeout=5) is False
+
+    def test_returns_false_if_the_executable_is_found_but_fails_to_launch(self):
+        with patch("interview_analyzer.model_setup.ollama_is_reachable", return_value=False), \
+             patch("interview_analyzer.model_setup.shutil.which", return_value="/usr/local/bin/ollama"), \
+             patch(
+                 "interview_analyzer.model_setup.subprocess.Popen",
+                 side_effect=OSError("permission denied"),
+             ):
+            assert ensure_ollama_running("http://localhost:11434") is False
