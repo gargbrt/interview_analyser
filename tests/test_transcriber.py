@@ -13,9 +13,11 @@ import numpy as np
 
 from interview_analyzer.config_loader import Config
 from interview_analyzer.transcriber import (
+    _GROQ_MAX_CHUNK_SECONDS,
     TranscriptionCancelled,
     _channel_count,
     _filter_mic_bleed,
+    _groq_transcribe_array_chunked,
     _groq_transcribe_file,
     _looks_like_mic_bleed,
     _transcribe_via_groq,
@@ -396,6 +398,118 @@ class TestDualChannelSpeakerLabeling:
                 pass
 
 
+class TestGroqTranscribeArrayChunked:
+    """Regression coverage for a real bug: a single channel of an actual
+    ~23-minute interview was ~43MB as raw 16-bit PCM at 16kHz -- Groq
+    rejected it outright with HTTP 413 (Payload Too Large, 25MB limit on
+    the free tier), even after per-channel splitting. Uploads must be
+    chunked to a bounded duration regardless of how long the call was."""
+
+    def test_short_audio_makes_exactly_one_upload(self, tmp_path):
+        sample_rate = 16000
+        audio = np.zeros(sample_rate * 5, dtype=np.float32)  # 5s, well under one chunk
+
+        with patch("soundfile.write"), \
+             patch(
+                 "interview_analyzer.transcriber._groq_transcribe_file",
+                 return_value=[{"start": 0.0, "end": 5.0, "text": "hello"}],
+             ) as mock_file:
+            result = _groq_transcribe_array_chunked(
+                audio, sample_rate, "whisper-large-v3-turbo", "en", None, "gsk-key", None, None, 0.0, 1.0,
+            )
+
+        mock_file.assert_called_once()
+        assert result == [{"start": 0.0, "end": 5.0, "text": "hello"}]
+
+    def test_long_audio_is_split_into_multiple_uploads_with_offset_timestamps(self, tmp_path):
+        sample_rate = 16000
+        # 2.5x the chunk size -- must produce 3 uploads (ceil division)
+        audio = np.zeros(int(sample_rate * _GROQ_MAX_CHUNK_SECONDS * 2.5), dtype=np.float32)
+
+        with patch("soundfile.write"), \
+             patch(
+                 "interview_analyzer.transcriber._groq_transcribe_file",
+                 side_effect=[
+                     [{"start": 0.0, "end": 1.0, "text": "first"}],
+                     [{"start": 0.0, "end": 1.0, "text": "second"}],
+                     [{"start": 0.0, "end": 1.0, "text": "third"}],
+                 ],
+             ) as mock_file:
+            result = _groq_transcribe_array_chunked(
+                audio, sample_rate, "whisper-large-v3-turbo", None, None, "gsk-key", None, None, 0.0, 1.0,
+            )
+
+        assert mock_file.call_count == 3
+        # each chunk's local 0.0-1.0 timestamps get offset back to absolute time
+        assert result == [
+            {"start": 0.0, "end": 1.0, "text": "first"},
+            {"start": _GROQ_MAX_CHUNK_SECONDS + 0.0, "end": _GROQ_MAX_CHUNK_SECONDS + 1.0, "text": "second"},
+            {"start": 2 * _GROQ_MAX_CHUNK_SECONDS + 0.0, "end": 2 * _GROQ_MAX_CHUNK_SECONDS + 1.0, "text": "third"},
+        ]
+
+    def test_each_chunk_stays_under_the_size_budget(self, tmp_path):
+        """Every chunk written to disk (before upload) must be at most
+        _GROQ_MAX_CHUNK_SECONDS of 16-bit mono PCM -- ~19.2MB, comfortably
+        under Groq's 25MB limit."""
+        sample_rate = 16000
+        audio = np.zeros(int(sample_rate * _GROQ_MAX_CHUNK_SECONDS * 1.5), dtype=np.float32)
+        written_lengths = []
+
+        def _fake_write(path, data, rate, **kwargs):
+            written_lengths.append(len(data))
+
+        with patch("soundfile.write", side_effect=_fake_write), \
+             patch("interview_analyzer.transcriber._groq_transcribe_file", return_value=[]):
+            _groq_transcribe_array_chunked(
+                audio, sample_rate, "whisper-large-v3-turbo", None, None, "gsk-key", None, None, 0.0, 1.0,
+            )
+
+        assert all(n <= sample_rate * _GROQ_MAX_CHUNK_SECONDS for n in written_lengths)
+
+    def test_reports_progress_per_chunk(self, tmp_path):
+        sample_rate = 16000
+        audio = np.zeros(int(sample_rate * _GROQ_MAX_CHUNK_SECONDS * 2), dtype=np.float32)
+        progress_calls = []
+
+        with patch("soundfile.write"), \
+             patch("interview_analyzer.transcriber._groq_transcribe_file", return_value=[]):
+            _groq_transcribe_array_chunked(
+                audio, sample_rate, "whisper-large-v3-turbo", None, None, "gsk-key",
+                progress_calls.append, None, 0.0, 1.0,
+            )
+
+        assert progress_calls == [0.5, 1.0]
+
+    def test_cancel_event_stops_mid_chunking(self, tmp_path):
+        import threading
+
+        sample_rate = 16000
+        audio = np.zeros(int(sample_rate * _GROQ_MAX_CHUNK_SECONDS * 3), dtype=np.float32)
+        cancel_event = threading.Event()
+
+        call_count = 0
+
+        def _fake_transcribe_file(*args, **kwargs):
+            nonlocal call_count
+            call_count += 1
+            if call_count == 2:
+                cancel_event.set()
+            return []
+
+        with patch("soundfile.write"), \
+             patch("interview_analyzer.transcriber._groq_transcribe_file", side_effect=_fake_transcribe_file):
+            try:
+                _groq_transcribe_array_chunked(
+                    audio, sample_rate, "whisper-large-v3-turbo", None, None, "gsk-key",
+                    None, cancel_event, 0.0, 1.0,
+                )
+                assert False, "expected TranscriptionCancelled"
+            except TranscriptionCancelled:
+                pass
+
+        assert call_count == 2  # stopped before the 3rd chunk
+
+
 class TestGroqTranscribeFile:
     """_groq_transcribe_file makes one blocking call to Groq's
     /audio/transcriptions endpoint -- the Groq equivalent of a single
@@ -470,9 +584,11 @@ class TestTranscribeViaGroq:
         monkeypatch.delenv("INTERVIEW_ANALYZER_API_KEY", raising=False)
         audio_path = tmp_path / "call.wav"
         audio_path.write_bytes(b"fake")
+        fake_audio = np.zeros(10, dtype=np.float32)
 
         with patch("interview_analyzer.transcriber.api_keys.load_key", return_value="gsk-saved"), \
              patch("interview_analyzer.transcriber._channel_count", return_value=1), \
+             patch("faster_whisper.audio.decode_audio", return_value=fake_audio), \
              patch("interview_analyzer.transcriber._groq_transcribe_file", return_value=[]) as mock_file:
             _transcribe_via_groq(audio_path, self._config(), None, None)
 
@@ -482,8 +598,10 @@ class TestTranscribeViaGroq:
         monkeypatch.setenv("INTERVIEW_ANALYZER_API_KEY", "gsk-env")
         audio_path = tmp_path / "call.wav"
         audio_path.write_bytes(b"fake")
+        fake_audio = np.zeros(10, dtype=np.float32)
 
         with patch("interview_analyzer.transcriber._channel_count", return_value=1), \
+             patch("faster_whisper.audio.decode_audio", return_value=fake_audio), \
              patch(
                  "interview_analyzer.transcriber._groq_transcribe_file",
                  return_value=[{"start": 0.0, "end": 1.0, "text": " hello "}],
@@ -524,8 +642,10 @@ class TestTranscribeViaGroq:
         monkeypatch.setenv("INTERVIEW_ANALYZER_API_KEY", "gsk-env")
         audio_path = tmp_path / "call.wav"
         audio_path.write_bytes(b"fake")
+        fake_audio = np.zeros(10, dtype=np.float32)
 
         with patch("interview_analyzer.transcriber._channel_count", return_value=1), \
+             patch("faster_whisper.audio.decode_audio", return_value=fake_audio), \
              patch(
                  "interview_analyzer.transcriber._groq_transcribe_file",
                  return_value=[{"start": 0.0, "end": 1.0, "text": "hello"}],

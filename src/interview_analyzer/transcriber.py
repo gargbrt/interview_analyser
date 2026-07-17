@@ -310,6 +310,15 @@ def _transcribe_dual_channel(
     return labeled
 
 
+# Groq's free tier caps a single /audio/transcriptions request at 25MB
+# (reproduced directly: a single channel of a real ~23-minute interview was
+# already ~43MB as raw 16-bit PCM at 16kHz -- well over the limit even
+# after per-channel splitting). 600s (10 min) of 16kHz 16-bit mono PCM is
+# ~19.2MB, comfortably under the limit with margin regardless of how the
+# audio was originally encoded.
+_GROQ_MAX_CHUNK_SECONDS = 600
+
+
 def _transcribe_via_groq(
     audio_path: pathlib.Path,
     cfg: Config,
@@ -321,11 +330,9 @@ def _transcribe_via_groq(
     up to ~228x real-time), at the real cost of the audio leaving this
     machine and going to Groq's servers. See docs/using_cloud_apis.md.
 
-    Progress reporting is coarser than the local path: Groq's transcription
-    endpoint is a single blocking HTTP call with no streaming, so there's
-    no per-segment signal to report mid-call -- on_progress only fires
-    between channels (dual-channel) or once at the end (mono), rather than
-    continuously. Acceptable given how fast the call itself is.
+    Progress reporting is coarser than the local path: each individual
+    Groq request is a blocking call with no streaming, so on_progress only
+    advances between chunks/channels, not continuously within one.
     """
     env_var = cfg.analysis.get("cloud_api_key_env_var", "INTERVIEW_ANALYZER_API_KEY")
     api_key = os.environ.get(env_var) or api_keys.load_key("groq")
@@ -341,14 +348,33 @@ def _transcribe_via_groq(
     language = _resolve_whisper_language(tcfg.get("language", "auto"))
     prompt = tcfg.get("initial_prompt") or None
 
-    if tcfg.get("diarization", True) and _channel_count(audio_path) >= 2:
-        return _groq_transcribe_dual_channel(
-            audio_path, groq_model, language, prompt, api_key, on_progress, cancel_event
-        )
+    from faster_whisper.audio import decode_audio
 
-    segments = _groq_transcribe_file(audio_path, groq_model, language, prompt, api_key, cancel_event)
-    if on_progress is not None:
-        on_progress(1.0)
+    if tcfg.get("diarization", True) and _channel_count(audio_path) >= 2:
+        you_audio, interviewer_audio = decode_audio(str(audio_path), sampling_rate=16000, split_stereo=True)
+        labeled: list[tuple[float, float, str, str]] = []
+
+        def _run_channel(audio_array, speaker_label: str, progress_offset: float) -> None:
+            segments = _groq_transcribe_array_chunked(
+                audio_array, 16000, groq_model, language, prompt, api_key,
+                on_progress, cancel_event, progress_offset, 0.5,
+            )
+            for seg in segments:
+                text = seg.get("text", "").strip()
+                if text:
+                    labeled.append((seg["start"], seg["end"], speaker_label, text))
+
+        _run_channel(you_audio, "You", 0.0)
+        _run_channel(interviewer_audio, "Interviewer", 0.5)
+
+        labeled = _filter_mic_bleed(labeled)
+        labeled.sort(key=lambda item: item[0])
+        return labeled
+
+    audio_array = decode_audio(str(audio_path), sampling_rate=16000)
+    segments = _groq_transcribe_array_chunked(
+        audio_array, 16000, groq_model, language, prompt, api_key, on_progress, cancel_event, 0.0, 1.0,
+    )
     if tcfg.get("diarization", True):
         # _diarize_and_label expects faster-whisper Segment-like objects
         # (attribute access, not dict keys) -- a thin adapter so pyannote
@@ -359,6 +385,59 @@ def _transcribe_via_groq(
     return [(s["start"], s["end"], "Speaker", s["text"].strip()) for s in segments]
 
 
+def _groq_transcribe_array_chunked(
+    audio_array,
+    sample_rate: int,
+    model: str,
+    language: Optional[str],
+    prompt: Optional[str],
+    api_key: str,
+    on_progress: Optional[Callable[[float], None]],
+    cancel_event: Optional[threading.Event],
+    progress_offset: float,
+    progress_share: float,
+) -> list[dict]:
+    """Uploads `audio_array` to Groq in fixed-duration chunks (see
+    _GROQ_MAX_CHUNK_SECONDS) so a single request never exceeds Groq's
+    per-file size limit, regardless of how long the original recording
+    was. Returns a flat list of segment dicts with "start"/"end"/"text",
+    offset back into absolute time across chunk boundaries -- callers see
+    one continuous segment list, chunking is an internal detail."""
+    import soundfile as sf
+
+    chunk_frames = _GROQ_MAX_CHUNK_SECONDS * sample_rate
+    total_frames = len(audio_array)
+    total_chunks = max(1, -(-total_frames // chunk_frames))  # ceil division
+
+    all_segments: list[dict] = []
+    for i in range(total_chunks):
+        if cancel_event is not None and cancel_event.is_set():
+            raise TranscriptionCancelled()
+        start_frame = i * chunk_frames
+        end_frame = min(start_frame + chunk_frames, total_frames)
+        time_offset = start_frame / sample_rate
+
+        fd, tmp_name = tempfile.mkstemp(suffix=".wav", prefix="groq_chunk_")
+        os.close(fd)
+        tmp_path = pathlib.Path(tmp_name)
+        try:
+            sf.write(str(tmp_path), audio_array[start_frame:end_frame], sample_rate, subtype="PCM_16")
+            segments = _groq_transcribe_file(tmp_path, model, language, prompt, api_key, cancel_event)
+        finally:
+            tmp_path.unlink(missing_ok=True)
+
+        for seg in segments:
+            all_segments.append({
+                "start": seg["start"] + time_offset,
+                "end": seg["end"] + time_offset,
+                "text": seg.get("text", ""),
+            })
+        if on_progress is not None:
+            on_progress(progress_offset + progress_share * ((i + 1) / total_chunks))
+
+    return all_segments
+
+
 def _groq_transcribe_file(
     audio_path: pathlib.Path,
     model: str,
@@ -367,11 +446,11 @@ def _groq_transcribe_file(
     api_key: str,
     cancel_event: Optional[threading.Event],
 ) -> list[dict]:
-    """One blocking call to Groq's /audio/transcriptions endpoint, returning
-    its segment list (each with "start"/"end"/"text") -- the Groq
-    equivalent of faster-whisper's segment stream, just materialized all
-    at once rather than yielded lazily (Groq's API isn't a streaming
-    endpoint)."""
+    """One blocking call to Groq's /audio/transcriptions endpoint for a
+    single chunk, returning its segment list (each with
+    "start"/"end"/"text") -- the Groq equivalent of faster-whisper's
+    segment stream, just materialized all at once rather than yielded
+    lazily (Groq's API isn't a streaming endpoint)."""
     if cancel_event is not None and cancel_event.is_set():
         raise TranscriptionCancelled()
 
@@ -391,55 +470,6 @@ def _groq_transcribe_file(
         )
     resp.raise_for_status()
     return resp.json().get("segments", [])
-
-
-def _groq_transcribe_dual_channel(
-    audio_path: pathlib.Path,
-    model: str,
-    language: Optional[str],
-    prompt: Optional[str],
-    api_key: str,
-    on_progress: Optional[Callable[[float], None]],
-    cancel_event: Optional[threading.Event],
-) -> list[tuple[float, float, str, str]]:
-    """Groq equivalent of _transcribe_dual_channel above -- same left=mic
-    ("You") / right=loopback ("Interviewer") convention, same merge-by-
-    start-time logic. Groq's API has no concept of multi-channel input, so
-    each channel is decoded and written to its own temp mono WAV file for
-    a separate upload, then the temp files are cleaned up immediately
-    after."""
-    from faster_whisper.audio import decode_audio
-
-    import soundfile as sf
-
-    you_audio, interviewer_audio = decode_audio(str(audio_path), sampling_rate=16000, split_stereo=True)
-
-    labeled: list[tuple[float, float, str, str]] = []
-
-    def _run_channel(audio_array, speaker_label: str, progress_offset: float, progress_share: float) -> None:
-        if cancel_event is not None and cancel_event.is_set():
-            raise TranscriptionCancelled()
-        fd, tmp_name = tempfile.mkstemp(suffix=".wav", prefix="groq_channel_")
-        os.close(fd)
-        tmp_path = pathlib.Path(tmp_name)
-        try:
-            sf.write(str(tmp_path), audio_array, 16000, subtype="PCM_16")
-            segments = _groq_transcribe_file(tmp_path, model, language, prompt, api_key, cancel_event)
-        finally:
-            tmp_path.unlink(missing_ok=True)
-        for seg in segments:
-            text = seg.get("text", "").strip()
-            if text:
-                labeled.append((seg["start"], seg["end"], speaker_label, text))
-        if on_progress is not None:
-            on_progress(progress_offset + progress_share)
-
-    _run_channel(you_audio, "You", 0.0, 0.5)
-    _run_channel(interviewer_audio, "Interviewer", 0.5, 0.5)
-
-    labeled = _filter_mic_bleed(labeled)
-    labeled.sort(key=lambda item: item[0])
-    return labeled
 
 
 def _resolve_whisper_language(language_setting: str) -> Optional[str]:
