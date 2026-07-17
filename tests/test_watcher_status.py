@@ -21,8 +21,13 @@ def _test_config(tmp_path) -> Config:
         },
         "audio": {"sample_rate": 16000, "channels": 1, "bitrate_kbps": 64,
                    "format": "opus", "raw_dir": str(tmp_path / "audio")},
+        # live_during_recording is off here since these tests mock the
+        # recorder itself -- live_transcribe.py needs a real (or at least
+        # int-valued) frames_written/actual_sample_rate to run against; its
+        # own behavior is covered separately in test_live_transcribe.py and
+        # test_watcher_live_transcription.py
         "transcription": {"engine": "faster-whisper", "whisper_model": "tiny",
-                           "device": "cpu", "diarization": False},
+                           "device": "cpu", "diarization": False, "live_during_recording": False},
         "analysis": {"engine": "ollama", "llm_model": "llama3.1:8b",
                      "ollama_host": "http://localhost:11434"},
         "storage": {"db_path": str(tmp_path / "interviews.db")},

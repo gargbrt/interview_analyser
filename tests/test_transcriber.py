@@ -12,7 +12,7 @@ from unittest.mock import MagicMock, patch
 import numpy as np
 
 from interview_analyzer.config_loader import Config
-from interview_analyzer.transcriber import _channel_count, transcribe
+from interview_analyzer.transcriber import _channel_count, load_whisper_model, transcribe
 
 
 def _fake_segment(start, end, text):
@@ -190,6 +190,63 @@ class TestVadAndLanguageSettings:
             transcript = transcribe(tmp_path / "call.wav", cfg)
 
         assert "नमस्ते" in transcript  # left untouched, not dropped or crashed
+
+
+class TestReusableModel:
+    """A caller that already has a loaded WhisperModel (see
+    live_transcribe.py, which transcribes one interview in many periodic
+    segments rather than one whole-file call) can pass it in via `model=`
+    to skip transcribe()'s own loading step entirely."""
+
+    def test_load_whisper_model_uses_configured_settings(self, tmp_path):
+        cfg = Config(raw={
+            "transcription": {"whisper_model": "medium", "device": "cuda"},
+        })
+        with patch("faster_whisper.WhisperModel") as MockModel:
+            load_whisper_model(cfg)
+
+        MockModel.assert_called_once_with("medium", device="cuda", compute_type="float16")
+
+    def test_load_whisper_model_falls_back_to_local_cache_on_a_network_error(self, tmp_path):
+        """A real Hub outage was observed to break loading a model that
+        was already fully downloaded and cached -- WhisperModel phones
+        home to check for updates by default even then. This is the
+        regression guard for the local_files_only=True retry."""
+        cfg = Config(raw={"transcription": {"whisper_model": "medium", "device": "cpu"}})
+        offline_model = MagicMock()
+
+        with patch("faster_whisper.WhisperModel", side_effect=[ConnectionError("hub unreachable"), offline_model]) as MockModel:
+            result = load_whisper_model(cfg)
+
+        assert result is offline_model
+        assert MockModel.call_count == 2
+        assert MockModel.call_args.kwargs.get("local_files_only") is True
+
+    def test_load_whisper_model_raises_the_original_error_if_not_cached_either(self, tmp_path):
+        """First run, model genuinely not downloaded yet: the offline
+        retry fails too, and the original (network) error -- not a
+        confusing "not found locally" one -- is what should surface."""
+        cfg = Config(raw={"transcription": {"whisper_model": "medium", "device": "cpu"}})
+        original_error = ConnectionError("hub unreachable")
+
+        with patch("faster_whisper.WhisperModel", side_effect=[original_error, FileNotFoundError("not cached")]):
+            try:
+                load_whisper_model(cfg)
+                assert False, "expected the original ConnectionError to be raised"
+            except ConnectionError as e:
+                assert e is original_error
+
+    def test_transcribe_uses_the_given_model_instead_of_loading_one(self, tmp_path):
+        fake_info = SimpleNamespace(duration=1.0)
+        given_model = MagicMock()
+        given_model.transcribe.return_value = (iter([_fake_segment(0, 1, "hi")]), fake_info)
+
+        with patch("faster_whisper.WhisperModel") as MockModel:
+            transcript = transcribe(tmp_path / "call.wav", _config(), model=given_model)
+
+        MockModel.assert_not_called()
+        given_model.transcribe.assert_called_once()
+        assert "hi" in transcript
 
 
 class TestChannelCount:

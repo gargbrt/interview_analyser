@@ -50,11 +50,48 @@ def _channel_count(audio_path: pathlib.Path) -> int:
         return 1
 
 
+def load_whisper_model(cfg: Config):
+    """Loads a WhisperModel per `cfg.transcription`'s settings. Split out
+    from transcribe() so a caller that needs to transcribe many separate
+    audio files against the same settings (see live_transcribe.py, which
+    transcribes one interview's audio in periodic segments during
+    recording rather than one whole-file call at the end) can load the
+    model once and reuse it, instead of paying WhisperModel's real loading
+    cost on every call.
+
+    Falls back to an offline-only load (`local_files_only=True`) if the
+    normal load fails -- WhisperModel always checks Hugging Face Hub for
+    updates before using a model by default, even one that's already fully
+    downloaded and cached locally, so a transient network issue could
+    otherwise break transcription for a model that doesn't need any
+    network access at all (observed directly: a real Hub outage broke
+    loading an already-cached model). If the model genuinely isn't cached
+    yet (e.g. first run), the offline retry fails too and the original
+    (informative, network-related) error is what gets raised.
+    """
+    from faster_whisper import WhisperModel
+
+    tcfg = cfg.transcription
+    model_name = tcfg.get("whisper_model", "small")
+    device = tcfg.get("device", "cpu")
+    compute_type = "int8" if device == "cpu" else "float16"
+    try:
+        return WhisperModel(model_name, device=device, compute_type=compute_type)
+    except Exception as e:  # noqa: BLE001
+        try:
+            model = WhisperModel(model_name, device=device, compute_type=compute_type, local_files_only=True)
+        except Exception:
+            raise e from None
+        logger.info("Loaded %s from local cache after a network issue reaching Hugging Face Hub.", model_name)
+        return model
+
+
 def transcribe(
     audio_path: pathlib.Path,
     cfg: Config,
     on_progress: Optional[Callable[[float], None]] = None,
     cancel_event: Optional[threading.Event] = None,
+    model=None,
 ) -> str:
     """Returns a speaker-labeled transcript as plain text, e.g.:
 
@@ -70,15 +107,14 @@ def transcribe(
     `TranscriptionCancelled` instead of returning (checked between segments
     because that's the only natural interruption point faster-whisper's
     synchronous, single-call API offers -- there's no mid-segment hook).
-    """
-    from faster_whisper import WhisperModel
 
+    If given, `model` is used instead of loading a new one from `cfg` --
+    see load_whisper_model()'s docstring for why a caller might already
+    have one loaded.
+    """
     tcfg = cfg.transcription
-    model = WhisperModel(
-        tcfg.get("whisper_model", "small"),
-        device=tcfg.get("device", "cpu"),
-        compute_type="int8" if tcfg.get("device", "cpu") == "cpu" else "float16",
-    )
+    if model is None:
+        model = load_whisper_model(cfg)
 
     language = _resolve_whisper_language(tcfg.get("language", "auto"))
     vad_filter = tcfg.get("vad_filter", True)

@@ -131,6 +131,7 @@ class _WindowsAudioRecorder:
         self._stream = None
         self._mic_stream = None
         self._wav_file: Optional[wave.Wave_write] = None
+        self._out_file = None  # the raw file object wave.Wave_file wraps -- see start()
         self._thread: Optional[threading.Thread] = None
         self._stop_event = threading.Event()
         self._pause_event = threading.Event()
@@ -197,7 +198,16 @@ class _WindowsAudioRecorder:
         # opened successfully, so this must come after _open_microphone_stream
         self._output_channels = 2 if self._mic_stream is not None else 1
 
-        self._wav_file = wave.open(str(out_path), "wb")
+        # Unbuffered (buffering=0), rather than wave.open(str(out_path))'s
+        # default buffered file -- with small buffered writes (our chunks
+        # are ~2-4KB), a separate reader can see stale/empty data for a
+        # long time (up to the ~8KB default buffer filling), which
+        # live_transcribe.py -- reading this same file from another thread
+        # while it's still being written -- depends on not happening.
+        # Negligible cost here: this app's audio bitrate is a few tens of
+        # KB/s, far below what unbuffered writes matter for.
+        self._out_file = open(str(out_path), "wb", buffering=0)
+        self._wav_file = wave.open(self._out_file, "wb")
         self._wav_file.setnchannels(self._output_channels)
         self._wav_file.setsampwidth(self._pa.get_sample_size(pyaudio.paInt16))
         self._wav_file.setframerate(self._actual_sample_rate)
@@ -291,6 +301,25 @@ class _WindowsAudioRecorder:
         return self._frames_written / self._actual_sample_rate
 
     @property
+    def frames_written(self) -> int:
+        """How many frames have actually been written to the WAV file on
+        disk so far (excludes paused time -- same counter elapsed_seconds
+        is derived from). Used by live_transcribe.py to know how much of
+        the file is safe to read without racing the writer: `writeframes()`
+        happens-before this counter increments (see _handle_frame), so any
+        value read here is guaranteed to already be flushed to the wave
+        writer, whose header-patching keeps the on-disk file's declared
+        length in sync with it on every write."""
+        return self._frames_written
+
+    @property
+    def actual_sample_rate(self) -> int:
+        """The real capture sample rate in use (the loopback device's
+        native rate, which can differ from the sample_rate requested at
+        construction -- see start()). 0 before start() is called."""
+        return self._actual_sample_rate
+
+    @property
     def is_capturing_microphone(self) -> bool:
         """True once recording has actually started with a working
         microphone stream (False before start(), or if none was available/
@@ -329,6 +358,12 @@ class _WindowsAudioRecorder:
             self._mic_stream.close()
         if self._wav_file:
             self._wav_file.close()
+        if self._out_file:
+            # wave.Wave_write.close() only closes the underlying file
+            # itself if IT opened it -- since start() passes an
+            # already-open file object (see start()'s comment), that
+            # object must be closed here too
+            self._out_file.close()
         logger.info("Recording stopped -> %s", self._out_path)
         return self._out_path
 
@@ -369,6 +404,7 @@ class _MacAudioRecorder:
         self._stream = None
         self._mic_stream = None
         self._wav_file: Optional[wave.Wave_write] = None
+        self._out_file = None  # the raw file object wave.Wave_file wraps -- see start()
         self._thread: Optional[threading.Thread] = None
         self._stop_event = threading.Event()
         self._pause_event = threading.Event()
@@ -438,7 +474,11 @@ class _MacAudioRecorder:
         # opened successfully, so this must come after _open_microphone_stream
         self._output_channels = 2 if self._mic_stream is not None else 1
 
-        self._wav_file = wave.open(str(out_path), "wb")
+        # see the matching comment in _WindowsAudioRecorder.start() -- kept
+        # unbuffered so live_transcribe.py can reliably read this file
+        # from another thread while it's still being written.
+        self._out_file = open(str(out_path), "wb", buffering=0)
+        self._wav_file = wave.open(self._out_file, "wb")
         self._wav_file.setnchannels(self._output_channels)
         self._wav_file.setsampwidth(2)  # 16-bit PCM
         self._wav_file.setframerate(self._actual_sample_rate)
@@ -526,6 +566,17 @@ class _MacAudioRecorder:
         return self._frames_written / self._actual_sample_rate
 
     @property
+    def frames_written(self) -> int:
+        """See _WindowsAudioRecorder.frames_written's docstring -- same
+        contract, used by live_transcribe.py to know how much of the WAV
+        file on disk is safe to read without racing the writer."""
+        return self._frames_written
+
+    @property
+    def actual_sample_rate(self) -> int:
+        return self._actual_sample_rate
+
+    @property
     def is_capturing_microphone(self) -> bool:
         return self._mic_stream is not None
 
@@ -555,5 +606,8 @@ class _MacAudioRecorder:
             self._mic_stream.close()
         if self._wav_file:
             self._wav_file.close()
+        if self._out_file:
+            # see the matching comment in _WindowsAudioRecorder.stop()
+            self._out_file.close()
         logger.info("Recording stopped -> %s", self._out_path)
         return self._out_path

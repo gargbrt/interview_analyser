@@ -134,6 +134,24 @@ transcription:
   # want to push accuracy further.
   whisper_model: "medium"
   device: "cpu"             # set to "cuda" if you have a supported GPU
+  # Transcribe the call in the background WHILE it's being recorded,
+  # in periodic chunks (live_segment_seconds each), instead of waiting
+  # until it ends to start transcribing the whole thing -- this is what
+  # makes processing finish quickly after a long call: only the last
+  # partial chunk is left to transcribe once it ends. Recording itself is
+  # never touched by this (it only reads the audio file, never the
+  # recorder) -- see live_transcribe.py's module docstring for the safety
+  # details. Automatically falls back to transcribing the whole call
+  # afterwards (today's original behavior) if anything about this fails,
+  # so turning it off is only ever a speed tradeoff, never a correctness
+  # one. Set to false to disable.
+  live_during_recording: true
+  # How often (seconds of actually-recorded audio, i.e. pause time doesn't
+  # count) a chunk gets transcribed during the call. Smaller = the final
+  # post-call wait is shorter, but more overhead reloading/re-running
+  # Whisper more often; larger = fewer, bigger chunks. 300s (5 min) is a
+  # reasonable default for a typical interview length.
+  live_segment_seconds: 300
   # Separate speakers (You vs Interviewer) in the transcript. Uses whichever
   # mechanism is actually available for a given recording, automatically:
   #   - Preferred: channel separation -- when the microphone was captured

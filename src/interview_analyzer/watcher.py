@@ -30,6 +30,7 @@ from .confidence import calibrated_confidence, calibration_notes as build_calibr
 from .consent import ask_consent
 from .control_panel import RecordingControlPanel
 from .db import InterviewDB
+from .live_transcribe import LiveTranscriptionWorker
 from .recorder import SystemAudioRecorder
 from .report import write_interview_report, write_trends_report
 from .transcriber import TranscriptionCancelled, transcribe
@@ -165,6 +166,10 @@ class MeetingWatcher:
         # headless mode (watcher.py's own main()), where popups run standalone.
         self._ui_root = ui_root
         self._recorder: Optional[SystemAudioRecorder] = None
+        # transcribes the current recording incrementally in the
+        # background as it happens -- see live_transcribe.py. None when
+        # disabled, not currently recording, or it failed to start.
+        self._live_worker: Optional[LiveTranscriptionWorker] = None
         self._control_panel: Optional[RecordingControlPanel] = None
         self._current_interview_id: Optional[int] = None
         self._current_app_name: Optional[str] = None
@@ -429,6 +434,23 @@ class MeetingWatcher:
             retention_days=self.cfg.retention_days,
             user_id=self.user_id,
         )
+        self._live_worker = None
+        if self.cfg.transcription.get("live_during_recording", True):
+            # transcribes this call in the background as it's being
+            # recorded, so most of the transcript is already done by the
+            # time it ends -- see live_transcribe.py's module docstring
+            # for why this is safe for the live recording itself (it only
+            # ever reads the WAV file, never touches the recorder). Any
+            # failure here just means _process_in_background falls back to
+            # transcribing the whole file afterwards, same as before this
+            # feature existed.
+            try:
+                self._live_worker = LiveTranscriptionWorker(self.cfg, wav_path, self._recorder)
+                self._live_worker.start()
+            except Exception:  # noqa: BLE001
+                logger.warning("Couldn't start live transcription; will transcribe the whole "
+                                "call after it ends instead.", exc_info=True)
+                self._live_worker = None
         self._control_panel = RecordingControlPanel(
             app_name,
             on_pause=self.pause_recording,
@@ -463,17 +485,28 @@ class MeetingWatcher:
 
         wav_path = self._recorder.stop()
         self.db.end_interview(interview_id)
+        # ownership of the live worker (if any) transfers to the background
+        # thread below -- finishing it (transcribing whatever's left since
+        # its last periodic segment) can take a little while, and this
+        # method must return quickly (see its own docstring), so that
+        # happens over there, not here
+        live_worker = self._live_worker
+        self._live_worker = None
         logger.info("Meeting ended. Processing interview #%s in the background...", interview_id)
 
         thread = threading.Thread(
             target=self._process_in_background,
-            args=(interview_id, wav_path, app_name),
+            args=(interview_id, wav_path, app_name, live_worker),
             daemon=True,
         )
         thread.start()
 
     def _process_in_background(
-        self, interview_id: int, wav_path: pathlib.Path, source_app: Optional[str]
+        self,
+        interview_id: int,
+        wav_path: pathlib.Path,
+        source_app: Optional[str],
+        live_worker: Optional[LiveTranscriptionWorker] = None,
     ) -> None:
         """Runs compress -> transcribe -> analyze -> report for one
         interview on its own thread. Exceptions are logged, not raised
@@ -481,8 +514,20 @@ class MeetingWatcher:
         cancel_event = threading.Event()
         with self._processing_lock:
             self._cancel_events[interview_id] = cancel_event
-        self._set_job(interview_id, "compressing", source_app=source_app)
         try:
+            precomputed_transcript = None
+            if live_worker is not None:
+                # must happen before compress_audio below -- compress_audio
+                # deletes the original wav_path on success, and finish()
+                # needs to read it for the final not-yet-live-transcribed
+                # segment. finish() itself never raises (any internal
+                # failure just makes it return None -- see
+                # live_transcribe.py), but it's inside this try/except
+                # regardless, consistent with the rest of this method.
+                self._set_job(interview_id, "transcribing", progress=None, source_app=source_app)
+                precomputed_transcript = live_worker.finish()
+
+            self._set_job(interview_id, "compressing", source_app=source_app)
             audio_path = compress_audio(
                 wav_path,
                 bitrate_kbps=self.cfg.audio.get("bitrate_kbps", 64),
@@ -491,7 +536,10 @@ class MeetingWatcher:
             # keep DB pointing at the (now-compressed) file so cleanup can find it
             self.db.update_audio_path(interview_id, str(audio_path))
 
-            self._run_analysis_pipeline(interview_id, audio_path, cancel_event, source_app=source_app)
+            self._run_analysis_pipeline(
+                interview_id, audio_path, cancel_event, source_app=source_app,
+                precomputed_transcript=precomputed_transcript,
+            )
         except TranscriptionCancelled:
             logger.info("Processing for interview #%s was cancelled.", interview_id)
         except Exception:  # noqa: BLE001
@@ -526,31 +574,44 @@ class MeetingWatcher:
         audio_path: pathlib.Path,
         cancel_event: threading.Event,
         source_app: Optional[str] = None,
+        precomputed_transcript: Optional[str] = None,
     ) -> None:
         """transcribe -> analyze -> write report for audio that's already
         been recorded (and compressed, if applicable). Shared by
         `_process_in_background` and `reprocess_interview`; callers own
         registering/clearing this job in `_processing_jobs` (via
         `_set_job`/`_clear_job`) around the call, since a failure needs to
-        clear it too."""
-        self._set_job(interview_id, "transcribing", progress=None, source_app=source_app)
+        clear it too.
 
-        last_notified_at = 0.0
+        If given, `precomputed_transcript` (from live_transcribe.py having
+        already transcribed this call while it was being recorded) is used
+        directly instead of transcribing `audio_path` from scratch -- the
+        whole point of live transcription: most of the wait is already
+        done by the time the call ends. None falls back to transcribing
+        normally, same as before this feature existed (including whenever
+        live transcription was disabled, failed, or timed out)."""
+        if precomputed_transcript is not None:
+            self._set_job(interview_id, "transcribing", progress=1.0, source_app=source_app)
+            transcript = precomputed_transcript
+        else:
+            self._set_job(interview_id, "transcribing", progress=None, source_app=source_app)
 
-        def _on_transcribe_progress(fraction: float) -> None:
-            nonlocal last_notified_at
-            now = time.monotonic()
-            # throttle -- a long interview can yield hundreds of segments,
-            # and flooding the UI thread with .after() calls per segment
-            # isn't necessary for a progress bar humans are just glancing at
-            if fraction < 1.0 and now - last_notified_at < 0.25:
-                return
-            last_notified_at = now
-            self._set_job(interview_id, "transcribing", progress=fraction)
+            last_notified_at = 0.0
 
-        transcript = transcribe(
-            audio_path, self.cfg, on_progress=_on_transcribe_progress, cancel_event=cancel_event
-        )
+            def _on_transcribe_progress(fraction: float) -> None:
+                nonlocal last_notified_at
+                now = time.monotonic()
+                # throttle -- a long interview can yield hundreds of segments,
+                # and flooding the UI thread with .after() calls per segment
+                # isn't necessary for a progress bar humans are just glancing at
+                if fraction < 1.0 and now - last_notified_at < 0.25:
+                    return
+                last_notified_at = now
+                self._set_job(interview_id, "transcribing", progress=fraction)
+
+            transcript = transcribe(
+                audio_path, self.cfg, on_progress=_on_transcribe_progress, cancel_event=cancel_event
+            )
         self.db.save_transcript(interview_id, transcript)
 
         if not transcript.strip():
