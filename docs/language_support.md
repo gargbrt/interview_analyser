@@ -21,10 +21,51 @@ to control this:
 
 | Value      | Behavior                                                        |
 |------------|-------------------------------------------------------------------|
-| `auto`     | Detect the spoken language automatically (default).               |
-| `en`       | Force English.                                                    |
+| `auto`     | Detect the spoken language automatically.                         |
+| `en`       | Force English (default).                                          |
 | `hi`       | Force Hindi (output in Devanagari script).                        |
 | `hinglish` | Force Hindi decoding (embedded English words transcribed inline), then romanize the result to Latin script -- see below. |
+
+## Accented English (e.g. Indian English)
+
+Whisper's accuracy is noticeably lower on strongly accented English than on
+US/UK-accented English, out of the box. Three settings here specifically
+help with that, all on by default:
+
+1. **`transcription.language: "en"`** -- Whisper's "auto" mode detects the
+   spoken language from only the first ~30 seconds of audio, and a strong
+   accent is a common way for that step to misdetect the language entirely,
+   garbling everything downstream. Pinning to `"en"` skips that guesswork.
+2. **`transcription.whisper_model: "medium"`** (or `"large-v3"` if your
+   machine can run it fast enough) -- Whisper's accuracy on accented speech
+   improves with model size more than its accuracy on standard-accent
+   speech does; `"small"` and below visibly mis-hear more on accented
+   audio. This is slower to transcribe on CPU than `"small"` was --
+   roughly 2-3x for `"medium"` -- so drop back down if it's too slow for
+   your machine.
+3. **`transcription.initial_prompt`** -- a short text hint passed to
+   Whisper before each decode, biasing it towards transcribing informal,
+   disfluent spoken audio (including filler words) accurately rather than
+   "cleaning it up" into a different, more formal-sounding — and often
+   wrong — sentence. Set it to `""` to disable.
+
+### Why not a dedicated Indian-accent/Indic ASR model?
+
+[Sarvam AI](https://www.sarvam.ai/blogs/sarvam-translate) and others offer
+ASR specifically tuned for Indian accents and languages, but Sarvam's
+strongest speech-to-text models (Saarika/Saaras) are a paid cloud API only
+(~₹1.5/min after a small free-credit trial) — not a free, local model, so
+they don't fit this app's fully-local/free design and would add an
+internet dependency and ongoing cost. Free, locally-runnable alternatives
+like [IndicWhisper](https://huggingface.co/vasista22/whisper-hindi-large-v2)
+exist but are fine-tuned for *Hindi speech*, not Indian-accented *English*
+speech, and aren't published in the CTranslate2 format faster-whisper (this
+app's transcription engine) needs -- using one would mean converting it
+yourself first. If you want to try one anyway,
+`transcription.whisper_model` accepts any Hugging Face repo already in
+CTranslate2 format (not just the built-in size names), including one you
+convert yourself -- see [SYSTRAN/faster-whisper's conversion
+instructions](https://github.com/SYSTRAN/faster-whisper#model-conversion).
 
 ## The optional Hindi / English / Hinglish pack
 

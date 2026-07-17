@@ -20,6 +20,7 @@ import threading
 import time
 from typing import Callable, Optional
 
+import psutil
 import requests
 
 logger = logging.getLogger(__name__)
@@ -130,6 +131,40 @@ def ensure_ollama_running(host: str, timeout: float = 20) -> bool:
         time.sleep(0.5)
     logger.warning("Started Ollama but it didn't become reachable within %ss.", timeout)
     return False
+
+
+def stop_ollama(host: str, timeout: float = 10) -> bool:
+    """Best-effort stop of the local Ollama server process, for the
+    dashboard's Status tab "Stop" button. Returns True once `host` is
+    unreachable (either it wasn't running to begin with, or this
+    successfully stopped it).
+
+    There's no cross-platform "shut down the server" API call -- Ollama's
+    own CLI only offers `ollama stop <model>` (unloads a model from memory,
+    leaves the server itself running), so this finds and terminates the
+    server process directly by name. Note: on Windows, if Ollama's tray app
+    is installed and running, it may relaunch the server shortly after this
+    kills it -- that's outside this app's control.
+    """
+    found_any = False
+    for proc in psutil.process_iter(["name"]):
+        name = (proc.info.get("name") or "").lower()
+        if name in ("ollama.exe", "ollama", "ollama_llama_server.exe", "ollama_llama_server"):
+            found_any = True
+            try:
+                proc.terminate()
+            except (psutil.NoSuchProcess, psutil.AccessDenied):
+                pass
+
+    if not found_any:
+        return not ollama_is_reachable(host)
+
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if not ollama_is_reachable(host):
+            return True
+        time.sleep(0.5)
+    return not ollama_is_reachable(host)
 
 
 def list_installed_models(host: str) -> list[str]:

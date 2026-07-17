@@ -101,6 +101,14 @@ def transcribe(
         # treating it fresh. That's part of the same 55s-dropped-speech bug.
         condition_on_previous_text=False,
         no_speech_threshold=0.4,
+        # A short style/context hint biases decoding towards this kind of
+        # audio -- real, informal spoken conversation with filler words --
+        # rather than Whisper's tendency to "clean up" or drop disfluent
+        # speech into a more formal-sounding (and less accurate) sentence.
+        # Configurable since it's most useful for accented/non-US-English
+        # speech (see config.yaml's comment and docs/language_support.md);
+        # set to "" to disable.
+        initial_prompt=tcfg.get("initial_prompt") or None,
     )
 
     if tcfg.get("diarization", True) and _channel_count(audio_path) >= 2:

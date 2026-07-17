@@ -17,6 +17,7 @@ import pathlib
 import subprocess
 import sys
 import threading
+import time
 from typing import Callable, Optional
 
 from . import api_keys
@@ -25,9 +26,11 @@ from .language_packs import LANGUAGE_PACKS, PackActionDialog, is_pack_installed
 from .model_setup import (
     MODEL_CATALOG,
     ModelInstallDialog,
+    ensure_ollama_running,
     is_model_installed,
     ollama_is_reachable,
     size_label,
+    stop_ollama,
 )
 from .report import write_trends_report
 from .report_view import render_into_text_widget
@@ -126,6 +129,36 @@ def can_reprocess(record) -> bool:
     return has_audio(record)
 
 
+def _friendly_error_markdown(heading: str, exc: BaseException) -> str:
+    """Renders a failure as a human-readable headline first, with the raw
+    exception folded in below as "Technical details" -- so someone who
+    just wants to know what to *do* isn't stuck parsing a Python exception,
+    while the exact error is still there for anyone who wants to dig in or
+    paste it into a bug report. The full traceback still goes to the log
+    file (see the callers' logger.exception calls) -- this is deliberately
+    just the type+message, not a stack trace, since that's the app's own
+    log, not something the user reads in normal operation."""
+    message = str(exc)
+    lower = message.lower()
+    if "ollama" in lower and ("couldn't be started" in lower or "isn't running" in lower):
+        headline = (
+            "The local analysis model (Ollama) isn't running, and couldn't be started "
+            "automatically. Go to the **Status** tab and check \"Local analysis model\" -- "
+            "click **Start** there, then try again."
+        )
+    elif "connection" in lower or "refused" in lower or isinstance(exc, ConnectionError):
+        headline = (
+            "Couldn't reach the analysis model. If you're using Ollama, check its status on "
+            "the **Status** tab; if you're using a cloud engine, check your internet connection "
+            "and API key in the Settings tab."
+        )
+    elif "no audio was recorded" in lower:
+        headline = "This interview has no recorded audio to work with, so there's nothing to reprocess."
+    else:
+        headline = "Something went wrong while processing this interview."
+    return f"# {heading}\n\n{headline}\n\n**Technical details:** {type(exc).__name__}: {message}"
+
+
 def _configure_report_tags(text_widget) -> None:
     text_widget.tag_configure("h1", font=("Georgia", 15, "bold"), spacing3=6)
     text_widget.tag_configure("h2", font=("Georgia", 12, "bold"), spacing1=10, spacing3=4)
@@ -165,6 +198,15 @@ class Dashboard:
         self._background_jobs_label = None
         self._pause_btn = None
         self._stop_btn = None
+        # Ollama status/start/stop row on the Status tab -- see
+        # _start_ollama_status_polling. _ollama_poll_started guards against
+        # starting a second polling thread if the dashboard is closed and
+        # reopened (a fresh Dashboard instance isn't created for that --
+        # see open()/close() -- so this flag must survive across runs).
+        self._ollama_status_label = None
+        self._ollama_start_btn = None
+        self._ollama_stop_btn = None
+        self._ollama_poll_started = False
         self._manual_start_entry = None
         self._manual_start_btn = None
         self._history_tree = None
@@ -280,6 +322,7 @@ class Dashboard:
         self._refresh_status()
         self._refresh_history()
         self._refresh_trends()
+        self._start_ollama_status_polling()
         self.watcher.set_ui_root(root)
         self._ready.set()
         root.mainloop()
@@ -373,6 +416,22 @@ class Dashboard:
         self._manual_start_btn = ttk.Button(manual_row, text="Start recording", command=self._on_manual_start)
         self._manual_start_btn.pack(side="left")
 
+        # Local analysis model (Ollama) status -- shown here since a
+        # not-running model is a common, previously-confusing cause of
+        # "reprocessing failed"/"analysis failed" (see _friendly_error_markdown
+        # and history_status_label's hint text). Only meaningful for the
+        # "ollama" analysis engine; see _apply_ollama_status for the
+        # cloud-engine case.
+        model_row = ttk.Frame(frame)
+        model_row.pack(anchor="w", pady=(14, 0))
+        ttk.Label(model_row, text="Local analysis model:").pack(side="left", padx=(0, 6))
+        self._ollama_status_label = ttk.Label(model_row, text="checking…", foreground="#5b645f")
+        self._ollama_status_label.pack(side="left", padx=(0, 10))
+        self._ollama_start_btn = ttk.Button(model_row, text="Start", command=self._on_start_ollama)
+        self._ollama_start_btn.pack(side="left", padx=(0, 4))
+        self._ollama_stop_btn = ttk.Button(model_row, text="Stop", command=self._on_stop_ollama)
+        self._ollama_stop_btn.pack(side="left")
+
         ttk.Button(
             frame, text="Open recordings folder", command=self._on_open_recordings_folder
         ).pack(anchor="w", pady=(14, 0))
@@ -423,6 +482,102 @@ class Dashboard:
             _open_with_os_default(folder)
         except Exception:  # noqa: BLE001
             logger.exception("Failed to open recordings folder %s", folder)
+
+    def _ollama_host(self) -> str:
+        return self.watcher.cfg.analysis.get("ollama_host", "http://localhost:11434")
+
+    def _using_ollama_engine(self) -> bool:
+        return self.watcher.cfg.analysis.get("engine", "ollama") == "ollama"
+
+    def _start_ollama_status_polling(self) -> None:
+        """Background thread that checks Ollama's reachability every few
+        seconds and pushes the result to the Status tab -- run off the Tk
+        thread since ollama_is_reachable() makes a real HTTP request
+        (blocking the UI thread for up to its 3s timeout on every refresh
+        would freeze the whole window while Ollama is down, exactly when
+        the status indicator matters most)."""
+        if self._ollama_poll_started:
+            return
+        self._ollama_poll_started = True
+
+        def _poll() -> None:
+            while self._root is not None:
+                if self._using_ollama_engine():
+                    reachable = ollama_is_reachable(self._ollama_host())
+                else:
+                    reachable = None  # not applicable -- see _apply_ollama_status
+                root = self._root
+                if root is None:
+                    break
+                try:
+                    root.after(0, lambda r=reachable: self._apply_ollama_status(r))
+                except Exception:  # noqa: BLE001
+                    break
+                time.sleep(8)
+
+        threading.Thread(target=_poll, daemon=True).start()
+
+    def _apply_ollama_status(self, reachable: Optional[bool]) -> None:
+        """`reachable` is None when the configured analysis engine isn't
+        Ollama at all (a cloud engine) -- there's no local model to show a
+        running/stopped state for or to start/stop."""
+        if self._ollama_status_label is None:
+            return
+        if reachable is None:
+            engine = self.watcher.cfg.analysis.get("engine", "ollama")
+            self._ollama_status_label.config(text=f"n/a (using {engine})", foreground="#5b645f")
+            self._ollama_start_btn.config(state="disabled")
+            self._ollama_stop_btn.config(state="disabled")
+        elif reachable:
+            self._ollama_status_label.config(text="● Running", foreground="#2f6f5e")
+            self._ollama_start_btn.config(state="disabled")
+            self._ollama_stop_btn.config(state="normal")
+        else:
+            self._ollama_status_label.config(text="● Not running", foreground="#c0392b")
+            self._ollama_start_btn.config(state="normal")
+            self._ollama_stop_btn.config(state="disabled")
+
+    def _on_start_ollama(self) -> None:
+        self._ollama_start_btn.config(state="disabled")
+        self._ollama_status_label.config(text="Starting…", foreground="#5b645f")
+        host = self._ollama_host()
+
+        def _run() -> None:
+            started = ensure_ollama_running(host)
+            if self._root is not None:
+                self._root.after(0, lambda: self._apply_ollama_status(started))
+
+        threading.Thread(target=_run, daemon=True).start()
+
+    def _on_stop_ollama(self) -> None:
+        self._ollama_stop_btn.config(state="disabled")
+        self._ollama_status_label.config(text="Stopping…", foreground="#5b645f")
+        host = self._ollama_host()
+
+        def _run() -> None:
+            stop_ollama(host)
+            reachable = ollama_is_reachable(host)
+            if self._root is not None:
+                self._root.after(0, lambda: self._apply_ollama_status(reachable))
+
+        threading.Thread(target=_run, daemon=True).start()
+
+    def _wake_ollama_async(self) -> None:
+        """Fired from the History/Trends Refresh buttons so that clicking
+        Refresh also proactively wakes up a stopped local model, instead of
+        only starting it lazily the moment an actual analysis request is
+        made (see OllamaEngine.run() in analyzer.py) -- by the time you've
+        clicked Reprocess it's had a head start warming up."""
+        if not self._using_ollama_engine():
+            return
+        host = self._ollama_host()
+
+        def _run() -> None:
+            reachable = ensure_ollama_running(host)
+            if self._root is not None:
+                self._root.after(0, lambda: self._apply_ollama_status(reachable))
+
+        threading.Thread(target=_run, daemon=True).start()
 
     def _on_click_logout(self) -> None:
         # only enabled while idle (see _refresh_status) -- logging out
@@ -544,7 +699,7 @@ class Dashboard:
 
         toolbar = ttk.Frame(frame)
         toolbar.grid(row=0, column=0, columnspan=2, sticky="w", pady=(0, 4))
-        ttk.Button(toolbar, text="Refresh", command=self._refresh_history).pack(side="left")
+        ttk.Button(toolbar, text="Refresh", command=self._on_refresh_history).pack(side="left")
         self._reprocess_btn = ttk.Button(
             toolbar, text="Reprocess (generate report)", command=self._on_reprocess, state="disabled"
         )
@@ -770,6 +925,10 @@ class Dashboard:
             self._history_tree.selection_set(selected[0])
         self._update_action_buttons()
 
+    def _on_refresh_history(self) -> None:
+        self._refresh_history()
+        self._wake_ollama_async()
+
     def _selected_record(self):
         selection = self._history_tree.selection()
         if not selection:
@@ -823,8 +982,10 @@ class Dashboard:
             reason = {
                 "Interrupted — no report": "The recording was interrupted before it finished (e.g. a crash or "
                                             "a force-quit), so it never reached the report stage.",
-                "Analysis failed": "The transcript was produced, but analysis didn't complete "
-                                    "(e.g. the analysis engine was unreachable at the time).",
+                "Analysis failed": "The transcript was produced, but analysis didn't complete -- most often "
+                                    "because the local analysis model (Ollama) wasn't running at the time. "
+                                    "Check its status on the **Status** tab (it should start automatically "
+                                    "the next time you try, but you can also start it there yourself).",
                 "Not processed": "This interview hasn't been processed yet.",
                 "Report pending": "Analysis finished, but the report file wasn't written yet.",
             }.get(history_status_label(record), "The report file is missing.")
@@ -852,11 +1013,11 @@ class Dashboard:
             except Exception as e:  # noqa: BLE001
                 logger.exception("Reprocessing interview #%s failed", interview_id)
                 # `e` is deleted when this except block exits (standard
-                # Python behavior for `except ... as e`), so it must be
-                # captured into a plain variable now -- a lambda referring
-                # to `e` directly would raise NameError once .after() runs
-                # it later, since by then the name no longer exists.
-                error_message = str(e)
+                # Python behavior for `except ... as e`), so the rendered
+                # markdown must be built now -- a lambda referring to `e`
+                # directly would raise NameError once .after() runs it
+                # later, since by then the name no longer exists.
+                error_markdown = _friendly_error_markdown("Reprocessing failed", e)
                 if self._root is not None:
                     # only re-render the row list (to re-enable Reprocess,
                     # since the audio is still there) -- NOT the detail
@@ -864,7 +1025,7 @@ class Dashboard:
                     # would otherwise get immediately overwritten by
                     # _on_history_select()'s normal "not processed" text
                     self._root.after(0, self._refresh_history)
-                    self._root.after(0, lambda msg=error_message: self._show_reprocess_error(msg))
+                    self._root.after(0, lambda msg=error_markdown: self._show_reprocess_error(msg))
             else:
                 # success -- re-render the row list and the now-available report
                 if self._root is not None:
@@ -874,8 +1035,11 @@ class Dashboard:
         threading.Thread(target=_run, daemon=True).start()
 
     def _show_reprocess_error(self, message: str) -> None:
+        """`message` is already fully-formed markdown from
+        _friendly_error_markdown -- built in _on_reprocess while the
+        original exception object was still alive."""
         self._history_text.config(state="normal")
-        render_into_text_widget(self._history_text, f"# Reprocessing failed\n\n{message}")
+        render_into_text_widget(self._history_text, message)
         self._history_text.config(state="disabled")
 
     def _on_open_audio(self) -> None:
@@ -940,7 +1104,7 @@ class Dashboard:
         frame.columnconfigure(0, weight=1)
         frame.rowconfigure(1, weight=1)
 
-        ttk.Button(frame, text="Refresh", command=self._refresh_trends).grid(
+        ttk.Button(frame, text="Refresh", command=self._on_refresh_trends).grid(
             row=0, column=0, columnspan=2, sticky="w", pady=(0, 6)
         )
 
@@ -971,6 +1135,10 @@ class Dashboard:
         self._trends_text.config(state="normal")
         render_into_text_widget(self._trends_text, trends_path.read_text(encoding="utf-8"))
         self._trends_text.config(state="disabled")
+
+    def _on_refresh_trends(self) -> None:
+        self._refresh_trends()
+        self._wake_ollama_async()
 
     # -- Settings tab -----------------------------------------------------
 

@@ -9,6 +9,7 @@ import json
 import pathlib
 from unittest.mock import MagicMock, patch
 
+import psutil
 import pytest
 
 from interview_analyzer.config_loader import Config
@@ -23,6 +24,7 @@ from interview_analyzer.model_setup import (
     pull_model,
     setup_already_done,
     size_label,
+    stop_ollama,
 )
 
 
@@ -197,3 +199,58 @@ class TestEnsureOllamaRunning:
                  side_effect=OSError("permission denied"),
              ):
             assert ensure_ollama_running("http://localhost:11434") is False
+
+
+class _FakeProcess:
+    def __init__(self, name: str, terminate_raises: Exception = None):
+        self.info = {"name": name}
+        self._terminate_raises = terminate_raises
+        self.terminated = False
+
+    def terminate(self):
+        if self._terminate_raises is not None:
+            raise self._terminate_raises
+        self.terminated = True
+
+
+class TestStopOllama:
+    """stop_ollama backs the Status tab's "Stop" button -- best-effort since
+    there's no cross-platform "shut down the server" API, only finding and
+    terminating the process by name (see ensure_ollama_running for the
+    matching "start" side)."""
+
+    def test_terminates_matching_processes_and_confirms_unreachable(self):
+        procs = [_FakeProcess("ollama.exe"), _FakeProcess("explorer.exe")]
+        with patch("interview_analyzer.model_setup.psutil.process_iter", return_value=procs), \
+             patch("interview_analyzer.model_setup.ollama_is_reachable", return_value=False), \
+             patch("interview_analyzer.model_setup.time.sleep"):
+            assert stop_ollama("http://localhost:11434") is True
+
+        assert procs[0].terminated is True
+        assert procs[1].terminated is False  # unrelated process left alone
+
+    def test_returns_true_if_nothing_was_running_to_begin_with(self):
+        with patch("interview_analyzer.model_setup.psutil.process_iter", return_value=[]), \
+             patch("interview_analyzer.model_setup.ollama_is_reachable", return_value=False):
+            assert stop_ollama("http://localhost:11434") is True
+
+    def test_ignores_processes_that_disappear_or_deny_access_mid_terminate(self):
+        procs = [
+            _FakeProcess("ollama.exe", terminate_raises=psutil.NoSuchProcess(1234)),
+            _FakeProcess("ollama.exe", terminate_raises=psutil.AccessDenied(5678)),
+        ]
+        with patch("interview_analyzer.model_setup.psutil.process_iter", return_value=procs), \
+             patch("interview_analyzer.model_setup.ollama_is_reachable", return_value=False), \
+             patch("interview_analyzer.model_setup.time.sleep"):
+            assert stop_ollama("http://localhost:11434") is True  # doesn't raise
+
+    def test_returns_false_if_still_reachable_after_the_timeout(self):
+        procs = [_FakeProcess("ollama.exe")]
+        with patch("interview_analyzer.model_setup.psutil.process_iter", return_value=procs), \
+             patch("interview_analyzer.model_setup.ollama_is_reachable", return_value=True), \
+             patch("interview_analyzer.model_setup.time.sleep"), \
+             patch(
+                 "interview_analyzer.model_setup.time.monotonic",
+                 side_effect=[0, 1, 999],  # jumps past the deadline
+             ):
+            assert stop_ollama("http://localhost:11434", timeout=5) is False

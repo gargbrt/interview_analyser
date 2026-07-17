@@ -8,8 +8,20 @@ from __future__ import annotations
 from unittest.mock import MagicMock, patch
 
 from interview_analyzer.config_loader import Config
-from interview_analyzer.dashboard import Dashboard, _open_with_os_default
+from interview_analyzer.dashboard import Dashboard, _friendly_error_markdown, _open_with_os_default
 from interview_analyzer.db import InterviewDB
+
+
+class _ImmediateThread:
+    """Stands in for threading.Thread so background work started by the
+    Ollama status/start/stop handlers below runs synchronously and
+    deterministically within the test instead of racing the assertions."""
+
+    def __init__(self, target=None, args=(), kwargs=None, daemon=None):
+        self._target = target
+
+    def start(self):
+        self._target()
 
 
 def _watcher(tmp_path, user_id=1):
@@ -177,3 +189,136 @@ class TestOpenWithOsDefault:
                 assert False, "expected RuntimeError"
             except RuntimeError as e:
                 assert "linux" in str(e)
+
+
+class TestFriendlyErrorMarkdown:
+    """The headline shown for a reprocessing/analysis failure should be
+    something a non-technical user can act on, with the raw exception
+    still available below for anyone who wants the exact error."""
+
+    def test_ollama_not_running_gets_an_actionable_headline(self):
+        exc = RuntimeError(
+            "Ollama isn't running and couldn't be started automatically at "
+            "http://localhost:11434. Install it from https://ollama.com, or start it "
+            "manually, then try again."
+        )
+        md = _friendly_error_markdown("Reprocessing failed", exc)
+        assert md.startswith("# Reprocessing failed")
+        assert "Status" in md and "Start" in md
+        assert "**Technical details:** RuntimeError: Ollama isn't running" in md
+
+    def test_connection_error_gets_an_actionable_headline(self):
+        md = _friendly_error_markdown("Reprocessing failed", ConnectionError("Connection refused"))
+        assert "Couldn't reach the analysis model" in md
+        assert "**Technical details:** ConnectionError: Connection refused" in md
+
+    def test_missing_audio_gets_an_actionable_headline(self):
+        exc = ValueError("No audio was recorded for this interview -- nothing to reprocess.")
+        md = _friendly_error_markdown("Reprocessing failed", exc)
+        assert "nothing to reprocess" in md
+
+    def test_unrecognized_error_gets_a_generic_headline_with_technical_details(self):
+        md = _friendly_error_markdown("Reprocessing failed", KeyError("session_summary"))
+        assert "Something went wrong" in md
+        assert "**Technical details:** KeyError:" in md
+
+
+class TestOllamaStatusRow:
+    """The Status tab's "Local analysis model" row -- see
+    _apply_ollama_status/_on_start_ollama/_on_stop_ollama in dashboard.py.
+    _root is faked with a synchronous .after so the background-thread
+    handlers' UI updates land immediately within the test."""
+
+    def _dashboard(self, tmp_path):
+        dashboard = Dashboard(_watcher(tmp_path))
+        dashboard._root = MagicMock()
+        dashboard._root.after = lambda _ms, cb: cb()
+        dashboard._ollama_status_label = MagicMock()
+        dashboard._ollama_start_btn = MagicMock()
+        dashboard._ollama_stop_btn = MagicMock()
+        return dashboard
+
+    def test_apply_status_running(self, tmp_path):
+        dashboard = self._dashboard(tmp_path)
+        dashboard._apply_ollama_status(True)
+        dashboard._ollama_status_label.config.assert_called_with(text="● Running", foreground="#2f6f5e")
+        dashboard._ollama_start_btn.config.assert_called_with(state="disabled")
+        dashboard._ollama_stop_btn.config.assert_called_with(state="normal")
+
+    def test_apply_status_not_running(self, tmp_path):
+        dashboard = self._dashboard(tmp_path)
+        dashboard._apply_ollama_status(False)
+        dashboard._ollama_status_label.config.assert_called_with(text="● Not running", foreground="#c0392b")
+        dashboard._ollama_start_btn.config.assert_called_with(state="normal")
+        dashboard._ollama_stop_btn.config.assert_called_with(state="disabled")
+
+    def test_apply_status_none_means_not_applicable_for_a_cloud_engine(self, tmp_path):
+        dashboard = self._dashboard(tmp_path)
+        dashboard.watcher.cfg = Config(raw={"analysis": {"engine": "anthropic_api"}})
+        dashboard._apply_ollama_status(None)
+        dashboard._ollama_status_label.config.assert_called_with(
+            text="n/a (using anthropic_api)", foreground="#5b645f"
+        )
+        dashboard._ollama_start_btn.config.assert_called_with(state="disabled")
+        dashboard._ollama_stop_btn.config.assert_called_with(state="disabled")
+
+    def test_start_button_calls_ensure_ollama_running_and_updates_status(self, tmp_path):
+        dashboard = self._dashboard(tmp_path)
+        with patch("interview_analyzer.dashboard.threading.Thread", _ImmediateThread), \
+             patch("interview_analyzer.dashboard.ensure_ollama_running", return_value=True) as mock_ensure:
+            dashboard._on_start_ollama()
+
+        mock_ensure.assert_called_once_with("http://localhost:11434")
+        dashboard._ollama_status_label.config.assert_called_with(text="● Running", foreground="#2f6f5e")
+
+    def test_stop_button_calls_stop_ollama_and_updates_status(self, tmp_path):
+        dashboard = self._dashboard(tmp_path)
+        with patch("interview_analyzer.dashboard.threading.Thread", _ImmediateThread), \
+             patch("interview_analyzer.dashboard.stop_ollama") as mock_stop, \
+             patch("interview_analyzer.dashboard.ollama_is_reachable", return_value=False):
+            dashboard._on_stop_ollama()
+
+        mock_stop.assert_called_once_with("http://localhost:11434")
+        dashboard._ollama_status_label.config.assert_called_with(text="● Not running", foreground="#c0392b")
+
+    def test_wake_ollama_async_is_a_no_op_for_a_cloud_engine(self, tmp_path):
+        dashboard = self._dashboard(tmp_path)
+        dashboard.watcher.cfg = Config(raw={"analysis": {"engine": "openai_api"}})
+        with patch("interview_analyzer.dashboard.threading.Thread", _ImmediateThread), \
+             patch("interview_analyzer.dashboard.ensure_ollama_running") as mock_ensure:
+            dashboard._wake_ollama_async()
+
+        mock_ensure.assert_not_called()
+
+    def test_wake_ollama_async_starts_ollama_for_the_ollama_engine(self, tmp_path):
+        dashboard = self._dashboard(tmp_path)
+        with patch("interview_analyzer.dashboard.threading.Thread", _ImmediateThread), \
+             patch("interview_analyzer.dashboard.ensure_ollama_running", return_value=True) as mock_ensure:
+            dashboard._wake_ollama_async()
+
+        mock_ensure.assert_called_once_with("http://localhost:11434")
+
+
+class TestRefreshButtonsAlsoWakeOllama:
+    """Refresh (History and Trends tabs) should give a stopped local model
+    a head start warming up, not just refresh the displayed data."""
+
+    def test_history_refresh_also_wakes_ollama(self, tmp_path):
+        dashboard = Dashboard(_watcher(tmp_path))
+        dashboard._refresh_history = MagicMock()
+        dashboard._wake_ollama_async = MagicMock()
+
+        dashboard._on_refresh_history()
+
+        dashboard._refresh_history.assert_called_once()
+        dashboard._wake_ollama_async.assert_called_once()
+
+    def test_trends_refresh_also_wakes_ollama(self, tmp_path):
+        dashboard = Dashboard(_watcher(tmp_path))
+        dashboard._refresh_trends = MagicMock()
+        dashboard._wake_ollama_async = MagicMock()
+
+        dashboard._on_refresh_trends()
+
+        dashboard._refresh_trends.assert_called_once()
+        dashboard._wake_ollama_async.assert_called_once()

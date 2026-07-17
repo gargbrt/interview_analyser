@@ -127,6 +127,30 @@ class TestVadAndLanguageSettings:
 
         assert kwargs["language"] == "en"
 
+    def test_initial_prompt_is_passed_through_when_configured(self, tmp_path):
+        cfg = Config(raw={
+            "transcription": {
+                "whisper_model": "tiny", "device": "cpu", "diarization": False,
+                "initial_prompt": "Informal spoken interview, possibly Indian-accented English.",
+            },
+        })
+        fake_info = SimpleNamespace(duration=1.0)
+        with patch("faster_whisper.WhisperModel") as MockModel:
+            MockModel.return_value.transcribe.return_value = (iter([_fake_segment(0, 1, "hi")]), fake_info)
+            transcribe(tmp_path / "call.wav", cfg)
+            _, kwargs = MockModel.return_value.transcribe.call_args
+
+        assert kwargs["initial_prompt"] == "Informal spoken interview, possibly Indian-accented English."
+
+    def test_initial_prompt_defaults_to_none_when_unset(self, tmp_path):
+        fake_info = SimpleNamespace(duration=1.0)
+        with patch("faster_whisper.WhisperModel") as MockModel:
+            MockModel.return_value.transcribe.return_value = (iter([_fake_segment(0, 1, "hi")]), fake_info)
+            transcribe(tmp_path / "call.wav", _config())
+            _, kwargs = MockModel.return_value.transcribe.call_args
+
+        assert kwargs["initial_prompt"] is None
+
     def test_hinglish_language_setting_pins_whisper_to_hindi(self, tmp_path):
         cfg = Config(raw={
             "transcription": {"whisper_model": "tiny", "device": "cpu", "diarization": False, "language": "hinglish"},

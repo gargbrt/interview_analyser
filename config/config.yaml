@@ -125,7 +125,14 @@ audio:
 # --- Transcription ---
 transcription:
   engine: "faster-whisper"  # local, free
-  whisper_model: "small"    # tiny|base|small|medium|large-v3 (bigger = slower, more accurate)
+  # tiny|base|small|medium|large-v3 (bigger = slower, more accurate). Bumped
+  # from "small" -- Whisper's accuracy on accented (e.g. Indian) English
+  # improves noticeably with model size, and "small" was producing visibly
+  # more mis-hearings on accented speech in testing. "medium" is ~2-3x
+  # slower to transcribe on CPU than "small"; drop back down if that's too
+  # slow for your machine, or go to "large-v3" if it's fast enough and you
+  # want to push accuracy further.
+  whisper_model: "medium"
   device: "cpu"             # set to "cuda" if you have a supported GPU
   # Separate speakers (You vs Interviewer) in the transcript. Uses whichever
   # mechanism is actually available for a given recording, automatically:
@@ -149,13 +156,25 @@ transcription:
   vad_filter: true
   # Whisper supports ~99 languages (see docs/language_support.md for the
   # constraints/notes on accuracy per language and on code-switching).
-  #   "auto"      - detect automatically per recording (default)
-  #   "en"        - force English
+  #   "auto"      - detect automatically per recording
+  #   "en"        - force English (default -- see below)
   #   "hi"        - force Hindi (Devanagari script output)
   #   "hinglish"  - Hindi audio with code-switched English, romanized to
   #                 Latin script where possible (needs the optional
   #                 indic-transliteration package -- see docs/language_support.md)
-  language: "auto"
+  # Pinned to "en" rather than "auto": Whisper's language-ID step (what
+  # "auto" relies on) looks only at the first ~30s of audio, and strongly
+  # accented English is a common way for it to misdetect the language
+  # entirely -- once that happens, the whole transcript comes out garbled
+  # or in the wrong language. Forcing "en" skips that guesswork. Switch
+  # back to "auto" if your interviews are regularly in a different language.
+  language: "en"
+  # A short style/context hint passed to Whisper to bias decoding towards
+  # this kind of audio -- helps with accented and informal/disfluent
+  # speech (filler words, casual phrasing) that Whisper otherwise tends to
+  # "clean up" into a different, less accurate sentence. See
+  # docs/language_support.md. Set to "" to disable.
+  initial_prompt: "This is an unscripted, informal spoken interview in English, possibly with an Indian accent. Transcribe exactly what is said, including filler words like um, uh, so, actually, basically, and casual phrasing."
 
 # --- Analysis ---
 # "engine" selects which AnalysisEngine to use (see src/interview_analyzer/engines.py).
