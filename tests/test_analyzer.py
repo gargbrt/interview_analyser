@@ -132,43 +132,45 @@ class TestCloudEngineApiKeyResolution:
     cloud engines need a real API key, resolved from either the environment
     variable (the original mechanism) or a key saved via the Settings tab's
     "Cloud API key" section (api_keys.py), with the env var taking
-    precedence if both are set."""
+    precedence if both are set.
 
-    def test_anthropic_engine_uses_env_var_when_set(self, monkeypatch, tmp_path):
+    api_keys.load_key() itself is mocked directly (rather than exercising
+    its real Windows-DPAPI/macOS-Keychain storage backend, which
+    api_keys_test.py already covers) so these tests only verify engine
+    resolution logic and stay identical regardless of which OS runs them."""
+
+    def test_anthropic_engine_uses_env_var_when_set(self, monkeypatch):
         monkeypatch.setenv("INTERVIEW_ANALYZER_API_KEY", "sk-ant-from-env")
-        with patch.object(api_keys, "_STORE_PATH", tmp_path / ".api_keys.json"):
-            engine = AnthropicEngine({})
+        monkeypatch.setattr(api_keys, "load_key", lambda provider: None)
+        engine = AnthropicEngine({})
         assert engine.api_key == "sk-ant-from-env"
 
-    def test_anthropic_engine_falls_back_to_saved_key(self, monkeypatch, tmp_path):
+    def test_anthropic_engine_falls_back_to_saved_key(self, monkeypatch):
         monkeypatch.delenv("INTERVIEW_ANALYZER_API_KEY", raising=False)
-        with patch.object(api_keys, "_STORE_PATH", tmp_path / ".api_keys.json"):
-            api_keys.save_key("anthropic_api", "sk-ant-saved")
-            engine = AnthropicEngine({})
+        monkeypatch.setattr(api_keys, "load_key", lambda provider: "sk-ant-saved" if provider == "anthropic_api" else None)
+        engine = AnthropicEngine({})
         assert engine.api_key == "sk-ant-saved"
 
-    def test_anthropic_engine_env_var_takes_precedence_over_saved_key(self, monkeypatch, tmp_path):
+    def test_anthropic_engine_env_var_takes_precedence_over_saved_key(self, monkeypatch):
         monkeypatch.setenv("INTERVIEW_ANALYZER_API_KEY", "sk-ant-from-env")
-        with patch.object(api_keys, "_STORE_PATH", tmp_path / ".api_keys.json"):
-            api_keys.save_key("anthropic_api", "sk-ant-saved")
-            engine = AnthropicEngine({})
+        monkeypatch.setattr(api_keys, "load_key", lambda provider: "sk-ant-saved")
+        engine = AnthropicEngine({})
         assert engine.api_key == "sk-ant-from-env"
 
-    def test_anthropic_engine_raises_a_clear_error_with_neither(self, monkeypatch, tmp_path):
+    def test_anthropic_engine_raises_a_clear_error_with_neither(self, monkeypatch):
         monkeypatch.delenv("INTERVIEW_ANALYZER_API_KEY", raising=False)
-        with patch.object(api_keys, "_STORE_PATH", tmp_path / ".api_keys.json"):
-            with pytest.raises(RuntimeError, match="claude.ai subscription"):
-                AnthropicEngine({})
+        monkeypatch.setattr(api_keys, "load_key", lambda provider: None)
+        with pytest.raises(RuntimeError, match="claude.ai subscription"):
+            AnthropicEngine({})
 
-    def test_openai_engine_falls_back_to_saved_key(self, monkeypatch, tmp_path):
+    def test_openai_engine_falls_back_to_saved_key(self, monkeypatch):
         monkeypatch.delenv("INTERVIEW_ANALYZER_API_KEY", raising=False)
-        with patch.object(api_keys, "_STORE_PATH", tmp_path / ".api_keys.json"):
-            api_keys.save_key("openai_api", "sk-openai-saved")
-            engine = OpenAIEngine({})
+        monkeypatch.setattr(api_keys, "load_key", lambda provider: "sk-openai-saved" if provider == "openai_api" else None)
+        engine = OpenAIEngine({})
         assert engine.api_key == "sk-openai-saved"
 
-    def test_openai_engine_raises_a_clear_error_with_neither(self, monkeypatch, tmp_path):
+    def test_openai_engine_raises_a_clear_error_with_neither(self, monkeypatch):
         monkeypatch.delenv("INTERVIEW_ANALYZER_API_KEY", raising=False)
-        with patch.object(api_keys, "_STORE_PATH", tmp_path / ".api_keys.json"):
-            with pytest.raises(RuntimeError, match="ChatGPT subscription"):
-                OpenAIEngine({})
+        monkeypatch.setattr(api_keys, "load_key", lambda provider: None)
+        with pytest.raises(RuntimeError, match="ChatGPT subscription"):
+            OpenAIEngine({})

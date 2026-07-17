@@ -1,12 +1,27 @@
 """Tests for remembered_login.py: the "remember me" storage used by the
-login dialog. The password path uses real Windows DPAPI (via win32crypt)
-when available -- these tests exercise the real round-trip on this machine
-rather than mocking it, since DPAPI is what makes "not plaintext on disk"
-actually true, and that's the property worth verifying."""
+login dialog.
+
+The Windows-path tests below use *real* DPAPI (via win32crypt) rather than
+mocking it, since "not plaintext on disk" is the property worth actually
+verifying -- same approach as test_api_keys.py. They're Windows-only
+(skipped elsewhere): win32crypt doesn't exist on macOS, and more
+importantly, remembered_login.py now dispatches to the *real* macOS
+Keychain whenever sys.platform is actually "darwin" -- running these on
+real macOS CI without pinning the platform would silently exercise (and
+leave entries in) the real Keychain instead of testing DPAPI at all.
+TestMacOsUsesKeychainNotDpapi below covers the macOS path instead,
+platform-independently, via a faked `keyring`.
+
+Tests that never touch a password at all (username-only, corrupted-file
+handling) are platform-agnostic and stay as plain module-level tests.
+"""
 from __future__ import annotations
 
 import json
+import sys
 from unittest.mock import MagicMock, patch
+
+import pytest
 
 from interview_analyzer.config_loader import Config
 from interview_analyzer.remembered_login import forget, load, remember
@@ -29,45 +44,6 @@ def test_remember_and_load_username_only(tmp_path):
     assert result.password is None
 
 
-def test_remember_and_load_username_and_password_round_trips(tmp_path):
-    cfg = _cfg(tmp_path)
-    remember(cfg, "alice", "hunter2")
-
-    result = load(cfg)
-    assert result.username == "alice"
-    assert result.password == "hunter2"
-
-
-def test_password_is_never_stored_in_plaintext_on_disk(tmp_path):
-    cfg = _cfg(tmp_path)
-    remember(cfg, "alice", "hunter2")
-
-    raw = (tmp_path / "data" / ".remembered_login.json").read_text(encoding="utf-8")
-    assert "hunter2" not in raw
-    data = json.loads(raw)
-    assert data["username"] == "alice"
-    assert "password_enc" in data
-    assert data["password_enc"] != "hunter2"
-
-
-def test_remember_overwrites_previous_value(tmp_path):
-    cfg = _cfg(tmp_path)
-    remember(cfg, "alice", "hunter2")
-    remember(cfg, "bob", None)
-
-    result = load(cfg)
-    assert result.username == "bob"
-    assert result.password is None
-
-
-def test_forget_clears_remembered_login(tmp_path):
-    cfg = _cfg(tmp_path)
-    remember(cfg, "alice", "hunter2")
-    forget(cfg)
-
-    assert load(cfg) is None
-
-
 def test_forget_when_nothing_remembered_is_a_no_op(tmp_path):
     forget(_cfg(tmp_path))  # must not raise
 
@@ -79,6 +55,44 @@ def test_load_handles_corrupted_file_gracefully(tmp_path):
     path.write_text("not valid json{{{", encoding="utf-8")
 
     assert load(cfg) is None
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="exercises real Windows DPAPI")
+class TestWindowsDpapiPasswordStorage:
+    def test_remember_and_load_username_and_password_round_trips(self, tmp_path):
+        cfg = _cfg(tmp_path)
+        remember(cfg, "alice", "hunter2")
+
+        result = load(cfg)
+        assert result.username == "alice"
+        assert result.password == "hunter2"
+
+    def test_password_is_never_stored_in_plaintext_on_disk(self, tmp_path):
+        cfg = _cfg(tmp_path)
+        remember(cfg, "alice", "hunter2")
+
+        raw = (tmp_path / "data" / ".remembered_login.json").read_text(encoding="utf-8")
+        assert "hunter2" not in raw
+        data = json.loads(raw)
+        assert data["username"] == "alice"
+        assert "password_enc" in data
+        assert data["password_enc"] != "hunter2"
+
+    def test_remember_overwrites_previous_value(self, tmp_path):
+        cfg = _cfg(tmp_path)
+        remember(cfg, "alice", "hunter2")
+        remember(cfg, "bob", None)
+
+        result = load(cfg)
+        assert result.username == "bob"
+        assert result.password is None
+
+    def test_forget_clears_remembered_login(self, tmp_path):
+        cfg = _cfg(tmp_path)
+        remember(cfg, "alice", "hunter2")
+        forget(cfg)
+
+        assert load(cfg) is None
 
 
 class _FakeKeyring:

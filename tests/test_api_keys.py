@@ -1,13 +1,24 @@
-"""Tests for api_keys.py: local, DPAPI-encrypted storage for cloud
-analysis-engine API keys entered via the Settings tab. Uses real Windows
-DPAPI (via win32crypt) rather than mocking it, since "never plaintext on
-disk" is the property worth actually verifying -- same approach as
-test_remembered_login.py for the password case.
+"""Tests for api_keys.py: local, encrypted storage for cloud analysis-engine
+API keys entered via the Settings tab.
+
+The Windows-path tests below use *real* DPAPI (via win32crypt) rather than
+mocking it, since "never plaintext on disk" is the property worth actually
+verifying -- same approach as test_remembered_login.py for the password
+case. They're Windows-only (skipped elsewhere): win32crypt doesn't exist
+on macOS, and more importantly, api_keys.py now dispatches to the *real*
+macOS Keychain whenever sys.platform is actually "darwin" -- running these
+on real macOS CI without pinning the platform would silently exercise (and
+pollute) the real Keychain instead of the isolated file store these tests
+expect. TestMacOsUsesKeychainNotDpapi below covers the macOS path instead,
+platform-independently, via a faked `keyring`.
 """
 from __future__ import annotations
 
 import json
+import sys
 from unittest.mock import MagicMock, patch
+
+import pytest
 
 from interview_analyzer import api_keys
 
@@ -16,71 +27,66 @@ def _isolated_store(tmp_path):
     return patch.object(api_keys, "_STORE_PATH", tmp_path / ".api_keys.json")
 
 
-def test_no_key_by_default(tmp_path):
-    with _isolated_store(tmp_path):
-        assert api_keys.load_key("anthropic_api") is None
-        assert api_keys.has_key("anthropic_api") is False
+@pytest.mark.skipif(sys.platform != "win32", reason="exercises real Windows DPAPI")
+class TestWindowsDpapiStorage:
+    def test_no_key_by_default(self, tmp_path):
+        with _isolated_store(tmp_path):
+            assert api_keys.load_key("anthropic_api") is None
+            assert api_keys.has_key("anthropic_api") is False
 
+    def test_save_and_load_round_trips(self, tmp_path):
+        with _isolated_store(tmp_path):
+            assert api_keys.save_key("anthropic_api", "sk-ant-abc123") is True
+            assert api_keys.load_key("anthropic_api") == "sk-ant-abc123"
+            assert api_keys.has_key("anthropic_api") is True
 
-def test_save_and_load_round_trips(tmp_path):
-    with _isolated_store(tmp_path):
-        assert api_keys.save_key("anthropic_api", "sk-ant-abc123") is True
-        assert api_keys.load_key("anthropic_api") == "sk-ant-abc123"
-        assert api_keys.has_key("anthropic_api") is True
+    def test_key_is_never_stored_in_plaintext_on_disk(self, tmp_path):
+        store_path = tmp_path / ".api_keys.json"
+        with _isolated_store(tmp_path):
+            api_keys.save_key("anthropic_api", "sk-ant-abc123")
 
+        raw = store_path.read_text(encoding="utf-8")
+        assert "sk-ant-abc123" not in raw
+        data = json.loads(raw)
+        assert data["anthropic_api"] != "sk-ant-abc123"
 
-def test_key_is_never_stored_in_plaintext_on_disk(tmp_path):
-    store_path = tmp_path / ".api_keys.json"
-    with _isolated_store(tmp_path):
-        api_keys.save_key("anthropic_api", "sk-ant-abc123")
+    def test_different_providers_are_independent(self, tmp_path):
+        with _isolated_store(tmp_path):
+            api_keys.save_key("anthropic_api", "sk-ant-abc123")
+            api_keys.save_key("openai_api", "sk-openai-xyz789")
 
-    raw = store_path.read_text(encoding="utf-8")
-    assert "sk-ant-abc123" not in raw
-    data = json.loads(raw)
-    assert data["anthropic_api"] != "sk-ant-abc123"
+            assert api_keys.load_key("anthropic_api") == "sk-ant-abc123"
+            assert api_keys.load_key("openai_api") == "sk-openai-xyz789"
 
+    def test_saving_overwrites_only_its_own_provider(self, tmp_path):
+        with _isolated_store(tmp_path):
+            api_keys.save_key("anthropic_api", "sk-ant-abc123")
+            api_keys.save_key("openai_api", "sk-openai-xyz789")
+            api_keys.save_key("anthropic_api", "sk-ant-new-key")
 
-def test_different_providers_are_independent(tmp_path):
-    with _isolated_store(tmp_path):
-        api_keys.save_key("anthropic_api", "sk-ant-abc123")
-        api_keys.save_key("openai_api", "sk-openai-xyz789")
+            assert api_keys.load_key("anthropic_api") == "sk-ant-new-key"
+            assert api_keys.load_key("openai_api") == "sk-openai-xyz789"
 
-        assert api_keys.load_key("anthropic_api") == "sk-ant-abc123"
-        assert api_keys.load_key("openai_api") == "sk-openai-xyz789"
+    def test_clear_key_removes_only_that_provider(self, tmp_path):
+        with _isolated_store(tmp_path):
+            api_keys.save_key("anthropic_api", "sk-ant-abc123")
+            api_keys.save_key("openai_api", "sk-openai-xyz789")
 
+            api_keys.clear_key("anthropic_api")
 
-def test_saving_overwrites_only_its_own_provider(tmp_path):
-    with _isolated_store(tmp_path):
-        api_keys.save_key("anthropic_api", "sk-ant-abc123")
-        api_keys.save_key("openai_api", "sk-openai-xyz789")
-        api_keys.save_key("anthropic_api", "sk-ant-new-key")
+            assert api_keys.load_key("anthropic_api") is None
+            assert api_keys.load_key("openai_api") == "sk-openai-xyz789"
 
-        assert api_keys.load_key("anthropic_api") == "sk-ant-new-key"
-        assert api_keys.load_key("openai_api") == "sk-openai-xyz789"
+    def test_clear_key_when_nothing_saved_is_a_no_op(self, tmp_path):
+        with _isolated_store(tmp_path):
+            api_keys.clear_key("anthropic_api")  # must not raise
 
-
-def test_clear_key_removes_only_that_provider(tmp_path):
-    with _isolated_store(tmp_path):
-        api_keys.save_key("anthropic_api", "sk-ant-abc123")
-        api_keys.save_key("openai_api", "sk-openai-xyz789")
-
-        api_keys.clear_key("anthropic_api")
-
-        assert api_keys.load_key("anthropic_api") is None
-        assert api_keys.load_key("openai_api") == "sk-openai-xyz789"
-
-
-def test_clear_key_when_nothing_saved_is_a_no_op(tmp_path):
-    with _isolated_store(tmp_path):
-        api_keys.clear_key("anthropic_api")  # must not raise
-
-
-def test_load_handles_corrupted_store_gracefully(tmp_path):
-    store_path = tmp_path / ".api_keys.json"
-    store_path.parent.mkdir(parents=True, exist_ok=True)
-    store_path.write_text("not valid json{{{", encoding="utf-8")
-    with _isolated_store(tmp_path):
-        assert api_keys.load_key("anthropic_api") is None
+    def test_load_handles_corrupted_store_gracefully(self, tmp_path):
+        store_path = tmp_path / ".api_keys.json"
+        store_path.parent.mkdir(parents=True, exist_ok=True)
+        store_path.write_text("not valid json{{{", encoding="utf-8")
+        with _isolated_store(tmp_path):
+            assert api_keys.load_key("anthropic_api") is None
 
 
 class TestMasked:

@@ -100,7 +100,15 @@ def _fake_recorder(mic_available: bool = False, mic_open_fails: bool = False, in
     fake_module.paInt16 = _FakePyAudio.paInt16
     fake_module.paWASAPI = _FakePyAudio.paWASAPI
     with patch("interview_analyzer.recorder.pyaudio", fake_module):
-        yield SystemAudioRecorder(sample_rate=16000, channels=1, include_microphone=include_microphone)
+        # Constructs _WindowsAudioRecorder directly rather than going
+        # through the SystemAudioRecorder() factory -- these tests are
+        # specifically exercising the Windows/pyaudiowpatch-backed
+        # implementation (see module docstring), which must stay testable
+        # regardless of which OS actually runs the suite (CI now also runs
+        # on macos-latest, where the factory would otherwise dispatch to
+        # _MacAudioRecorder instead and these tests would test the wrong
+        # backend entirely).
+        yield _WindowsAudioRecorder(sample_rate=16000, channels=1, include_microphone=include_microphone)
 
 
 def test_handle_frame_writes_when_not_paused(tmp_path):
