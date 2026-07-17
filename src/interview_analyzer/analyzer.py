@@ -183,15 +183,25 @@ class GroqEngine(AnalysisEngine):
     tradeoff versus Ollama isn't cost, it's privacy: your transcript
     leaves your machine and goes to Groq's servers.
 
-    Defaults to openai/gpt-oss-20b rather than a Llama model because Groq's
-    *strict* structured-output mode (which guarantees the response matches
-    RESULT_JSON_SCHEMA exactly, instead of just being valid-JSON-shaped --
-    see rubric.py) is currently only supported on the GPT-OSS models. Even
-    if a user points this at a model that doesn't support strict mode,
+    Defaults to meta-llama/llama-4-scout-17b-16e-instruct rather than a
+    GPT-OSS model. GPT-OSS models are the only ones on Groq that support
+    *strict* structured-output mode (a hard guarantee the response matches
+    RESULT_JSON_SCHEMA exactly, not just "is valid JSON somehow") -- but
+    they're also "reasoning" models that spend real completion tokens
+    thinking before answering, and Groq's free tier caps them at a mere
+    8K tokens/minute (reproduced directly: a real ~25K-character
+    transcript needed ~5700 prompt tokens + ~5300 completion tokens
+    including ~2800 of internal reasoning -- already over budget from one
+    request alone, before any other usage that minute). llama-4-scout gets
+    30K tokens/minute on the free tier and isn't a reasoning model, so it
+    comfortably fits a long transcript in one request; it only gets Groq's
+    "best-effort" schema mode (no hard guarantee), but
     analyze_transcript()'s own shape validation (see
-    _has_the_expected_shape) still catches a malformed response and marks
-    it reprocessable rather than silently shipping a blank report -- same
-    safety net as the Ollama engine.
+    _has_the_expected_shape) already catches a malformed response and
+    marks it reprocessable rather than silently shipping a blank report --
+    the same safety net the Ollama engine relies on, and in practice a
+    better fit for this workload than a stricter guarantee that can't
+    reliably complete a real request.
     """
 
     def __init__(self, acfg: dict):
@@ -203,22 +213,19 @@ class GroqEngine(AnalysisEngine):
                 f"https://console.groq.com/keys, then set it in the Settings tab's "
                 f"\"Cloud API key\" section, or set the {env_var} environment variable."
             )
-        self.model = acfg.get("llm_model", "openai/gpt-oss-20b")
+        self.model = acfg.get("llm_model", "meta-llama/llama-4-scout-17b-16e-instruct")
 
     def run(self, prompt: str, on_progress: Optional[Callable[[float], None]] = None) -> str:
         # No incremental progress signal for this engine -- see AnthropicEngine.run.
         #
-        # max_tokens is set explicitly and generously (default GPT-OSS
-        # models are "reasoning" models -- reproduced directly: a real
-        # long-transcript request spent 2790 tokens on internal reasoning
-        # before writing any answer). Without a high enough budget, the
-        # reasoning phase alone can exhaust Groq's default limit, leaving
-        # nothing for the actual JSON answer -- observed as either an
-        # empty/truncated response that fails strict-schema validation, or
-        # (further truncated) an outright error from Groq. 8000 comfortably
-        # covers reasoning plus a large multi-question rubric response
-        # (verified against a real ~25K-character transcript: 2790
-        # reasoning tokens + a complete 19-question answer, well under budget).
+        # strict=False: see the class docstring -- only GPT-OSS models
+        # support Groq's strict structured-output mode; sending strict=True
+        # to a model that doesn't support it risks an outright API error
+        # rather than a graceful downgrade. max_tokens=8000 is generous
+        # headroom for a large multi-question rubric response (verified
+        # against a real ~25K-character transcript: ~5600 prompt tokens +
+        # under 1000 completion tokens, well under both this budget and
+        # the model's 30K tokens/minute free-tier rate limit).
         resp = requests.post(
             "https://api.groq.com/openai/v1/chat/completions",
             headers={"Authorization": f"Bearer {self.api_key}", "content-type": "application/json"},
@@ -230,13 +237,26 @@ class GroqEngine(AnalysisEngine):
                     "type": "json_schema",
                     "json_schema": {
                         "name": "interview_analysis",
-                        "strict": True,
+                        "strict": False,
                         "schema": RESULT_JSON_SCHEMA,
                     },
                 },
             },
             timeout=600,
         )
+        if resp.status_code == 404:
+            # A real, confusing failure mode: switching analysis.engine to
+            # "groq_api" doesn't reset analysis.llm_model, which is shared
+            # across all four engines -- a model name left over from
+            # Ollama (e.g. "llama3.1:8b") isn't a valid Groq model id, and
+            # Groq's plain 404 for that gives no hint why. Point directly
+            # at the likely cause instead of leaving a bare HTTPError.
+            raise RuntimeError(
+                f"Groq returned \"not found\" for model \"{self.model}\" -- likely not a valid Groq model "
+                f"id (e.g. a name like \"llama3.1:8b\" is Ollama's naming, not Groq's). Set "
+                f"analysis.llm_model to a real Groq model, e.g. \"meta-llama/llama-4-scout-17b-16e-instruct\" "
+                f"(see console.groq.com/docs/models for the full list)."
+            )
         resp.raise_for_status()
         return resp.json()["choices"][0]["message"]["content"]
 

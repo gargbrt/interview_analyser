@@ -227,13 +227,18 @@ analysis:
   #   qwen2.5:14b   - noticeably better reasoning/instruction-following for
   #                   this kind of structured rubric scoring, if your machine
   #                   has ~16GB+ RAM to spare. Recommended if you can run it.
-  #   openai/gpt-oss-20b - default for "groq_api". Groq only guarantees
-  #                   exact schema compliance (see rubric.py) on the
-  #                   GPT-OSS models; other Groq models (e.g.
-  #                   llama-3.1-8b-instant) work too but without that
-  #                   guarantee -- a malformed response still gets caught
-  #                   and made reprocessable rather than silently blank.
-  llm_model: "llama3.1:8b"
+  #   meta-llama/llama-4-scout-17b-16e-instruct - default for "groq_api".
+  #                   30K tokens/minute on Groq's free tier, comfortably
+  #                   fits a long transcript. Groq's GPT-OSS models
+  #                   guarantee exact schema compliance (see rubric.py)
+  #                   but are capped at only 8K tokens/minute free --
+  #                   too tight for a real interview transcript in one
+  #                   request (verified directly: a ~25K-character
+  #                   transcript alone needed more than that). Whichever
+  #                   Groq model you pick, a malformed response still gets
+  #                   caught and made reprocessable rather than silently
+  #                   shipping a blank report.
+  llm_model: "meta-llama/llama-4-scout-17b-16e-instruct"
   ollama_host: "http://localhost:11434"
   # Only used when engine is "groq_api", "anthropic_api", or "openai_api".
   # This must be a real API key -- console.groq.com/keys (free),

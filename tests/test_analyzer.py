@@ -291,14 +291,29 @@ class TestCloudEngineApiKeyResolution:
         with pytest.raises(RuntimeError, match="console.groq.com"):
             GroqEngine({})
 
-    def test_groq_engine_defaults_to_gpt_oss_for_strict_schema_support(self, monkeypatch):
+    def test_groq_engine_defaults_to_llama_4_scout_for_free_tier_rate_limit_headroom(self, monkeypatch):
+        """Regression coverage for a real bug: the previous default,
+        openai/gpt-oss-20b, is capped at 8K tokens/minute on Groq's free
+        tier -- reproduced directly, a single real long-transcript request
+        already needed more than that on its own (reasoning tokens alone
+        ate a big chunk of the budget), failing with a 413 rate-limit
+        error before even accounting for other usage that minute.
+        llama-4-scout gets 30K tokens/minute and isn't a reasoning model,
+        so it comfortably completes the same request."""
         monkeypatch.setenv("INTERVIEW_ANALYZER_API_KEY", "gsk-from-env")
         engine = GroqEngine({})
-        assert engine.model == "openai/gpt-oss-20b"
+        assert engine.model == "meta-llama/llama-4-scout-17b-16e-instruct"
 
 
 class TestGroqEngineRequest:
-    def test_sends_strict_json_schema_matching_the_rubric(self, monkeypatch):
+    def test_sends_the_rubric_json_schema_in_best_effort_mode(self, monkeypatch):
+        """strict=False, not True: strict structured-output mode is only
+        supported on Groq's GPT-OSS models (see the class docstring for
+        why this engine doesn't default to one of those) -- sending
+        strict=True for a model that doesn't support it risks an outright
+        API error rather than a graceful downgrade. The rubric shape is
+        still requested via the schema; analyze_transcript()'s own
+        validation is the actual safety net for a non-compliant response."""
         monkeypatch.setenv("INTERVIEW_ANALYZER_API_KEY", "gsk-from-env")
         engine = GroqEngine({})
         fake_resp = MagicMock()
@@ -310,11 +325,26 @@ class TestGroqEngineRequest:
 
         assert raw == '{"qa_pairs": []}'
         sent = mock_post.call_args.kwargs["json"]
-        assert sent["model"] == "openai/gpt-oss-20b"
+        assert sent["model"] == "meta-llama/llama-4-scout-17b-16e-instruct"
         assert sent["response_format"]["type"] == "json_schema"
-        assert sent["response_format"]["json_schema"]["strict"] is True
+        assert sent["response_format"]["json_schema"]["strict"] is False
         assert sent["response_format"]["json_schema"]["schema"] == RESULT_JSON_SCHEMA
         assert mock_post.call_args.kwargs["headers"]["Authorization"] == "Bearer gsk-from-env"
+
+    def test_a_404_gets_a_clear_hint_about_the_model_name_not_a_bare_httperror(self, monkeypatch):
+        """Regression coverage for a real, confusing failure: switching
+        analysis.engine to "groq_api" doesn't reset analysis.llm_model
+        (shared across all four engines) -- a name left over from Ollama
+        (e.g. "llama3.1:8b") isn't a valid Groq model id, and reproduced
+        directly, Groq's plain 404 for that gave no hint why."""
+        monkeypatch.setenv("INTERVIEW_ANALYZER_API_KEY", "gsk-from-env")
+        engine = GroqEngine({"llm_model": "llama3.1:8b"})
+        fake_resp = MagicMock()
+        fake_resp.status_code = 404
+
+        with patch("interview_analyzer.analyzer.requests.post", return_value=fake_resp):
+            with pytest.raises(RuntimeError, match="llama3.1:8b"):
+                engine.run("prompt")
 
     def test_sets_a_generous_max_tokens_for_the_reasoning_model(self, monkeypatch):
         """Regression coverage for a real bug: GPT-OSS is a reasoning

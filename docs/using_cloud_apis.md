@@ -43,20 +43,24 @@ servers over the internet, rather than never leaving your machine.
   accuracy to the local "medium"/"large-v3" models). Dual-channel speaker
   separation (You/Interviewer) works the same way as the local engine —
   each channel is uploaded separately and merged by timestamp.
-- Analysis defaults to `openai/gpt-oss-20b` rather than a Llama model,
-  because Groq's *strict* structured-output mode (which guarantees the
-  response matches the expected rubric shape exactly) is currently only
-  supported on the GPT-OSS models — this avoids the malformed-response
-  failure mode described below for Ollama. Other Groq models work too, just
-  without that guarantee (a malformed response still gets caught and made
-  reprocessable rather than silently producing a blank report).
+- Analysis defaults to `meta-llama/llama-4-scout-17b-16e-instruct`, which
+  gets 30K tokens/minute on Groq's free tier — comfortably fits a full
+  interview transcript in one request. Groq's GPT-OSS models support
+  *strict* structured-output mode (a hard guarantee the response matches
+  the expected rubric shape exactly, not just "valid JSON somehow"), but
+  they're also capped at only 8K tokens/minute free, which real testing
+  showed isn't enough for a long transcript in one request (a ~25K-character
+  transcript alone needed more than that, before completion tokens). Any
+  Groq model works via `analysis.llm_model`; a malformed response is always
+  caught and made reprocessable rather than silently producing a blank
+  report, regardless of which model or schema-compliance mode it used.
 - Live transcription (`transcription.live_during_recording`) only applies
   to the local engine — Groq's hosted API is already fast enough at the end
   of a call that there's nothing useful for it to save.
-- Free-tier rate limits apply (requests/tokens per day) — see
-  [Groq's docs](https://console.groq.com/docs) for current numbers. If you
-  hit them, analysis/transcription will fail with a clear error from Groq's
-  API rather than silently hanging.
+- Free-tier rate limits apply (tokens/requests per minute, varies by model —
+  see [Groq's docs](https://console.groq.com/docs/rate-limits) for current
+  numbers). If you hit them, analysis/transcription will fail with a clear
+  error from Groq's API rather than silently hanging.
 
 ## Important: a claude.ai subscription is not an API key
 
@@ -97,7 +101,7 @@ tab's Analysis engine dropdown):
 ```yaml
 analysis:
   engine: "anthropic_api"       # or "openai_api", or "groq_api" (free)
-  llm_model: "claude-sonnet-5"  # or "gpt-4o-mini" for openai_api, "openai/gpt-oss-20b" for groq_api
+  llm_model: "claude-sonnet-5"  # or "gpt-4o-mini" for openai_api, "meta-llama/llama-4-scout-17b-16e-instruct" for groq_api
 ```
 
 ## Getting the best free (local) results
