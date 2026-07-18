@@ -12,6 +12,7 @@ tracked independently in `_processing_jobs`.
 """
 from __future__ import annotations
 
+import ctypes
 import datetime as dt
 import logging
 import pathlib
@@ -39,9 +40,19 @@ from .transcriber import TranscriptionCancelled, transcribe
 logger = logging.getLogger(__name__)
 
 try:
+    import win32con  # type: ignore
     import win32gui  # type: ignore
+    import win32process  # type: ignore
 except ImportError:  # pragma: no cover
+    win32con = None
     win32gui = None
+    win32process = None
+
+# DWMWA_CLOAKED: a window can be "cloaked" (hidden from the user by DWM --
+# e.g. it lives on a different virtual desktop, or is a suspended UWP app)
+# while still reporting WS_VISIBLE / IsWindowVisible() == True. Windows only
+# introduced this in Windows 8; the attribute id is a stable constant.
+_DWMWA_CLOAKED = 14
 
 # Quartz (via pyobjc) is macOS-only; imported lazily so this module still
 # imports fine on Windows without it installed.
@@ -115,6 +126,73 @@ def _platform_process_list(watched: dict, base_key: str) -> list[str]:
     return watched.get(base_key, [])
 
 
+def _is_window_cloaked(hwnd: int) -> bool:
+    """True if DWM is hiding this window from the user (e.g. it lives on a
+    different virtual desktop, or is a suspended/minimized-to-tray UWP app)
+    even though IsWindowVisible() still reports it as visible -- a real gap
+    in the Win32 "visible" concept, not a bug in our check."""
+    try:
+        cloaked = ctypes.c_int(0)
+        ctypes.windll.dwmapi.DwmGetWindowAttribute(
+            hwnd, _DWMWA_CLOAKED, ctypes.byref(cloaked), ctypes.sizeof(cloaked)
+        )
+        return bool(cloaked.value)
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def _is_real_app_window(hwnd: int) -> bool:
+    """True if `hwnd` looks like a genuine, user-facing application window
+    rather than a background utility/notification window that merely
+    carries the WS_VISIBLE style bit.
+
+    IsWindowVisible() alone isn't enough: small always-on-top notification
+    / reminder popups (e.g. a conferencing app's "your meeting is starting"
+    reminder, which Windows commonly fires the moment the OS wakes from
+    sleep if a scheduled meeting's start time passed while asleep) are
+    typically built with the WS_EX_TOOLWINDOW extended style specifically
+    so they don't show up in the taskbar/alt-tab list -- that's the same
+    signal used here to tell them apart from a real app window. Cloaked
+    windows (see _is_window_cloaked) are excluded too, since those aren't
+    actually on screen either."""
+    if not win32gui.IsWindowVisible(hwnd):
+        return False
+    ex_style = win32gui.GetWindowLong(hwnd, win32con.GWL_EXSTYLE)
+    if (ex_style & win32con.WS_EX_TOOLWINDOW) and not (ex_style & win32con.WS_EX_APPWINDOW):
+        return False
+    if _is_window_cloaked(hwnd):
+        return False
+    return True
+
+
+def _windows_process_has_a_visible_window(pid: int) -> bool:
+    """True if `pid` currently owns at least one real, user-facing window.
+
+    Distinguishes a real, on-screen instance of a desktop conferencing app
+    (e.g. an active Zoom call) from the same app merely running in the
+    background/system tray, or showing only a notification/reminder popup
+    -- reproduced directly on a real machine: Zoom.exe can sit running for
+    hours with an empty MainWindowTitle and zero visible windows without
+    any call in progress, and process-presence alone was triggering
+    false-positive meeting detection (including right after waking from
+    sleep, when a scheduled meeting's reminder popup fires)."""
+    found = False
+
+    def _cb(hwnd, _):
+        nonlocal found
+        if found or not _is_real_app_window(hwnd):
+            return
+        try:
+            _, window_pid = win32process.GetWindowThreadProcessId(hwnd)
+        except Exception:  # noqa: BLE001
+            return
+        if window_pid == pid:
+            found = True
+
+    win32gui.EnumWindows(_cb, None)
+    return found
+
+
 def detect_active_meeting(cfg: Config) -> Optional[tuple[str, bool]]:
     """Returns (app_name, is_desktop_app) if a meeting appears active, else
     None.
@@ -133,6 +211,16 @@ def detect_active_meeting(cfg: Config) -> Optional[tuple[str, bool]]:
 
     for proc_name in _platform_process_list(watched, "desktop_apps"):
         if proc_name in running:
+            if win32gui is not None and win32process is not None:
+                pids = [
+                    p.info["pid"]
+                    for p in psutil.process_iter(["name", "pid"])
+                    if p.info["name"] == proc_name
+                ]
+                if pids and not any(_windows_process_has_a_visible_window(pid) for pid in pids):
+                    # the app is running but has no visible window anywhere
+                    # (background/tray only) -- not an active call
+                    continue
             return proc_name.replace(".exe", ""), True
 
     browser_running = any(b in running for b in _platform_process_list(watched, "browser_processes"))
