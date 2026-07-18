@@ -5,9 +5,10 @@ the original "Meet - " keyword never matched a real live call. Verified
 against a real Meet window title captured during manual testing."""
 from __future__ import annotations
 
+import sys
 from unittest.mock import MagicMock, patch
 
-import win32con
+import pytest
 
 from interview_analyzer.config_loader import Config
 from interview_analyzer.watcher import (
@@ -15,6 +16,13 @@ from interview_analyzer.watcher import (
     _windows_process_has_a_visible_window,
     detect_active_meeting,
 )
+
+# win32con/win32gui/win32process are Windows-only (see requirements.txt's
+# sys_platform == "win32" pywin32 pin) -- the tests below that touch them
+# directly are skipped on macOS, matching how watcher.py itself falls back
+# to process-presence-only detection there.
+if sys.platform == "win32":
+    import win32con
 
 REAL_MEET_TITLE = "Meet – mtz-ofiz-ukh - Google Chrome"  # captured from an actual live call
 
@@ -121,6 +129,7 @@ def test_browser_running_but_no_matching_tab_title_returns_none():
     assert result is None
 
 
+@pytest.mark.skipif(sys.platform != "win32", reason="exercises win32gui/win32con internals directly")
 class TestIsRealAppWindow:
     """Covers the wake-from-sleep false positive: a conferencing app can own
     a technically-"visible" window that isn't a real, on-screen app window
@@ -164,6 +173,7 @@ class TestIsRealAppWindow:
             assert _is_real_app_window(123) is False
 
 
+@pytest.mark.skipif(sys.platform != "win32", reason="exercises win32gui/win32process internals directly")
 def test_process_owning_only_a_toolwindow_popup_is_not_a_visible_window():
     """End-to-end through _windows_process_has_a_visible_window: a process
     that owns exactly one window, and that window is a reminder-style
