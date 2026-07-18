@@ -70,7 +70,13 @@ def test_plain_meet_homepage_tab_does_not_match():
 
 
 def test_desktop_app_match_returns_is_desktop_app_true():
+    # win32gui/win32process are forced to a non-None sentinel here so this
+    # test deterministically exercises the visible-window-gated branch
+    # regardless of whether pywin32 is actually installed on the machine
+    # running the test (it isn't on macOS).
     with patch("interview_analyzer.watcher.psutil.process_iter", return_value=[_mock_process("Zoom.exe")]), \
+         patch("interview_analyzer.watcher.win32gui", MagicMock()), \
+         patch("interview_analyzer.watcher.win32process", MagicMock()), \
          patch("interview_analyzer.watcher._windows_process_has_a_visible_window", return_value=True):
         result = detect_active_meeting(_cfg())
 
@@ -81,6 +87,8 @@ def test_desktop_app_takes_precedence_over_browser_tab():
     with patch("interview_analyzer.watcher.psutil.process_iter",
                return_value=[_mock_process("Zoom.exe"), _mock_process("chrome.exe")]), \
          patch("interview_analyzer.watcher._enumerate_window_titles", return_value=[REAL_MEET_TITLE]), \
+         patch("interview_analyzer.watcher.win32gui", MagicMock()), \
+         patch("interview_analyzer.watcher.win32process", MagicMock()), \
          patch("interview_analyzer.watcher._windows_process_has_a_visible_window", return_value=True):
         result = detect_active_meeting(_cfg())
 
@@ -93,6 +101,8 @@ def test_desktop_app_running_with_no_visible_window_is_not_treated_as_a_call():
     MainWindowTitle observed directly on a real machine) must not be
     treated as an active call just because the process exists."""
     with patch("interview_analyzer.watcher.psutil.process_iter", return_value=[_mock_process("Zoom.exe")]), \
+         patch("interview_analyzer.watcher.win32gui", MagicMock()), \
+         patch("interview_analyzer.watcher.win32process", MagicMock()), \
          patch("interview_analyzer.watcher._windows_process_has_a_visible_window", return_value=False):
         result = detect_active_meeting(_cfg())
 
