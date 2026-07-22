@@ -10,6 +10,7 @@ from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import numpy as np
+import pytest
 
 from interview_analyzer.config_loader import Config
 from interview_analyzer.transcriber import (
@@ -21,6 +22,7 @@ from interview_analyzer.transcriber import (
     _groq_transcribe_file,
     _looks_like_mic_bleed,
     _transcribe_via_groq,
+    get_audio_duration_seconds,
     load_whisper_model,
     transcribe,
 )
@@ -284,6 +286,33 @@ class TestChannelCount:
 
     def test_returns_one_for_a_missing_file(self, tmp_path):
         assert _channel_count(tmp_path / "does_not_exist.wav") == 1
+
+
+class TestGetAudioDurationSeconds:
+    """get_audio_duration_seconds() is a real (not mocked) probe against an
+    actual file, same spirit as TestChannelCount -- used to back-fill
+    ended_at for an interview whose recording never cleanly finished (see
+    reprocess_interview in watcher.py)."""
+
+    def _write_wav(self, path, seconds: float, framerate: int = 16000):
+        n_frames = int(seconds * framerate)
+        with wave.open(str(path), "wb") as wf:
+            wf.setnchannels(1)
+            wf.setsampwidth(2)
+            wf.setframerate(framerate)
+            wf.writeframes(b"\x00\x00" * n_frames)
+
+    def test_reports_the_real_duration_of_a_wav_file(self, tmp_path):
+        path = tmp_path / "three_seconds.wav"
+        self._write_wav(path, seconds=3.0)
+
+        duration = get_audio_duration_seconds(path)
+
+        assert duration is not None
+        assert duration == pytest.approx(3.0, abs=0.05)
+
+    def test_returns_none_for_a_missing_file(self, tmp_path):
+        assert get_audio_duration_seconds(tmp_path / "does_not_exist.wav") is None
 
 
 class TestDualChannelSpeakerLabeling:

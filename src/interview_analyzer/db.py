@@ -115,11 +115,16 @@ class InterviewDB:
             self._conn.commit()
             return cur.lastrowid
 
-    def end_interview(self, interview_id: int) -> None:
+    def end_interview(self, interview_id: int, ended_at: Optional[str] = None) -> None:
+        """Sets ended_at to `ended_at` if given, else now. The explicit
+        form is used to back-fill an interview whose recording never
+        cleanly finished (see reprocess_interview in watcher.py) with a
+        real timestamp computed from the audio's own duration, rather than
+        the moment the (much later) reprocess happened to run."""
         with self._lock:
             self._conn.execute(
                 "UPDATE interviews SET ended_at = ? WHERE id = ?",
-                (dt.datetime.now().isoformat(), interview_id),
+                (ended_at or dt.datetime.now().isoformat(), interview_id),
             )
             self._conn.commit()
 

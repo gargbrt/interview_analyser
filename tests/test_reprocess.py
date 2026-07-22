@@ -8,9 +8,13 @@ interview rather than blocking the watcher, so more than one can be
 in flight at once."""
 from __future__ import annotations
 
+import datetime as dt
 import pathlib
 import threading
+import wave
 from unittest.mock import patch
+
+import pytest
 
 from interview_analyzer.config_loader import Config
 from interview_analyzer.transcriber import TranscriptionCancelled
@@ -48,6 +52,20 @@ def _seed_interview(watcher, tmp_path, name="orphaned.wav", app="Zoom") -> int:
     iid = watcher.db.start_interview(app, str(audio_path), retention_days=3, user_id=1)
     watcher.db.end_interview(iid)
     return iid
+
+
+def _seed_interview_with_real_audio_and_no_ended_at(watcher, tmp_path, seconds=5.0, name="crashed.wav") -> int:
+    """Simulates a recording that crashed before _stop_and_process's
+    end_interview() call ever ran -- real, decodable audio (needed for
+    get_audio_duration_seconds to probe it) but ended_at left null."""
+    audio_path = tmp_path / "audio" / name
+    audio_path.parent.mkdir(parents=True, exist_ok=True)
+    with wave.open(str(audio_path), "wb") as wf:
+        wf.setnchannels(1)
+        wf.setsampwidth(2)
+        wf.setframerate(16000)
+        wf.writeframes(b"\x00\x00" * int(seconds * 16000))
+    return watcher.db.start_interview("Zoom", str(audio_path), retention_days=3, user_id=1)
 
 
 def test_reprocess_interview_skips_analysis_when_no_speech_detected(tmp_path):
@@ -350,3 +368,42 @@ def test_cancel_processing_returns_false_when_nothing_to_cancel(tmp_path):
     cfg = _test_config(tmp_path)
     watcher = MeetingWatcher(cfg, user_id=1)
     assert watcher.cancel_processing(12345) is False
+
+
+def test_reprocess_interview_backfills_ended_at_from_real_audio_duration(tmp_path):
+    """Regression coverage for a real bug: an interview whose recording
+    crashed before _stop_and_process's end_interview() call ran left
+    ended_at permanently null, so the History tab's Duration column showed
+    blank forever (see dashboard.py's format_duration) -- even after a
+    successful reprocess, since reprocessing alone never sets ended_at.
+    It's now back-filled from the audio file's own real duration."""
+    cfg = _test_config(tmp_path)
+    watcher = MeetingWatcher(cfg, user_id=1)
+    iid = _seed_interview_with_real_audio_and_no_ended_at(watcher, tmp_path, seconds=5.0)
+    assert watcher.db.get(iid).ended_at is None
+
+    with patch("interview_analyzer.watcher.transcribe", return_value="[Interviewer] Hi\n[You] Hello"), \
+         patch("interview_analyzer.watcher.analyze_transcript", return_value=FAKE_ANALYSIS):
+        watcher.reprocess_interview(iid)
+
+    record = watcher.db.get(iid)
+    assert record.ended_at is not None
+    started = dt.datetime.fromisoformat(record.started_at)
+    ended = dt.datetime.fromisoformat(record.ended_at)
+    assert (ended - started).total_seconds() == pytest.approx(5.0, abs=0.5)
+
+
+def test_reprocess_interview_does_not_overwrite_a_real_ended_at(tmp_path):
+    """A normally-ended interview being reprocessed for an unrelated reason
+    (e.g. a bad model config at the time) must not have its real ended_at
+    clobbered by a duration-based guess."""
+    cfg = _test_config(tmp_path)
+    watcher = MeetingWatcher(cfg, user_id=1)
+    iid = _seed_interview(watcher, tmp_path, "normal.wav")
+    original_ended_at = watcher.db.get(iid).ended_at
+
+    with patch("interview_analyzer.watcher.transcribe", return_value="[Interviewer] Hi\n[You] Hello"), \
+         patch("interview_analyzer.watcher.analyze_transcript", return_value=FAKE_ANALYSIS):
+        watcher.reprocess_interview(iid)
+
+    assert watcher.db.get(iid).ended_at == original_ended_at

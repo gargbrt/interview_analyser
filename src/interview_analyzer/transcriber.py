@@ -116,6 +116,27 @@ def _channel_count(audio_path: pathlib.Path) -> int:
         return 1
 
 
+def get_audio_duration_seconds(audio_path: pathlib.Path) -> Optional[float]:
+    """Cheap duration probe (no full audio decode) via PyAV, same approach
+    as _channel_count -- works for whatever format is actually on disk (WAV
+    or the compressed opus). Used to back-fill an interview's ended_at when
+    the original recording never cleanly finished (e.g. a crash) and so
+    never got one set -- see reprocess_interview in watcher.py. Returns
+    None if the file can't be probed for any reason, rather than raising."""
+    import av
+
+    try:
+        with av.open(str(audio_path)) as container:
+            if container.duration is not None:
+                return container.duration / 1_000_000  # AV_TIME_BASE is microseconds
+            stream = container.streams.audio[0]
+            if stream.duration is not None:
+                return float(stream.duration * stream.time_base)
+    except Exception:  # noqa: BLE001
+        pass
+    return None
+
+
 def load_whisper_model(cfg: Config):
     """Loads a WhisperModel per `cfg.transcription`'s settings. Split out
     from transcribe() so a caller that needs to transcribe many separate

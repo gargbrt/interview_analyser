@@ -17,6 +17,20 @@ def test_start_and_end_interview(tmp_path):
     assert record.user_id == 1
 
 
+def test_end_interview_accepts_an_explicit_timestamp(tmp_path):
+    """Used to back-fill ended_at for an interview whose original recording
+    never cleanly finished (see reprocess_interview in watcher.py) with a
+    timestamp computed from the audio's own duration, rather than always
+    stamping "now"."""
+    db = InterviewDB(tmp_path / "test.db")
+    iid = db.start_interview("Zoom", str(tmp_path / "a.wav"), retention_days=3, user_id=1)
+
+    explicit = "2026-07-22T20:45:00"
+    db.end_interview(iid, ended_at=explicit)
+
+    assert db.get(iid).ended_at == explicit
+
+
 def test_user_scoping(tmp_path):
     db = InterviewDB(tmp_path / "test.db")
     db.start_interview("Teams", str(tmp_path / "a.wav"), retention_days=3, user_id=1)

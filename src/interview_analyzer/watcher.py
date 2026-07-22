@@ -35,7 +35,7 @@ from .live_transcribe import LiveTranscriptionWorker
 from .recorder import SystemAudioRecorder
 from .infographic import write_interview_infographic, write_trends_infographic
 from .report import write_interview_report, write_trends_report
-from .transcriber import TranscriptionCancelled, transcribe
+from .transcriber import TranscriptionCancelled, get_audio_duration_seconds, transcribe
 
 logger = logging.getLogger(__name__)
 
@@ -799,6 +799,25 @@ class MeetingWatcher:
                 "Audio file is empty -- the recording was likely interrupted before "
                 "any audio was saved, so there's nothing to transcribe."
             )
+
+        if record.ended_at is None:
+            # The original recording never cleanly finished (e.g. a crash
+            # before _stop_and_process's end_interview() call ran), so the
+            # History/Trends tabs' duration column shows blank ("--", see
+            # dashboard.py's format_duration) and would stay that way
+            # forever -- reprocessing alone never sets ended_at. Back-fill
+            # a real one from the audio file's own actual duration instead.
+            try:
+                duration_seconds = get_audio_duration_seconds(audio_path)
+                started = dt.datetime.fromisoformat(record.started_at)
+                if duration_seconds is not None:
+                    ended_at = (started + dt.timedelta(seconds=duration_seconds)).isoformat()
+                    self.db.end_interview(interview_id, ended_at=ended_at)
+            except Exception:  # noqa: BLE001
+                logger.warning(
+                    "Couldn't back-fill ended_at for interview #%s from its audio duration.",
+                    interview_id, exc_info=True,
+                )
 
         cancel_event = threading.Event()
         with self._processing_lock:
