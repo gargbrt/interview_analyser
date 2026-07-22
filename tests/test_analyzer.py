@@ -2,6 +2,7 @@ import json
 from unittest.mock import MagicMock, patch
 
 import pytest
+import requests
 
 from interview_analyzer import api_keys
 from interview_analyzer.analyzer import AnthropicEngine, GroqEngine, OllamaEngine, OpenAIEngine, analyze_transcript
@@ -291,29 +292,46 @@ class TestCloudEngineApiKeyResolution:
         with pytest.raises(RuntimeError, match="console.groq.com"):
             GroqEngine({})
 
-    def test_groq_engine_defaults_to_llama_4_scout_for_free_tier_rate_limit_headroom(self, monkeypatch):
+    def test_groq_engine_defaults_to_llama_3_3_70b_versatile(self, monkeypatch):
         """Regression coverage for a real bug: the previous default,
-        openai/gpt-oss-20b, is capped at 8K tokens/minute on Groq's free
-        tier -- reproduced directly, a single real long-transcript request
-        already needed more than that on its own (reasoning tokens alone
-        ate a big chunk of the budget), failing with a 413 rate-limit
-        error before even accounting for other usage that minute.
-        llama-4-scout gets 30K tokens/minute and isn't a reasoning model,
-        so it comfortably completes the same request."""
+        meta-llama/llama-4-scout-17b-16e-instruct, was removed from Groq's
+        catalog at some point after it was first chosen -- reproduced
+        directly, Groq now returns a 404 "not found" for it. Verified
+        directly against Groq's own /v1/models listing that
+        llama-3.3-70b-versatile is still available and isn't a reasoning
+        model (unlike GPT-OSS)."""
         monkeypatch.setenv("INTERVIEW_ANALYZER_API_KEY", "gsk-from-env")
         engine = GroqEngine({})
-        assert engine.model == "meta-llama/llama-4-scout-17b-16e-instruct"
+        assert engine.model == "llama-3.3-70b-versatile"
+
+    def test_groq_engine_exposes_a_chunking_budget_for_long_transcripts(self, monkeypatch):
+        """Regression coverage for a real bug: a full ~1-hour interview
+        transcript (~64K characters) needed ~23.7K tokens in one request,
+        over llama-3.3-70b-versatile's entire 12K tokens/minute free-tier
+        budget by itself -- reproduced directly against Groq's real API, a
+        413 no retry could ever fix (that big a request can never fit,
+        regardless of timing). analyze_transcript()'s chunking path (see
+        TestChunkedAnalysis) relies on this attribute existing and being
+        sane."""
+        monkeypatch.setenv("INTERVIEW_ANALYZER_API_KEY", "gsk-from-env")
+        engine = GroqEngine({})
+        assert 0 < engine.max_transcript_chars_per_request <= 12000
+
+    def test_groq_engine_chunking_budget_is_configurable(self, monkeypatch):
+        monkeypatch.setenv("INTERVIEW_ANALYZER_API_KEY", "gsk-from-env")
+        engine = GroqEngine({"groq_chunk_max_chars": 5000})
+        assert engine.max_transcript_chars_per_request == 5000
 
 
 class TestGroqEngineRequest:
-    def test_sends_the_rubric_json_schema_in_best_effort_mode(self, monkeypatch):
-        """strict=False, not True: strict structured-output mode is only
-        supported on Groq's GPT-OSS models (see the class docstring for
-        why this engine doesn't default to one of those) -- sending
-        strict=True for a model that doesn't support it risks an outright
-        API error rather than a graceful downgrade. The rubric shape is
-        still requested via the schema; analyze_transcript()'s own
-        validation is the actual safety net for a non-compliant response."""
+    def test_sends_json_object_response_format(self, monkeypatch):
+        """Not response_format=json_schema: reproduced directly against a
+        real request, Groq now hard-rejects json_schema (400 "This model
+        does not support response format json_schema") for every model
+        except GPT-OSS. json_object mode is broadly supported (verified
+        directly, including against a real transcript); analyze_transcript()'s
+        own shape validation is the actual safety net for a non-compliant
+        response, same as before."""
         monkeypatch.setenv("INTERVIEW_ANALYZER_API_KEY", "gsk-from-env")
         engine = GroqEngine({})
         fake_resp = MagicMock()
@@ -325,10 +343,8 @@ class TestGroqEngineRequest:
 
         assert raw == '{"qa_pairs": []}'
         sent = mock_post.call_args.kwargs["json"]
-        assert sent["model"] == "meta-llama/llama-4-scout-17b-16e-instruct"
-        assert sent["response_format"]["type"] == "json_schema"
-        assert sent["response_format"]["json_schema"]["strict"] is False
-        assert sent["response_format"]["json_schema"]["schema"] == RESULT_JSON_SCHEMA
+        assert sent["model"] == "llama-3.3-70b-versatile"
+        assert sent["response_format"] == {"type": "json_object"}
         assert mock_post.call_args.kwargs["headers"]["Authorization"] == "Bearer gsk-from-env"
 
     def test_a_404_gets_a_clear_hint_about_the_model_name_not_a_bare_httperror(self, monkeypatch):
@@ -346,14 +362,9 @@ class TestGroqEngineRequest:
             with pytest.raises(RuntimeError, match="llama3.1:8b"):
                 engine.run("prompt")
 
-    def test_sets_a_generous_max_tokens_for_the_reasoning_model(self, monkeypatch):
-        """Regression coverage for a real bug: GPT-OSS is a reasoning
-        model that spends real tokens "thinking" before answering
-        (reproduced directly: 2790 reasoning tokens on one real
-        transcript) -- without an explicit, generous max_tokens, the
-        reasoning phase alone could exhaust Groq's default budget, leaving
-        nothing for the actual JSON answer and causing analysis to fail
-        outright on a long transcript."""
+    def test_max_tokens_is_generous_for_a_large_prompt(self, monkeypatch):
+        """A large, un-chunked transcript (many questions -> a long rubric
+        response) still gets a generous ceiling."""
         monkeypatch.setenv("INTERVIEW_ANALYZER_API_KEY", "gsk-from-env")
         engine = GroqEngine({})
         fake_resp = MagicMock()
@@ -361,9 +372,63 @@ class TestGroqEngineRequest:
         fake_resp.raise_for_status.return_value = None
 
         with patch("interview_analyzer.analyzer.requests.post", return_value=fake_resp) as mock_post:
-            engine.run("prompt")
+            engine.run("x" * 30000)
 
-        assert mock_post.call_args.kwargs["json"]["max_tokens"] >= 8000
+        assert mock_post.call_args.kwargs["json"]["max_tokens"] == 8000
+
+    def test_max_tokens_scales_down_for_a_small_chunk(self, monkeypatch):
+        """Regression coverage for a real bug: Groq's admission control
+        reserves the *entire* requested max_tokens against the account's
+        per-minute budget up front -- reproduced directly, a small
+        ~9000-character transcript chunk was rejected with a 429
+        specifically because "Requested" included a full 8000-token
+        reservation on top of its own ~3500 prompt tokens, even though its
+        actual usage afterward was only ~2800 tokens. A small prompt should
+        request a correspondingly small reservation instead of always
+        maxing out at 8000."""
+        monkeypatch.setenv("INTERVIEW_ANALYZER_API_KEY", "gsk-from-env")
+        engine = GroqEngine({})
+        fake_resp = MagicMock()
+        fake_resp.json.return_value = {"choices": [{"message": {"content": "{}"}}]}
+        fake_resp.raise_for_status.return_value = None
+
+        with patch("interview_analyzer.analyzer.requests.post", return_value=fake_resp) as mock_post:
+            engine.run("x" * 300)
+
+        assert 1500 <= mock_post.call_args.kwargs["json"]["max_tokens"] < 8000
+
+    def test_retries_a_429_after_waiting_the_retry_after_header(self, monkeypatch):
+        """Regression coverage for a real bug: firing several chunk
+        requests back to back can trip a *transient* rate limit (recent
+        usage from earlier chunks, not this request alone, pushes the
+        account over budget that minute) -- reproduced directly against
+        Groq's real API, with a real `retry-after` response header. This
+        is recoverable by waiting and retrying, unlike a single request
+        that's permanently too large."""
+        monkeypatch.setenv("INTERVIEW_ANALYZER_API_KEY", "gsk-from-env")
+        engine = GroqEngine({})
+        rate_limited = MagicMock(status_code=429, headers={"retry-after": "2"})
+        success = MagicMock(status_code=200)
+        success.json.return_value = {"choices": [{"message": {"content": '{"qa_pairs": []}'}}]}
+        success.raise_for_status.return_value = None
+
+        with patch("interview_analyzer.analyzer.requests.post", side_effect=[rate_limited, success]), \
+             patch("interview_analyzer.analyzer.time.sleep") as mock_sleep:
+            raw = engine.run("prompt")
+
+        assert raw == '{"qa_pairs": []}'
+        mock_sleep.assert_called_once_with(3.0)
+
+    def test_gives_up_after_repeated_429s(self, monkeypatch):
+        monkeypatch.setenv("INTERVIEW_ANALYZER_API_KEY", "gsk-from-env")
+        engine = GroqEngine({})
+        rate_limited = MagicMock(status_code=429, headers={"retry-after": "1"})
+        rate_limited.raise_for_status.side_effect = requests.exceptions.HTTPError("429")
+
+        with patch("interview_analyzer.analyzer.requests.post", return_value=rate_limited), \
+             patch("interview_analyzer.analyzer.time.sleep"):
+            with pytest.raises(requests.exceptions.HTTPError):
+                engine.run("prompt")
 
     def test_uses_a_custom_model_when_configured(self, monkeypatch):
         monkeypatch.setenv("INTERVIEW_ANALYZER_API_KEY", "gsk-from-env")
@@ -376,3 +441,110 @@ class TestGroqEngineRequest:
             engine.run("prompt")
 
         assert mock_post.call_args.kwargs["json"]["model"] == "llama-3.1-8b-instant"
+
+
+class _FakeChunkedEngine(AnalysisEngine):
+    """Simulates an engine with a small per-request budget, returning one
+    queued response per call so tests can verify chunking actually splits
+    the transcript into multiple requests, and that the merge step
+    combines the per-chunk results correctly."""
+
+    def __init__(self, max_chars, responses):
+        self.max_transcript_chars_per_request = max_chars
+        self._responses = list(responses)
+        self.calls: list[str] = []
+
+    def run(self, prompt: str, on_progress=None) -> str:
+        self.calls.append(prompt)
+        return self._responses.pop(0)
+
+
+class TestChunkedAnalysis:
+    """Regression coverage for a real bug: a full ~1-hour interview
+    transcript needed far more tokens than Groq's free-tier per-minute
+    budget allows in a single request (reproduced directly against a real
+    interview: ~64K characters needed ~23.7K tokens against a 12K/minute
+    cap), causing an unrecoverable 413 rate-limit error. analyze_transcript
+    now splits a transcript that exceeds the engine's declared budget into
+    multiple smaller requests and merges the results, rather than either
+    failing outright or being limited to engines with generous rate
+    limits."""
+
+    def _cfg_for(self, engine, name="fake_chunked") -> Config:
+        register_engine(name, lambda acfg: engine)
+        return Config(raw={"analysis": {"engine": name}})
+
+    def _long_transcript(self, n=20) -> str:
+        return "\n".join(f"[Interviewer] Question {i}?\n[You] Answer number {i}." for i in range(n))
+
+    def test_long_transcript_gets_split_into_multiple_requests(self):
+        good = json.dumps({
+            "qa_pairs": [{"question": "q"}],
+            "session_summary": {"top_strengths": ["Clear"], "top_issues": ["Rambling"],
+                                 "one_thing_to_practice_next": "Practice", "confidence": 80},
+        })
+        engine = _FakeChunkedEngine(max_chars=200, responses=[good] * 20)
+        cfg = self._cfg_for(engine, "fake_chunked_split")
+
+        result = analyze_transcript(self._long_transcript(), cfg)
+
+        assert len(engine.calls) > 1
+        assert result.get("parse_error") is not True
+
+    def test_short_transcript_is_not_chunked(self):
+        engine = _FakeChunkedEngine(
+            max_chars=1_000_000,
+            responses=[json.dumps({
+                "qa_pairs": [], "session_summary": {"top_strengths": [], "top_issues": [],
+                                                     "one_thing_to_practice_next": "", "confidence": 50},
+            })],
+        )
+        cfg = self._cfg_for(engine, "fake_chunked_short")
+
+        result = analyze_transcript("[Interviewer] Hi\n[You] Hello", cfg)
+
+        assert len(engine.calls) == 1
+        assert result["qa_pairs"] == []
+
+    def test_merges_qa_pairs_and_tallies_strengths_and_issues_across_chunks(self):
+        chunk1 = json.dumps({
+            "qa_pairs": [{"question": "q1"}],
+            "session_summary": {"top_strengths": ["Clear communication"], "top_issues": ["Rambling"],
+                                 "one_thing_to_practice_next": "Practice A", "confidence": 60},
+        })
+        chunk2 = json.dumps({
+            "qa_pairs": [{"question": "q2"}],
+            "session_summary": {"top_strengths": ["Clear communication"], "top_issues": ["Vague examples"],
+                                 "one_thing_to_practice_next": "Practice B", "confidence": 80},
+        })
+        engine = _FakeChunkedEngine(max_chars=120, responses=[chunk1, chunk2] * 10)
+        cfg = self._cfg_for(engine, "fake_chunked_merge")
+
+        result = analyze_transcript(self._long_transcript(10), cfg)
+
+        assert len(result["qa_pairs"]) == len(engine.calls)
+        assert "Clear communication" in result["session_summary"]["top_strengths"]
+        assert result["session_summary"]["one_thing_to_practice_next"] in ("Practice A", "Practice B")
+        assert 60 <= result["session_summary"]["confidence"] <= 80
+
+    def test_a_failing_chunk_is_skipped_not_fatal_to_the_whole_interview(self):
+        good = json.dumps({
+            "qa_pairs": [{"question": "q1"}],
+            "session_summary": {"top_strengths": ["Clear"], "top_issues": [],
+                                 "one_thing_to_practice_next": "Practice", "confidence": 70},
+        })
+        engine = _FakeChunkedEngine(max_chars=120, responses=["not json"] + [good] * 20)
+        cfg = self._cfg_for(engine, "fake_chunked_partial_fail")
+
+        result = analyze_transcript(self._long_transcript(10), cfg)
+
+        assert result.get("parse_error") is not True
+        assert len(result["qa_pairs"]) >= 1
+
+    def test_every_chunk_failing_reports_a_parse_error(self):
+        engine = _FakeChunkedEngine(max_chars=120, responses=["not json"] * 20)
+        cfg = self._cfg_for(engine, "fake_chunked_all_fail")
+
+        result = analyze_transcript(self._long_transcript(10), cfg)
+
+        assert result["parse_error"] is True

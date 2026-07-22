@@ -227,24 +227,36 @@ analysis:
   #   qwen2.5:14b   - noticeably better reasoning/instruction-following for
   #                   this kind of structured rubric scoring, if your machine
   #                   has ~16GB+ RAM to spare. Recommended if you can run it.
-  #   meta-llama/llama-4-scout-17b-16e-instruct - default for "groq_api".
-  #                   30K tokens/minute on Groq's free tier, comfortably
-  #                   fits a long transcript. Groq's GPT-OSS models
-  #                   guarantee exact schema compliance (see rubric.py)
-  #                   but are capped at only 8K tokens/minute free --
-  #                   too tight for a real interview transcript in one
-  #                   request (verified directly: a ~25K-character
-  #                   transcript alone needed more than that). Whichever
-  #                   Groq model you pick, a malformed response still gets
-  #                   caught and made reprocessable rather than silently
-  #                   shipping a blank report.
-  llm_model: "meta-llama/llama-4-scout-17b-16e-instruct"
+  #   llama-3.3-70b-versatile - default for "groq_api". Not a "reasoning"
+  #                   model (unlike GPT-OSS, which burns extra tokens
+  #                   thinking before answering), but Groq's free tier caps
+  #                   it at 12K tokens/minute -- not enough for a full ~1
+  #                   hour interview transcript in one request (reproduced
+  #                   directly: ~64K characters needed ~23.7K tokens). For
+  #                   any transcript over ~9K characters, GroqEngine
+  #                   automatically splits it into chunks, analyzes each
+  #                   one, and merges the results (see analyzer.py's
+  #                   analyze_transcript/_analyze_in_chunks) rather than
+  #                   failing outright -- and retries automatically (using
+  #                   Groq's own Retry-After header) if a burst of chunks
+  #                   briefly trips the per-minute limit, so a long
+  #                   interview takes a bit longer but still finishes.
+  #                   (Groq's model catalog changes over time -- our
+  #                   original default, meta-llama/llama-4-scout, was
+  #                   removed from Groq's free tier after this was written;
+  #                   if you get a 404 "not found" error, check
+  #                   console.groq.com/docs/models for the current list.)
+  llm_model: "llama-3.3-70b-versatile"
   ollama_host: "http://localhost:11434"
   # Only used when engine is "groq_api", "anthropic_api", or "openai_api".
   # This must be a real API key -- console.groq.com/keys (free),
   # console.anthropic.com, or platform.openai.com. A claude.ai/ChatGPT
   # subscription does NOT provide API access.
   cloud_api_key_env_var: "INTERVIEW_ANALYZER_API_KEY"
+  # Only used by "groq_api" -- override this if you're on Groq's paid Dev
+  # Tier (much higher tokens/minute) or picked a different free model with
+  # a different budget. See GroqEngine's docstring in analyzer.py.
+  # groq_chunk_max_chars: 9000
 
 # --- Storage ---
 storage:

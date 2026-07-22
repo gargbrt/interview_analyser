@@ -84,6 +84,31 @@ def build_prompt(transcript: str, calibration_notes: str = "") -> str:
     )
 
 
+def split_transcript_for_chunked_analysis(transcript: str, max_chars: int) -> list[str]:
+    """Splits `transcript` into pieces of at most `max_chars`, breaking only
+    between speaker-turn lines (never mid-turn) so no single answer gets cut
+    in half across two chunks. Used by engines with a per-request token
+    budget too small for a full transcript in one call (see GroqEngine's
+    max_transcript_chars_per_request in analyzer.py) -- a long interview
+    (e.g. a full hour) can easily need more input tokens than Groq's
+    free-tier per-minute limit allows in a single request."""
+    lines = transcript.split("\n")
+    chunks: list[str] = []
+    current: list[str] = []
+    current_len = 0
+    for line in lines:
+        line_len = len(line) + 1
+        if current and current_len + line_len > max_chars:
+            chunks.append("\n".join(current))
+            current = []
+            current_len = 0
+        current.append(line)
+        current_len += line_len
+    if current:
+        chunks.append("\n".join(current))
+    return chunks
+
+
 # JSON Schema matching ANALYSIS_PROMPT_TEMPLATE's requested shape exactly,
 # for engines that support constrained/structured output (Ollama's
 # /api/generate `format` field accepts a full JSON Schema, not just the
