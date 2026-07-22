@@ -506,6 +506,64 @@ def test_record_loop_fills_silence_on_mic_channel_if_mic_drops_mid_recording(tmp
     assert list(arr[:, 1]) == [100, 200, 300, 400]
 
 
+class _FakeInfiniteReadableStream:
+    """Unlike _FakeReadableStream (which raises once its finite chunk list
+    is exhausted), yields the same chunk forever -- used to verify that a
+    *normal* stop() (via stop_event, not an exception) does not mark the
+    recording as failed."""
+
+    def __init__(self, chunk: bytes):
+        self._chunk = chunk
+
+    def read(self, n, exception_on_overflow=False):
+        return self._chunk
+
+    def stop_stream(self):
+        pass
+
+    def close(self):
+        pass
+
+
+def test_recording_failed_is_true_after_a_fatal_stream_read_error(tmp_path):
+    """Regression coverage for a real bug: a live ~1-hour recording ended
+    abruptly (the loopback stream's read() started raising -- e.g. a
+    device reset/disconnect, or an unrelated driver crash disrupting the
+    audio session) with no way for the watcher to notice the capture
+    thread had silently died, so the interview sat "recording" forever
+    with no transcript/analysis/report. See watcher.py's _tick, which now
+    polls this flag and finalizes immediately instead."""
+    with _fake_recorder() as rec:
+        out_path = tmp_path / "call.wav"
+        assert rec.recording_failed is False
+
+        rec.start(out_path)
+        assert _wait_until(lambda: rec.recording_failed), "recording_failed was never set"
+        rec.stop()
+
+
+def test_recording_failed_stays_false_after_a_normal_stop(tmp_path):
+    loopback_chunk = np.array([1, 2, 3, 4], dtype=np.int16).tobytes()
+
+    class _ParamFakePyAudio(_FakePyAudio):
+        def open(self, **kwargs):
+            return _FakeInfiniteReadableStream(loopback_chunk)
+
+    fake_module = MagicMock()
+    fake_module.PyAudio = _ParamFakePyAudio
+    fake_module.paInt16 = _FakePyAudio.paInt16
+    fake_module.paWASAPI = _FakePyAudio.paWASAPI
+
+    out_path = tmp_path / "call.wav"
+    with patch("interview_analyzer.recorder.pyaudio", fake_module):
+        rec = _WindowsAudioRecorder(sample_rate=16000, channels=1, include_microphone=False)
+        rec.start(out_path)
+        assert _wait_until(lambda: rec._frames_written > 0), "background thread never wrote a frame"
+        rec.stop()
+
+    assert rec.recording_failed is False
+
+
 # -- SystemAudioRecorder() platform dispatch --------------------------------
 # Windows behavior (the only platform this has ever run on for real, and
 # what every test above exercises via the real pyaudiowpatch-backed class)
@@ -788,3 +846,14 @@ def test_mac_recorder_separates_mic_and_loopback_onto_left_and_right_channels(tm
         arr = np.frombuffer(wf.readframes(wf.getnframes()), dtype=np.int16).reshape(-1, 2)
     assert list(arr[:, 0]) == [10, 20, 30, 40]
     assert list(arr[:, 1]) == [100, 200, 300, 400]
+
+
+def test_mac_recorder_recording_failed_is_true_after_a_fatal_stream_read_error(tmp_path):
+    """See the matching Windows-backend test for the real bug this covers."""
+    with _fake_mac_recorder() as rec:
+        out_path = tmp_path / "call.wav"
+        assert rec.recording_failed is False
+
+        rec.start(out_path)
+        assert _wait_until(lambda: rec.recording_failed), "recording_failed was never set"
+        rec.stop()

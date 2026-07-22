@@ -148,6 +148,7 @@ class _WindowsAudioRecorder:
         # once we know whether a microphone actually opened
         self._output_channels = channels
         self._frames_written = 0  # only counts frames actually written (i.e. not while paused)
+        self._recording_failed = False
 
     def _get_loopback_device(self):
         wasapi_info = self._pa.get_host_api_info_by_type(pyaudio.paWASAPI)
@@ -257,6 +258,12 @@ class _WindowsAudioRecorder:
                 data = self._stream.read(1024, exception_on_overflow=False)
             except Exception as e:  # noqa: BLE001
                 logger.warning("Recording read error: %s", e)
+                # A dead loopback stream is fatal to this recording (unlike
+                # a dropped mic, there's nothing to fall back to) -- flag it
+                # so the watcher notices and finalizes the interview with
+                # whatever was captured so far, instead of it silently
+                # sitting "recording" forever (see recording_failed).
+                self._recording_failed = True
                 break
             loopback_mono = _downmix_to_mono(data, self._actual_channels)
 
@@ -325,6 +332,17 @@ class _WindowsAudioRecorder:
         microphone stream (False before start(), or if none was available/
         openable and it fell back to system-audio-only)."""
         return self._mic_stream is not None
+
+    @property
+    def recording_failed(self) -> bool:
+        """True if the recording loop exited because of a real capture
+        error (e.g. the loopback device was reset, disconnected, or a
+        driver crash disrupted the audio session) rather than a normal
+        stop() call. Callers (see watcher.py's _tick) use this to finalize
+        the interview immediately instead of waiting forever for
+        meeting-absence detection, which might never come if whatever
+        killed the stream didn't also affect the meeting app itself."""
+        return self._recording_failed
 
     def pause(self) -> None:
         """Stop writing captured audio to disk until `resume()` is called.
@@ -416,6 +434,7 @@ class _MacAudioRecorder:
         # once we know whether a microphone actually opened
         self._output_channels = channels
         self._frames_written = 0
+        self._recording_failed = False
 
     def _find_loopback_device(self) -> Optional[dict]:
         for index, device in enumerate(sd.query_devices()):
@@ -528,6 +547,8 @@ class _MacAudioRecorder:
                 data = data.tobytes()
             except Exception as e:  # noqa: BLE001
                 logger.warning("Recording read error: %s", e)
+                # see the matching comment in _WindowsAudioRecorder._record_loop
+                self._recording_failed = True
                 break
             loopback_mono = _downmix_to_mono(data, self._actual_channels)
 
@@ -579,6 +600,11 @@ class _MacAudioRecorder:
     @property
     def is_capturing_microphone(self) -> bool:
         return self._mic_stream is not None
+
+    @property
+    def recording_failed(self) -> bool:
+        """See the matching property on _WindowsAudioRecorder."""
+        return self._recording_failed
 
     def pause(self) -> None:
         if not self._pause_event.is_set():

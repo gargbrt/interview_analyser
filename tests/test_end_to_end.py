@@ -233,6 +233,62 @@ def test_manual_stop_via_control_panel_ends_call_early_and_runs_pipeline(tmp_pat
     assert record.report_path is not None
 
 
+def test_recording_failure_finalizes_the_interview_even_though_the_meeting_is_still_detected(tmp_path):
+    """Regression coverage for a real bug: a live ~1-hour recording ended
+    abruptly (the capture stream started raising errors -- e.g. a device
+    reset/disconnect, or an unrelated driver crash disrupting the audio
+    session) while the meeting app itself kept running, so
+    detect_active_meeting() never went false and the interview sat
+    "recording" forever with no transcript/analysis/report and no way to
+    tell why. The watcher now polls the recorder's own recording_failed
+    flag and finalizes immediately, regardless of whether the meeting
+    still looks active."""
+    cfg = _test_config(tmp_path)
+    watcher = MeetingWatcher(cfg, user_id=1)
+
+    with patch("interview_analyzer.watcher.detect_active_meeting", return_value=("Zoom", True)), \
+         patch("interview_analyzer.watcher.ask_consent", return_value=True), \
+         patch("interview_analyzer.watcher.SystemAudioRecorder") as MockRecorder, \
+         patch("interview_analyzer.watcher.RecordingControlPanel") as MockPanel, \
+         patch("interview_analyzer.watcher.compress_audio") as mock_compress, \
+         patch("interview_analyzer.watcher.transcribe", return_value=FAKE_TRANSCRIPT), \
+         patch("interview_analyzer.watcher.analyze_transcript", return_value=FAKE_ANALYSIS):
+
+        fake_wav = tmp_path / "audio" / "fake.wav"
+        fake_wav.parent.mkdir(parents=True, exist_ok=True)
+        fake_wav.write_bytes(b"RIFF....WAVEfake")
+        MockRecorder.return_value.stop.return_value = fake_wav
+        MockRecorder.return_value.recording_failed = False
+
+        fake_opus = tmp_path / "audio" / "fake.opus"
+        fake_opus.write_bytes(b"fake compressed audio")
+        mock_compress.return_value = fake_opus
+
+        # tick 1: meeting detected -> consent asked -> recording "starts"
+        watcher._tick()
+        assert watcher._current_interview_id is not None
+        interview_id = watcher._current_interview_id
+
+        # the capture stream dies mid-recording -- detect_active_meeting is
+        # still mocked to return a match, simulating that whatever killed
+        # the stream didn't also close the meeting app
+        MockRecorder.return_value.recording_failed = True
+
+        # tick 2: must finalize because of the failure flag, not because
+        # the meeting ended (it's still "detected" as active)
+        watcher._tick()
+        MockPanel.return_value.close.assert_called_once()
+
+        assert _wait_until(lambda: not watcher.status["processing_jobs"]), \
+            "background processing never finished"
+
+    assert watcher._current_interview_id is None
+    record = watcher.db.get(interview_id)
+    assert record.ended_at is not None
+    assert record.transcript == FAKE_TRANSCRIPT
+    assert record.report_path is not None
+
+
 def test_retention_cleanup_deletes_audio_but_keeps_analysis(tmp_path):
     cfg = _test_config(tmp_path)
     db = InterviewDB(tmp_path / "interviews.db")

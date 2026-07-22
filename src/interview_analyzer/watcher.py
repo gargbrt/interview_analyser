@@ -446,6 +446,28 @@ class MeetingWatcher:
         return True
 
     def _tick(self) -> None:
+        if (
+            self._current_interview_id is not None
+            and self._recorder is not None
+            and getattr(self._recorder, "recording_failed", False) is True
+        ):
+            # The capture stream died mid-recording (device reset,
+            # disconnect, a driver crash -- anything that makes
+            # stream.read() start raising) -- reproduced directly: a real
+            # ~1-hour recording ended abruptly this way, but the meeting
+            # app itself kept running, so detect_active_meeting() never
+            # went false and the interview sat "recording" forever with no
+            # transcript/analysis/report and no way to tell why. Finalize
+            # immediately with whatever was actually captured instead of
+            # waiting for meeting-absence detection that might never come.
+            logger.warning(
+                "Recording for interview #%s stopped unexpectedly (a capture error, not a "
+                "normal end of call) -- finalizing what was captured so far.",
+                self._current_interview_id,
+            )
+            self._stop_and_process()
+            return
+
         if self._manual_start_requested is not None:
             app_name = self._manual_start_requested
             self._manual_start_requested = None
