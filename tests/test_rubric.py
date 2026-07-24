@@ -1,9 +1,55 @@
-from interview_analyzer.rubric import build_prompt, split_transcript_for_chunked_analysis
+from interview_analyzer.profiles import CORE_COMPETENCIES, GENERIC_PROFILE, AssessmentProfile
+from interview_analyzer.rubric import (
+    HIRE_RECOMMENDATION_LEVELS,
+    RESULT_JSON_SCHEMA,
+    build_prompt,
+    split_transcript_for_chunked_analysis,
+)
 
 
 def test_prompt_asks_for_a_confidence_field():
     prompt = build_prompt("[Interviewer] Hi\n[You] Hello")
     assert "confidence" in prompt.lower()
+
+
+def test_prompt_defaults_to_the_generic_profiles_full_competency_list():
+    prompt = build_prompt("[Interviewer] Hi\n[You] Hello")
+    for competency in GENERIC_PROFILE.competencies:
+        assert competency in prompt
+
+
+def test_prompt_only_lists_the_selected_subset_of_competencies():
+    """Regression coverage for the "user selects interview areas, output
+    stays consistent with exactly those" requirement: a profile with only
+    2 of the 12 competencies selected must not leak the other 10 into the
+    prompt."""
+    profile = AssessmentProfile(competencies=["Leadership", "Execution"])
+    prompt = build_prompt("[Interviewer] Hi\n[You] Hello", profile=profile)
+
+    assert "Leadership" in prompt
+    assert "Execution" in prompt
+    for competency in CORE_COMPETENCIES:
+        if competency not in ("Leadership", "Execution"):
+            assert competency not in prompt
+
+
+def test_prompt_includes_profile_guidance_text():
+    profile = AssessmentProfile(competencies=CORE_COMPETENCIES, role="Product", seniority="Senior/Lead")
+    prompt = build_prompt("[Interviewer] Hi\n[You] Hello", profile=profile)
+    assert "Product" in prompt
+    assert "Senior/Lead" in prompt
+
+
+def test_prompt_asks_for_hire_recommendation_levels():
+    prompt = build_prompt("[Interviewer] Hi\n[You] Hello")
+    for level in HIRE_RECOMMENDATION_LEVELS:
+        assert level in prompt
+
+
+def test_schema_requires_competency_scores_and_hire_recommendation():
+    session_summary_props = RESULT_JSON_SCHEMA["properties"]["session_summary"]
+    assert "competency_scores" in session_summary_props["required"]
+    assert "hire_recommendation" in session_summary_props["required"]
 
 
 def test_prompt_without_calibration_notes_has_no_notes_section():

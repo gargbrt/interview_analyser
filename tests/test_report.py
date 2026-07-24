@@ -2,7 +2,13 @@ import json
 
 from interview_analyzer.config_loader import Config
 from interview_analyzer.db import InterviewRecord
-from interview_analyzer.report import trends_report_path, write_interview_report, write_trends_report
+from interview_analyzer.profiles import AssessmentProfile
+from interview_analyzer.report import (
+    render_interview_report_markdown,
+    trends_report_path,
+    write_interview_report,
+    write_trends_report,
+)
 
 
 def _config(tmp_path) -> Config:
@@ -282,6 +288,121 @@ def test_write_trends_report_handles_zero_analyzed(tmp_path):
     assert "No analyzed interviews yet." in content
 
 
+def test_write_trends_report_includes_competency_averages_weakest_first(tmp_path):
+    cfg = _config(tmp_path)
+    analysis_a = {
+        "qa_pairs": [],
+        "session_summary": {
+            "top_strengths": [], "top_issues": [], "one_thing_to_practice_next": "",
+            "competency_scores": [
+                {"name": "Leadership", "score": 40, "remark": ""},
+                {"name": "Execution", "score": 90, "remark": ""},
+            ],
+        },
+    }
+    analysis_b = {
+        "qa_pairs": [],
+        "session_summary": {
+            "top_strengths": [], "top_issues": [], "one_thing_to_practice_next": "",
+            "competency_scores": [{"name": "Leadership", "score": 60, "remark": ""}],
+        },
+    }
+    records = [_record(1, "Zoom", analysis_a), _record(2, "Teams", analysis_b)]
+
+    content = write_trends_report(records, cfg).read_text()
+
+    assert "Competency averages" in content
+    leadership_pos = content.index("Leadership")
+    execution_pos = content.index("Execution")
+    assert leadership_pos < execution_pos  # weaker average (50) listed before stronger (90)
+    assert "across 2 interview(s)" in content  # Leadership scored in both
+
+
+class TestInterviewReportProfileFields:
+    """Session-summary additions from the assessment-profile feature:
+    per-competency scores, the hire-scale recommendation, and the
+    selection-probability estimate (see rubric.py/confidence.py)."""
+
+    def _analysis(self, **overrides):
+        base = {
+            "qa_pairs": [],
+            "session_summary": {
+                "top_strengths": [], "top_issues": [], "one_thing_to_practice_next": "",
+                "competency_scores": [{"name": "Leadership", "score": 72, "remark": "Showed clear ownership."}],
+                "hire_recommendation": {"level": "Hire", "rationale": "Strong overall signal."},
+            },
+        }
+        base.update(overrides)
+        return base
+
+    def test_renders_competency_scores_with_remarks(self, tmp_path):
+        record = _record(1, "Zoom", self._analysis())
+        content = write_interview_report(record, _config(tmp_path)).read_text()
+        assert "Leadership" in content
+        assert "72/100" in content
+        assert "Showed clear ownership." in content
+
+    def test_renders_hire_recommendation(self, tmp_path):
+        record = _record(1, "Zoom", self._analysis())
+        content = write_interview_report(record, _config(tmp_path)).read_text()
+        assert "Hire recommendation" in content
+        assert "Strong overall signal." in content
+
+    def test_renders_selection_probability_when_present(self, tmp_path):
+        analysis = self._analysis()
+        analysis["selection_probability"] = {
+            "percent": 68, "label": "Hire", "basis": "Hire-scale call: \"Hire\" (anchors 75%).",
+        }
+        record = _record(1, "Zoom", analysis)
+        content = write_interview_report(record, _config(tmp_path)).read_text()
+        assert "68%" in content
+        assert "Hire-scale call" in content
+
+    def test_omits_selection_probability_section_when_absent(self, tmp_path):
+        record = _record(1, "Zoom", self._analysis())  # no selection_probability key at all
+        content = write_interview_report(record, _config(tmp_path)).read_text()
+        assert "selection probability" not in content.lower()
+
+    def test_renders_binary_recommendation_alongside_the_percentage(self):
+        analysis = self._analysis()
+        analysis["selection_probability"] = {
+            "percent": 68, "label": "Hire", "basis": "...", "binary_recommendation": "Recommended",
+        }
+        record = _record(1, "Zoom", analysis)
+        content = render_interview_report_markdown(record, record.analysis)
+        assert "68%" in content
+        assert "**Recommendation:** Recommended" in content
+
+    def test_renders_competency_weight_label_for_the_given_profile(self, tmp_path):
+        # Entry Level -> Leadership is "minor" per profiles.SENIORITY_EMPHASIS
+        profile = AssessmentProfile(competencies=["Leadership"], seniority="Entry Level")
+        record = _record(1, "Zoom", self._analysis())
+        content = render_interview_report_markdown(record, record.analysis, profile)
+        assert "(minor weight)" in content
+
+    def test_renders_overall_competency_score(self, tmp_path):
+        analysis = self._analysis(session_summary={
+            "top_strengths": [], "top_issues": [], "one_thing_to_practice_next": "",
+            "competency_scores": [
+                {"name": "Leadership", "score": 80, "remark": ""},
+                {"name": "Execution", "score": 40, "remark": ""},
+            ],
+            "hire_recommendation": {"level": "Hire", "rationale": ""},
+        })
+        record = _record(1, "Zoom", analysis)
+        content = write_interview_report(record, _config(tmp_path)).read_text()
+        assert "Overall competency score" in content
+
+    def test_omits_overall_competency_score_when_no_scores(self, tmp_path):
+        analysis = self._analysis(session_summary={
+            "top_strengths": [], "top_issues": [], "one_thing_to_practice_next": "",
+            "hire_recommendation": {"level": "Hire", "rationale": ""},
+        })
+        record = _record(1, "Zoom", analysis)
+        content = write_interview_report(record, _config(tmp_path)).read_text()
+        assert "Overall competency score" not in content
+
+
 class TestTrendsAreScopedPerUser:
     """Regression coverage for a real bug: write_trends_report always
     computed its CONTENT from a user-scoped record list, but wrote it to a
@@ -325,3 +446,47 @@ class TestTrendsAreScopedPerUser:
         cfg = _config(tmp_path)
         path = trends_report_path(cfg, user_id=None)
         assert path.name == "trends.md"
+
+
+class TestRenderInterviewReportMarkdown:
+    """The in-memory (no file written) rendering used to preview a past
+    assessment from db.AnalysisHistoryRecord -- must produce identical
+    content to write_interview_report for the same (record, analysis),
+    since it's the same underlying builder."""
+
+    def test_matches_the_written_report_content(self, tmp_path):
+        analysis = {
+            "qa_pairs": [{"question": "Q1", "answer_summary": "A1", "issues": [], "suggested_improvement": ""}],
+            "session_summary": {"top_strengths": ["Clear"], "top_issues": [], "one_thing_to_practice_next": ""},
+        }
+        record = _record(1, "Zoom", analysis)
+
+        written_content = write_interview_report(record, _config(tmp_path)).read_text(encoding="utf-8")
+        rendered = render_interview_report_markdown(record, analysis)
+
+        assert rendered == written_content
+
+    def test_can_render_a_different_analysis_than_the_records_own(self, tmp_path):
+        """The whole point: render a *historical* analysis, not necessarily
+        record.analysis itself."""
+        record = _record(1, "Zoom", analysis={"qa_pairs": [], "session_summary": {}})
+        different_analysis = {
+            "qa_pairs": [],
+            "session_summary": {
+                "top_strengths": [], "top_issues": [], "one_thing_to_practice_next": "",
+                "hire_recommendation": {"level": "Strong Hire", "rationale": "From a past attempt."},
+            },
+        }
+
+        rendered = render_interview_report_markdown(record, different_analysis)
+
+        assert "Strong Hire" in rendered
+        assert "From a past attempt." in rendered
+
+    def test_writes_nothing_to_disk(self, tmp_path):
+        record = _record(1, "Zoom", analysis={"qa_pairs": [], "session_summary": {}})
+        output_dir = tmp_path / "output"
+
+        render_interview_report_markdown(record, {"qa_pairs": [], "session_summary": {}})
+
+        assert not output_dir.exists()

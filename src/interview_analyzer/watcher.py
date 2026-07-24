@@ -27,11 +27,17 @@ from .analyzer import analyze_transcript
 from .cleanup import run_cleanup
 from .compress import compress_audio
 from .config_loader import Config, load_config
-from .confidence import calibrated_confidence, calibration_notes as build_calibration_notes
+from .confidence import (
+    calibrated_confidence,
+    calibration_notes as build_calibration_notes,
+    estimate_selection_probability,
+)
 from .consent import ask_consent
 from .control_panel import RecordingControlPanel
 from .db import InterviewDB
 from .live_transcribe import LiveTranscriptionWorker
+from .profile_confirm import confirm_profile
+from .profiles import AssessmentProfile, GENERIC_PROFILE
 from .recorder import SystemAudioRecorder
 from .infographic import write_interview_infographic, write_trends_infographic
 from .report import write_interview_report, write_trends_report
@@ -578,7 +584,46 @@ class MeetingWatcher:
         )
         logger.info("Consent given for %s. Recording started (interview #%s).",
                      app_name, self._current_interview_id)
+        # Confirming/adjusting the assessment profile runs on its own
+        # thread rather than blocking here -- the dialog can take a while
+        # to answer (or, per its own fail-safe design, up to its full
+        # timeout), and this method must return quickly so the watcher's
+        # poll loop keeps responding (new meeting detection, manual
+        # stop/pause, absence detection) while it's up. The profile is only
+        # actually needed much later, once the call ends and analysis
+        # starts, so resolving it a little after recording begins is safe.
+        threading.Thread(
+            target=self._confirm_and_save_profile,
+            args=(self._current_interview_id,),
+            daemon=True,
+        ).start()
         self._notify()
+
+    def _get_active_profile(self) -> AssessmentProfile:
+        """The user's saved default assessment profile (see the Settings
+        tab's "Set as active default"), or the generic (all competencies,
+        no context skew) fallback if none is set -- exactly the "no
+        parameters selected -> generic" behavior."""
+        try:
+            active = self.db.get_active_profile_template(user_id=self.user_id)
+        except Exception:  # noqa: BLE001
+            logger.warning("Couldn't read the active assessment profile template; using generic.", exc_info=True)
+            return GENERIC_PROFILE
+        return active.profile if active is not None else GENERIC_PROFILE
+
+    def _confirm_and_save_profile(self, interview_id: int) -> None:
+        try:
+            active_profile = self._get_active_profile()
+            confirmed = confirm_profile(active_profile, ui_root=self._ui_root)
+            self.db.save_profile_snapshot(interview_id, confirmed)
+        except Exception:  # noqa: BLE001
+            # the interview simply keeps no snapshot -- _run_analysis_pipeline
+            # already falls back to GENERIC_PROFILE for that case, same as
+            # for any interview recorded before this feature existed
+            logger.warning(
+                "Couldn't confirm/save an assessment profile for interview #%s; it will "
+                "fall back to the generic profile.", interview_id, exc_info=True,
+            )
 
     def _stop_and_process(self) -> None:
         """Ends the current recording and hands it off to a background
@@ -707,10 +752,22 @@ class MeetingWatcher:
         whole point of live transcription: most of the wait is already
         done by the time the call ends. None falls back to transcribing
         normally, same as before this feature existed (including whenever
-        live transcription was disabled, failed, or timed out)."""
+        live transcription was disabled, failed, or timed out) -- UNLESS
+        this interview already has a real, saved transcript (e.g.
+        reprocessing purely to redo the assessment under a different
+        profile, see reprocess_interview), in which case that's reused
+        as-is: re-transcribing identical audio would just reproduce the
+        same text at real cost (time, and for a cloud engine, real API
+        usage) for no benefit."""
+        existing_record = self.db.get(interview_id)
+        existing_transcript = existing_record.transcript if existing_record else None
+
         if precomputed_transcript is not None:
             self._set_job(interview_id, "transcribing", progress=1.0, source_app=source_app)
             transcript = precomputed_transcript
+        elif existing_transcript and existing_transcript.strip():
+            self._set_job(interview_id, "transcribing", progress=1.0, source_app=source_app)
+            transcript = existing_transcript
         else:
             self._set_job(interview_id, "transcribing", progress=None, source_app=source_app)
 
@@ -758,15 +815,37 @@ class MeetingWatcher:
             last_analyze_notified_at = now
             self._set_job(interview_id, "analyzing", progress=fraction)
 
+        # whatever profile is currently attached to this interview (set at
+        # recording time by _confirm_and_save_profile, or by
+        # reprocess_interview if a different one was chosen for this
+        # reprocess) -- falls back to generic for an interview recorded
+        # before this feature existed, or if confirming/saving one failed.
+        # existing_record was already fetched above, before transcription --
+        # a profile change from reprocess_interview's override is saved
+        # before _run_analysis_pipeline is called, so this stale read (from
+        # before analysis, not after) still reflects it correctly.
+        profile = (existing_record.profile if existing_record else None) or GENERIC_PROFILE
+
         notes = build_calibration_notes(self.db, self.user_id)
         analysis = analyze_transcript(
-            transcript, self.cfg, on_progress=_on_analyze_progress, calibration_notes=notes
+            transcript, self.cfg, on_progress=_on_analyze_progress, profile=profile, calibration_notes=notes
         )
-        model_reported_confidence = None
-        if isinstance(analysis.get("session_summary"), dict):
-            model_reported_confidence = analysis["session_summary"].get("confidence")
+        session_summary = analysis.get("session_summary")
+        model_reported_confidence = session_summary.get("confidence") if isinstance(session_summary, dict) else None
         analysis["confidence_info"] = calibrated_confidence(self.db, self.user_id, model_reported_confidence)
+        if isinstance(session_summary, dict):
+            analysis["selection_probability"] = estimate_selection_probability(
+                session_summary.get("hire_recommendation"),
+                session_summary.get("competency_scores"),
+                profile=profile,
+                confidence_info=analysis["confidence_info"],
+            )
         self.db.save_analysis(interview_id, analysis)
+        # keeps a snapshot of every completed analysis attempt (the first
+        # run and every reprocess), not just the latest one -- so redoing
+        # the assessment under a different profile never silently discards
+        # a previous take. See dashboard.py's "Previous assessments" section.
+        self.db.append_analysis_history(interview_id, analysis, profile)
 
         self._set_job(interview_id, "generating_report")
         record = self.db.get(interview_id)
@@ -794,7 +873,7 @@ class MeetingWatcher:
         except Exception:  # noqa: BLE001
             logger.warning("Couldn't generate the trends infographic.", exc_info=True)
 
-    def reprocess_interview(self, interview_id: int) -> None:
+    def reprocess_interview(self, interview_id: int, profile: Optional[AssessmentProfile] = None) -> None:
         """Re-run transcribe/analyze/report for an interview that has audio
         on disk but never finished processing -- e.g. a crash mid-pipeline,
         a missing dependency, or Ollama being unreachable at the time.
@@ -802,7 +881,13 @@ class MeetingWatcher:
         a while); call it from a background thread, not the UI thread. Runs
         fine alongside a live recording or other interviews' background
         processing -- only reprocessing the *same* interview twice at once
-        is rejected."""
+        is rejected.
+
+        If `profile` is given, it replaces this interview's stored
+        assessment profile (see profiles.py) before reprocessing -- lets the
+        user redo an analysis under different role/seniority/industry/
+        competency settings. Omit it to reprocess against whatever profile
+        (or lack of one) is already attached to this interview."""
         if self._current_interview_id == interview_id:
             raise RuntimeError("This interview is still being recorded.")
         with self._processing_lock:
@@ -840,6 +925,9 @@ class MeetingWatcher:
                     "Couldn't back-fill ended_at for interview #%s from its audio duration.",
                     interview_id, exc_info=True,
                 )
+
+        if profile is not None:
+            self.db.save_profile_snapshot(interview_id, profile)
 
         cancel_event = threading.Event()
         with self._processing_lock:

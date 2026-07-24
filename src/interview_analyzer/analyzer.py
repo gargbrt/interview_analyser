@@ -31,6 +31,7 @@ from . import api_keys
 from .config_loader import Config
 from .engines import AnalysisEngine, get_engine, register_engine
 from .model_setup import ensure_ollama_running
+from .profiles import AssessmentProfile, GENERIC_PROFILE
 from .report import _stringify
 from .rubric import RESULT_JSON_SCHEMA, build_prompt, split_transcript_for_chunked_analysis
 
@@ -343,6 +344,44 @@ def _parse_and_validate(raw: str, context: str = "") -> Optional[dict]:
     return parsed
 
 
+def _merge_competency_scores(parsed_chunks: list[dict]) -> list[dict]:
+    """Averages each competency's score (by name) across every chunk that
+    reported it, and joins each chunk's remark into one combined note --
+    one entry per competency actually seen, in first-seen order (matches
+    the profile's own competency order, since every chunk was asked to
+    score the same fixed list -- see rubric.py's build_prompt)."""
+    scores_by_name: dict[str, list[int]] = {}
+    remarks_by_name: dict[str, list[str]] = {}
+    order: list[str] = []
+
+    for parsed in parsed_chunks:
+        for entry in (parsed.get("session_summary") or {}).get("competency_scores") or []:
+            if not isinstance(entry, dict):
+                continue
+            name = _stringify(entry.get("name", ""))
+            if not name:
+                continue
+            if name not in scores_by_name:
+                order.append(name)
+                scores_by_name[name] = []
+                remarks_by_name[name] = []
+            score = entry.get("score")
+            if isinstance(score, (int, float)) and not isinstance(score, bool):
+                scores_by_name[name].append(score)
+            remark = entry.get("remark")
+            if remark:
+                remarks_by_name[name].append(_stringify(remark))
+
+    return [
+        {
+            "name": name,
+            "score": round(sum(scores_by_name[name]) / len(scores_by_name[name])) if scores_by_name[name] else 0,
+            "remark": " ".join(remarks_by_name[name]),
+        }
+        for name in order
+    ]
+
+
 def _merge_chunk_analyses(parsed_chunks: list[dict]) -> dict:
     """Combines each transcript chunk's own qa_pairs/session_summary into a
     single result with the same shape a normal (unchunked) analysis
@@ -353,6 +392,7 @@ def _merge_chunk_analyses(parsed_chunks: list[dict]) -> dict:
     issues_counter: Counter = Counter()
     practice_candidates: list[str] = []
     confidences: list[float] = []
+    hire_recommendations: list[dict] = []
 
     for parsed in parsed_chunks:
         all_qa_pairs.extend(parsed.get("qa_pairs") or [])
@@ -367,6 +407,9 @@ def _merge_chunk_analyses(parsed_chunks: list[dict]) -> dict:
         confidence = summary.get("confidence")
         if isinstance(confidence, (int, float)) and not isinstance(confidence, bool):
             confidences.append(confidence)
+        hire_recommendation = summary.get("hire_recommendation")
+        if isinstance(hire_recommendation, dict):
+            hire_recommendations.append(hire_recommendation)
 
     return {
         "qa_pairs": all_qa_pairs,
@@ -380,6 +423,11 @@ def _merge_chunk_analyses(parsed_chunks: list[dict]) -> dict:
             # already reflects that chunk's own transcript quality, so the
             # mean is the fairest estimate for the whole interview
             "confidence": round(sum(confidences) / len(confidences)) if confidences else 0,
+            "competency_scores": _merge_competency_scores(parsed_chunks),
+            # same "last chunk wins" reasoning as one_thing_to_practice_next
+            # -- the final chunk had the most complete view of the
+            # conversation's arc when it made its hire-recommendation call
+            "hire_recommendation": hire_recommendations[-1] if hire_recommendations else {"level": "", "rationale": ""},
         },
     }
 
@@ -389,6 +437,7 @@ def _analyze_in_chunks(
     engine: AnalysisEngine,
     max_chars: int,
     on_progress: Optional[Callable[[float], None]],
+    profile: AssessmentProfile,
     calibration_notes: str,
 ) -> dict:
     chunks = split_transcript_for_chunked_analysis(transcript, max_chars)
@@ -398,7 +447,7 @@ def _analyze_in_chunks(
         # no pre-emptive pacing here -- GroqEngine.run() itself retries a
         # transient rate limit using Groq's own Retry-After header, which
         # adapts to real account usage rather than guessing a fixed delay
-        raw = _run_engine(engine, build_prompt(chunk, calibration_notes=calibration_notes), None)
+        raw = _run_engine(engine, build_prompt(chunk, profile=profile, calibration_notes=calibration_notes), None)
         parsed = _parse_and_validate(raw, context=f" for chunk {i + 1}/{len(chunks)}")
         if parsed is not None:
             parsed_chunks.append(parsed)
@@ -415,6 +464,7 @@ def analyze_transcript(
     transcript: str,
     cfg: Config,
     on_progress: Optional[Callable[[float], None]] = None,
+    profile: AssessmentProfile = GENERIC_PROFILE,
     calibration_notes: str = "",
 ) -> dict:
     acfg = cfg.analysis
@@ -423,9 +473,9 @@ def analyze_transcript(
 
     max_chars = getattr(engine, "max_transcript_chars_per_request", None)
     if max_chars and len(transcript) > max_chars:
-        return _analyze_in_chunks(transcript, engine, max_chars, on_progress, calibration_notes)
+        return _analyze_in_chunks(transcript, engine, max_chars, on_progress, profile, calibration_notes)
 
-    raw = _run_engine(engine, build_prompt(transcript, calibration_notes=calibration_notes), on_progress)
+    raw = _run_engine(engine, build_prompt(transcript, profile=profile, calibration_notes=calibration_notes), on_progress)
     parsed = _parse_and_validate(raw)
     if parsed is None:
         return {"raw": raw, "parse_error": True}

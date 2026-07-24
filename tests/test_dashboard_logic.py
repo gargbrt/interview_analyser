@@ -17,8 +17,10 @@ from interview_analyzer.dashboard import (
     _open_with_os_default,
     _parse_transcript_lines,
     _speaker_color,
+    can_reprocess,
 )
 from interview_analyzer.db import InterviewDB
+from interview_analyzer.profiles import CORE_COMPETENCIES, AssessmentProfile
 
 VALID_ANALYSIS = {
     "qa_pairs": [],
@@ -483,7 +485,7 @@ class TestViewInfographicButton:
         dashboard._history_tree = MagicMock()
         dashboard._history_tree.selection.return_value = [str(iid)]
         for attr in (
-            "_reprocess_btn", "_open_audio_btn", "_view_transcript_btn",
+            "_reprocess_btn", "_reprocess_with_profile_btn", "_open_audio_btn", "_view_transcript_btn",
             "_view_infographic_btn", "_delete_btn", "_cancel_btn",
         ):
             setattr(dashboard, attr, MagicMock())
@@ -531,3 +533,320 @@ class TestViewInfographicButton:
             dashboard._on_view_infographic()
 
         mock_open.assert_not_called()
+
+
+class TestAssessmentProfileSettings:
+    """The Settings tab's "Assessment profile" section (profiles.py's
+    role/seniority/industry/company + competency selection, saved as named
+    templates under this logged-in user). Widgets are mocked directly
+    (same philosophy as this file's other tests -- see its docstring)
+    rather than building the real Tk form."""
+
+    def _dashboard_with_profile_widgets(
+        self, tmp_path, role="(not specified)", seniority="(not specified)",
+        industry="(not specified)", company="(not specified)", selected_competencies=None,
+    ):
+        watcher = _watcher(tmp_path)
+        dashboard = Dashboard(watcher)
+        dashboard._profile_role_var = MagicMock(get=MagicMock(return_value=role))
+        dashboard._profile_seniority_var = MagicMock(get=MagicMock(return_value=seniority))
+        dashboard._profile_industry_var = MagicMock(get=MagicMock(return_value=industry))
+        dashboard._profile_company_var = MagicMock(get=MagicMock(return_value=company))
+        selected = set(selected_competencies or [])
+        dashboard._profile_competency_vars = {
+            c: MagicMock(get=MagicMock(return_value=c in selected)) for c in CORE_COMPETENCIES
+        }
+        dashboard._profile_template_name_entry = MagicMock()
+        dashboard._profile_template_picker = MagicMock()
+        dashboard._profile_status_label = MagicMock()
+        return dashboard
+
+    def test_profile_from_settings_widgets_converts_not_specified_to_none(self, tmp_path):
+        dashboard = self._dashboard_with_profile_widgets(tmp_path)
+        profile = dashboard._profile_from_settings_widgets()
+        assert profile.role is None
+        assert profile.seniority is None
+        assert profile.industry is None
+        assert profile.company_type is None
+
+    def test_profile_from_settings_widgets_reads_real_selections(self, tmp_path):
+        dashboard = self._dashboard_with_profile_widgets(
+            tmp_path, role="Product", seniority="Senior/Lead", industry="FinTech", company="FAANG / Big Tech",
+            selected_competencies=["Leadership", "Execution"],
+        )
+        profile = dashboard._profile_from_settings_widgets()
+        assert profile.role == "Product"
+        assert profile.seniority == "Senior/Lead"
+        assert profile.industry == "FinTech"
+        assert profile.company_type == "FAANG / Big Tech"
+        assert set(profile.competencies) == {"Leadership", "Execution"}
+
+    def test_profile_from_settings_widgets_falls_back_to_all_competencies_when_none_checked(self, tmp_path):
+        dashboard = self._dashboard_with_profile_widgets(tmp_path, selected_competencies=[])
+        profile = dashboard._profile_from_settings_widgets()
+        assert profile.competencies == CORE_COMPETENCIES
+
+    def test_apply_profile_to_settings_widgets_sets_every_var(self, tmp_path):
+        dashboard = self._dashboard_with_profile_widgets(tmp_path)
+        profile = AssessmentProfile(competencies=["Leadership"], role="Sales", seniority="Entry Level")
+
+        dashboard._apply_profile_to_settings_widgets(profile)
+
+        dashboard._profile_role_var.set.assert_called_with("Sales")
+        dashboard._profile_seniority_var.set.assert_called_with("Entry Level")
+        dashboard._profile_industry_var.set.assert_called_with("(not specified)")
+        dashboard._profile_competency_vars["Leadership"].set.assert_called_with(True)
+        dashboard._profile_competency_vars["Execution"].set.assert_called_with(False)
+
+    def test_save_profile_template_creates_it_from_current_widget_state(self, tmp_path):
+        dashboard = self._dashboard_with_profile_widgets(tmp_path, role="Data", selected_competencies=["Execution"])
+        dashboard._profile_template_name_entry.get.return_value = "My Template"
+
+        dashboard._on_save_profile_template()
+
+        templates = dashboard.watcher.db.list_profile_templates(user_id=1)
+        assert len(templates) == 1
+        assert templates[0].name == "My Template"
+        assert templates[0].profile.role == "Data"
+
+    def test_save_profile_template_with_a_blank_name_does_not_save(self, tmp_path):
+        dashboard = self._dashboard_with_profile_widgets(tmp_path)
+        dashboard._profile_template_name_entry.get.return_value = "   "
+
+        dashboard._on_save_profile_template()
+
+        assert dashboard.watcher.db.list_profile_templates(user_id=1) == []
+        dashboard._profile_status_label.config.assert_called()
+
+    def test_load_profile_template_applies_it_to_the_widgets(self, tmp_path):
+        dashboard = self._dashboard_with_profile_widgets(tmp_path)
+        dashboard.watcher.db.create_profile_template(
+            user_id=1, name="My Template", profile=AssessmentProfile(role="Consultant"),
+        )
+        dashboard._profile_template_picker.get.return_value = "My Template"
+
+        dashboard._on_load_profile_template()
+
+        dashboard._profile_role_var.set.assert_called_with("Consultant")
+
+    def test_set_active_profile_template_marks_it_active(self, tmp_path):
+        dashboard = self._dashboard_with_profile_widgets(tmp_path)
+        dashboard.watcher.db.create_profile_template(
+            user_id=1, name="My Template", profile=AssessmentProfile(),
+        )
+        dashboard._profile_template_picker.get.return_value = "My Template"
+
+        dashboard._on_set_active_profile_template()
+
+        active = dashboard.watcher.db.get_active_profile_template(user_id=1)
+        assert active is not None
+        assert active.name == "My Template"
+
+    def test_delete_profile_template_removes_it(self, tmp_path):
+        dashboard = self._dashboard_with_profile_widgets(tmp_path)
+        dashboard.watcher.db.create_profile_template(
+            user_id=1, name="My Template", profile=AssessmentProfile(),
+        )
+        dashboard._profile_template_picker.get.return_value = "My Template"
+
+        dashboard._on_delete_profile_template()
+
+        assert dashboard.watcher.db.list_profile_templates(user_id=1) == []
+
+
+class TestReprocessWithDifferentProfile:
+    def _dashboard_with_selected_interview(self, tmp_path):
+        watcher = _watcher(tmp_path)
+        audio_path = tmp_path / "a.wav"
+        audio_path.write_bytes(b"RIFF....WAVEreal audio bytes")  # can_reprocess needs real, non-empty audio
+        iid = watcher.db.start_interview("Zoom", str(audio_path), retention_days=3, user_id=1)
+        watcher.db.end_interview(iid)
+        watcher.status = {"processing_jobs": {}}
+
+        dashboard = Dashboard(watcher)
+        dashboard._history_tree = MagicMock()
+        dashboard._history_tree.selection.return_value = [str(iid)]
+        for attr in (
+            "_reprocess_btn", "_reprocess_with_profile_btn", "_open_audio_btn",
+            "_view_transcript_btn", "_view_infographic_btn", "_delete_btn", "_cancel_btn",
+        ):
+            setattr(dashboard, attr, MagicMock())
+        return dashboard, iid
+
+    def test_shows_the_confirm_dialog_prefilled_from_the_current_profile_then_reprocesses(self, tmp_path):
+        dashboard, iid = self._dashboard_with_selected_interview(tmp_path)
+        existing = AssessmentProfile(role="Sales")
+        dashboard.watcher.db.save_profile_snapshot(iid, existing)
+        chosen = AssessmentProfile(competencies=["Execution"], role="Data")
+
+        with patch("interview_analyzer.dashboard.threading.Thread", _ImmediateThread), \
+             patch("interview_analyzer.dashboard.confirm_profile", return_value=chosen) as mock_confirm:
+            dashboard._on_reprocess_with_profile()
+
+        mock_confirm.assert_called_once()
+        assert mock_confirm.call_args.args[0] == existing
+        dashboard.watcher.reprocess_interview.assert_called_once_with(iid, profile=chosen)
+
+    def test_intro_text_says_current_analysis_when_a_profile_is_saved(self, tmp_path):
+        dashboard, iid = self._dashboard_with_selected_interview(tmp_path)
+        dashboard.watcher.db.save_profile_snapshot(iid, AssessmentProfile(role="Sales"))
+
+        with patch("interview_analyzer.dashboard.threading.Thread", _ImmediateThread), \
+             patch("interview_analyzer.dashboard.confirm_profile", return_value=AssessmentProfile()) as mock_confirm:
+            dashboard._on_reprocess_with_profile()
+
+        assert "current analysis was run with" in mock_confirm.call_args.kwargs["intro_text"]
+
+    def test_intro_text_says_no_saved_profile_when_none_exists(self, tmp_path):
+        dashboard, iid = self._dashboard_with_selected_interview(tmp_path)
+        # no save_profile_snapshot call -- interview predates the feature
+
+        with patch("interview_analyzer.dashboard.threading.Thread", _ImmediateThread), \
+             patch("interview_analyzer.dashboard.confirm_profile", return_value=AssessmentProfile()) as mock_confirm:
+            dashboard._on_reprocess_with_profile()
+
+        assert "no saved profile yet" in mock_confirm.call_args.kwargs["intro_text"]
+
+    def test_no_op_when_nothing_selected(self, tmp_path):
+        watcher = _watcher(tmp_path)
+        watcher.status = {"processing_jobs": {}}
+        dashboard = Dashboard(watcher)
+        dashboard._history_tree = MagicMock()
+        dashboard._history_tree.selection.return_value = []
+
+        dashboard._on_reprocess_with_profile()  # must not raise
+
+        dashboard.watcher.reprocess_interview.assert_not_called()
+
+    def test_available_even_when_a_usable_report_already_exists(self, tmp_path):
+        """Regression coverage for a real gap: plain Reprocess hides itself
+        once a usable report exists (can_reprocess -- it only exists to
+        recover a *missing* report), but redoing the analysis under
+        different profile settings is a deliberate choice the user can make
+        on an already-successful interview too, so it must not share that
+        same gating."""
+        dashboard, iid = self._dashboard_with_selected_interview(tmp_path)
+        report_path = tmp_path / "report.md"
+        report_path.write_text("# Report", encoding="utf-8")
+        dashboard.watcher.db.save_report_path(iid, str(report_path))
+        record = dashboard.watcher.db.get(iid)
+        assert can_reprocess(record) is False  # sanity check: plain Reprocess would be hidden
+
+        dashboard._update_action_buttons()
+
+        dashboard._reprocess_btn.config.assert_called_with(state="disabled")
+        dashboard._reprocess_with_profile_btn.config.assert_called_with(state="normal")
+
+    def test_button_disabled_when_no_audio_at_all(self, tmp_path):
+        dashboard, iid = self._dashboard_with_selected_interview(tmp_path)
+        dashboard.watcher.db.update_audio_path(iid, str(tmp_path / "does_not_exist.wav"))
+
+        dashboard._update_action_buttons()
+
+        dashboard._reprocess_with_profile_btn.config.assert_called_with(state="disabled")
+
+
+class TestPreviousAssessmentsSection:
+    """The History tab's collapsible "Previous assessments" list, backed by
+    db.list_analysis_history (see db.py's analysis_history table)."""
+
+    def _dashboard_with_history_widgets(self, tmp_path):
+        watcher = _watcher(tmp_path)
+        iid = watcher.db.start_interview("Zoom", str(tmp_path / "a.wav"), retention_days=3, user_id=1)
+
+        dashboard = Dashboard(watcher)
+        dashboard._assessment_history_tree = MagicMock()
+        dashboard._assessment_history_tree.get_children.return_value = []
+        dashboard._assessment_history_preview = MagicMock()
+        dashboard._history_toggle_btn = MagicMock()
+        return dashboard, iid
+
+    def test_describe_profile_lists_the_non_empty_fields(self, tmp_path):
+        dashboard, _ = self._dashboard_with_history_widgets(tmp_path)
+        profile = AssessmentProfile(role="Product", seniority="Senior/Lead", industry=None, company_type=None)
+        assert dashboard._describe_profile(profile) == "Product · Senior/Lead"
+
+    def test_describe_profile_none_or_fully_generic_says_generic(self, tmp_path):
+        dashboard, _ = self._dashboard_with_history_widgets(tmp_path)
+        assert dashboard._describe_profile(None) == "Generic"
+        assert dashboard._describe_profile(AssessmentProfile()) == "Generic"
+
+    def test_refresh_populates_one_row_per_history_entry_newest_first(self, tmp_path):
+        dashboard, iid = self._dashboard_with_history_widgets(tmp_path)
+        dashboard.watcher.db.append_analysis_history(
+            iid, {"session_summary": {"hire_recommendation": {"level": "Lean Hire"}}},
+            profile=AssessmentProfile(role="Sales"),
+        )
+        dashboard.watcher.db.append_analysis_history(
+            iid, {"session_summary": {"hire_recommendation": {"level": "Strong Hire"}}},
+            profile=AssessmentProfile(role="Data"),
+        )
+        record = dashboard.watcher.db.get(iid)
+
+        dashboard._refresh_assessment_history_section(record)
+
+        assert dashboard._assessment_history_tree.insert.call_count == 2
+        first_call_values = dashboard._assessment_history_tree.insert.call_args_list[0].kwargs["values"]
+        assert first_call_values[1] == "Data"  # most recent (Strong Hire/Data) inserted first
+        assert first_call_values[2] == "Strong Hire"
+        dashboard._history_toggle_btn.config.assert_called_with(text="▶ Previous assessments (2)")
+
+    def test_refresh_clears_the_list_when_nothing_is_selected(self, tmp_path):
+        dashboard, _ = self._dashboard_with_history_widgets(tmp_path)
+
+        dashboard._refresh_assessment_history_section(None)
+
+        dashboard._assessment_history_tree.insert.assert_not_called()
+        dashboard._history_toggle_btn.config.assert_called_with(text="▶ Previous assessments (0)")
+
+    def test_toggle_expands_and_collapses(self, tmp_path):
+        dashboard, iid = self._dashboard_with_history_widgets(tmp_path)
+        dashboard._assessment_history_frame = MagicMock()
+        dashboard._history_tree = MagicMock()
+        dashboard._history_tree.selection.return_value = [str(iid)]
+
+        assert dashboard._assessment_history_expanded is False
+        dashboard._on_toggle_assessment_history()
+        assert dashboard._assessment_history_expanded is True
+        dashboard._assessment_history_frame.pack.assert_called_once()
+
+        dashboard._on_toggle_assessment_history()
+        assert dashboard._assessment_history_expanded is False
+        dashboard._assessment_history_frame.pack_forget.assert_called_once()
+
+    def test_selecting_an_entry_renders_its_historical_analysis(self, tmp_path):
+        dashboard, iid = self._dashboard_with_history_widgets(tmp_path)
+        dashboard._history_tree = MagicMock()
+        dashboard._history_tree.selection.return_value = [str(iid)]
+        dashboard.watcher.db.append_analysis_history(
+            iid,
+            {
+                "qa_pairs": [],
+                "session_summary": {
+                    "top_strengths": [], "top_issues": [], "one_thing_to_practice_next": "",
+                    "hire_recommendation": {"level": "Strong Hire", "rationale": "A past take."},
+                },
+            },
+            profile=AssessmentProfile(role="Product"),
+        )
+        entry = dashboard.watcher.db.list_analysis_history(iid)[0]
+        dashboard._assessment_history_tree.selection.return_value = [str(entry.id)]
+
+        with patch("interview_analyzer.dashboard.render_into_text_widget") as mock_render:
+            dashboard._on_select_history_entry()
+
+        mock_render.assert_called_once()
+        rendered_content = mock_render.call_args.args[1]
+        assert "Strong Hire" in rendered_content
+        assert "A past take." in rendered_content
+
+    def test_selecting_nothing_is_a_no_op(self, tmp_path):
+        dashboard, iid = self._dashboard_with_history_widgets(tmp_path)
+        dashboard._history_tree = MagicMock()
+        dashboard._history_tree.selection.return_value = [str(iid)]
+        dashboard._assessment_history_tree.selection.return_value = []
+
+        with patch("interview_analyzer.dashboard.render_into_text_widget") as mock_render:
+            dashboard._on_select_history_entry()  # must not raise
+
+        mock_render.assert_not_called()

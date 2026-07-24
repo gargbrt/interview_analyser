@@ -34,7 +34,17 @@ from .model_setup import (
     size_label,
     stop_ollama,
 )
-from .report import write_trends_report
+from .profile_confirm import confirm_profile
+from .profiles import (
+    COMPANY_TYPES,
+    CORE_COMPETENCIES,
+    GENERIC_PROFILE,
+    INDUSTRIES,
+    ROLES,
+    SENIORITIES,
+    AssessmentProfile,
+)
+from .report import render_interview_report_markdown, write_trends_report
 from .report_view import render_into_text_widget
 from .settings_editor import load_editable_settings, save_editable_settings
 from .tray import job_text
@@ -304,6 +314,7 @@ class Dashboard:
         self._history_tree = None
         self._history_text = None
         self._reprocess_btn = None
+        self._reprocess_with_profile_btn = None
         self._open_audio_btn = None
         self._view_transcript_btn = None
         self._view_infographic_btn = None
@@ -312,6 +323,13 @@ class Dashboard:
         self._history_progress_label = None
         self._history_progress_bar = None
         self._history_progress_running = False
+        # "Previous assessments" collapsible section (History tab detail
+        # pane) -- see _build_history_tab / _refresh_assessment_history_section.
+        self._assessment_history_expanded = False
+        self._history_toggle_btn = None
+        self._assessment_history_frame = None
+        self._assessment_history_tree = None
+        self._assessment_history_preview = None
         self._trends_text = None
         self._settings_widgets: dict[str, object] = {}
         self._settings_status = None
@@ -327,6 +345,18 @@ class Dashboard:
         self._api_key_entry = None
         self._api_key_status_label = None
         self._lang_pack_rows: dict[str, dict[str, object]] = {}
+        # Assessment profile section (Settings tab) -- see
+        # _build_assessment_profile_section. Role/seniority/industry/company
+        # are ttk.Combobox StringVars; competency_vars is one BooleanVar per
+        # core competency; template_var names the "saved templates" picker.
+        self._profile_role_var = None
+        self._profile_seniority_var = None
+        self._profile_industry_var = None
+        self._profile_company_var = None
+        self._profile_competency_vars: dict[str, object] = {}
+        self._profile_template_name_entry = None
+        self._profile_template_picker = None
+        self._profile_status_label = None
 
     @property
     def is_open(self) -> bool:
@@ -797,6 +827,11 @@ class Dashboard:
             toolbar, text="Reprocess (generate report)", command=self._on_reprocess, state="disabled"
         )
         self._reprocess_btn.pack(side="left", padx=(8, 0))
+        self._reprocess_with_profile_btn = ttk.Button(
+            toolbar, text="Reprocess with different profile...",
+            command=self._on_reprocess_with_profile, state="disabled",
+        )
+        self._reprocess_with_profile_btn.pack(side="left", padx=(8, 0))
         self._open_audio_btn = ttk.Button(
             toolbar, text="Play audio", command=self._on_open_audio, state="disabled"
         )
@@ -874,6 +909,37 @@ class Dashboard:
         self._fb_frame = self._build_feedback_panel(detail_container, tk, ttk)
         self._fb_frame.grid(row=1, column=0, sticky="ew", pady=(6, 0))
         self._fb_frame.grid_remove()  # hidden until a report is actually selected
+
+        history_section = ttk.Frame(detail_container)
+        history_section.grid(row=2, column=0, sticky="ew", pady=(6, 0))
+        self._history_toggle_btn = ttk.Button(
+            history_section, text="▶ Previous assessments (0)", command=self._on_toggle_assessment_history,
+        )
+        self._history_toggle_btn.pack(anchor="w")
+
+        self._assessment_history_frame = ttk.Frame(history_section)
+        # not packed here -- _on_toggle_assessment_history shows/hides it
+
+        tree_frame2 = ttk.Frame(self._assessment_history_frame)
+        tree_frame2.pack(fill="x", pady=(4, 4))
+        history_tree = ttk.Treeview(
+            tree_frame2, columns=("date", "profile", "recommendation"), show="headings",
+            height=5, selectmode="browse",
+        )
+        history_tree.heading("date", text="Date")
+        history_tree.heading("profile", text="Profile")
+        history_tree.heading("recommendation", text="Recommendation")
+        history_tree.column("date", width=120, minwidth=100, stretch=False)
+        history_tree.column("profile", width=180, minwidth=100)
+        history_tree.column("recommendation", width=120, minwidth=80)
+        history_tree.pack(fill="x")
+        history_tree.bind("<<TreeviewSelect>>", lambda e: self._on_select_history_entry())
+        self._assessment_history_tree = history_tree
+
+        preview = tk.Text(self._assessment_history_frame, wrap="word", height=12, state="disabled", relief="flat")
+        _configure_report_tags(preview)
+        preview.pack(fill="both", expand=True)
+        self._assessment_history_preview = preview
 
         return frame
 
@@ -1041,6 +1107,14 @@ class Dashboard:
 
         can_do_reprocess = record is not None and can_reprocess(record) and not busy
         self._reprocess_btn.config(state="normal" if can_do_reprocess else "disabled")
+        # Unlike plain Reprocess (which only exists to recover a *missing*
+        # report and hides itself once one exists -- see can_reprocess),
+        # redoing the analysis under different profile settings is a
+        # deliberate choice the user can make on an already-successful
+        # interview too -- gated only on real audio still being on disk,
+        # not on whether a report already exists.
+        can_reprocess_with_profile = record is not None and has_audio(record) and not busy
+        self._reprocess_with_profile_btn.config(state="normal" if can_reprocess_with_profile else "disabled")
         can_play = record is not None and has_audio(record)
         self._open_audio_btn.config(state="normal" if can_play else "disabled")
         can_view_transcript = record is not None and bool(record.transcript)
@@ -1100,6 +1174,67 @@ class Dashboard:
             render_into_text_widget(self._history_text, f"# Report not available\n\n{reason}{hint}")
         self._history_text.config(state="disabled")
         self._refresh_feedback_panel(record if show_feedback else None)
+        self._refresh_assessment_history_section(record)
+
+    def _describe_profile(self, profile: Optional[AssessmentProfile]) -> str:
+        if profile is None:
+            return "Generic"
+        parts = [v for v in (profile.role, profile.seniority, profile.industry, profile.company_type) if v]
+        return " · ".join(parts) if parts else "Generic"
+
+    def _refresh_assessment_history_section(self, record) -> None:
+        """Repopulates the "Previous assessments" list for the newly-
+        selected interview (or clears it if nothing/nothing-with-history is
+        selected) -- called every time the History tab's selection changes,
+        regardless of whether the section is currently expanded, so the
+        toggle button's count stays accurate either way."""
+        self._assessment_history_tree.delete(*self._assessment_history_tree.get_children())
+        self._assessment_history_preview.config(state="normal")
+        self._assessment_history_preview.delete("1.0", "end")
+        self._assessment_history_preview.config(state="disabled")
+
+        history = self.watcher.db.list_analysis_history(record.id) if record is not None else []
+        for entry in history:
+            hire_level = ""
+            summary = entry.analysis.get("session_summary") if isinstance(entry.analysis, dict) else None
+            if isinstance(summary, dict):
+                hire_recommendation = summary.get("hire_recommendation")
+                if isinstance(hire_recommendation, dict):
+                    hire_level = hire_recommendation.get("level", "") or ""
+            self._assessment_history_tree.insert(
+                "", "end", iid=str(entry.id),
+                values=(entry.created_at[:16].replace("T", " "), self._describe_profile(entry.profile), hire_level),
+            )
+
+        arrow = "▼" if self._assessment_history_expanded else "▶"
+        self._history_toggle_btn.config(text=f"{arrow} Previous assessments ({len(history)})")
+
+    def _on_toggle_assessment_history(self) -> None:
+        self._assessment_history_expanded = not self._assessment_history_expanded
+        if self._assessment_history_expanded:
+            self._assessment_history_frame.pack(fill="both", expand=True)
+        else:
+            self._assessment_history_frame.pack_forget()
+        record = self._selected_record()
+        count = len(self._assessment_history_tree.get_children())
+        arrow = "▼" if self._assessment_history_expanded else "▶"
+        self._history_toggle_btn.config(text=f"{arrow} Previous assessments ({count})")
+
+    def _on_select_history_entry(self) -> None:
+        selection = self._assessment_history_tree.selection()
+        record = self._selected_record()
+        if not selection or record is None:
+            return
+        entry_id = int(selection[0])
+        entry = next(
+            (h for h in self.watcher.db.list_analysis_history(record.id) if h.id == entry_id), None
+        )
+        if entry is None:
+            return
+        content = render_interview_report_markdown(record, entry.analysis, entry.profile or GENERIC_PROFILE)
+        self._assessment_history_preview.config(state="normal")
+        render_into_text_widget(self._assessment_history_preview, content)
+        self._assessment_history_preview.config(state="disabled")
 
     def _on_reprocess(self) -> None:
         record = self._selected_record()
@@ -1107,35 +1242,80 @@ class Dashboard:
             return
         if record.id in (self.watcher.status.get("processing_jobs") or {}):
             return  # already busy (button should be disabled already; this is a defensive belt-and-braces check)
-        interview_id = record.id
         self._reprocess_btn.config(state="disabled")
+        self._reprocess_with_profile_btn.config(state="disabled")
+        self._run_reprocess_in_background(record.id)
 
-        def _run():
-            try:
-                self.watcher.reprocess_interview(interview_id)
-            except Exception as e:  # noqa: BLE001
-                logger.exception("Reprocessing interview #%s failed", interview_id)
-                # `e` is deleted when this except block exits (standard
-                # Python behavior for `except ... as e`), so the rendered
-                # markdown must be built now -- a lambda referring to `e`
-                # directly would raise NameError once .after() runs it
-                # later, since by then the name no longer exists.
-                error_markdown = _friendly_error_markdown("Reprocessing failed", e)
-                if self._root is not None:
-                    # only re-render the row list (to re-enable Reprocess,
-                    # since the audio is still there) -- NOT the detail
-                    # pane, which already shows the error message below and
-                    # would otherwise get immediately overwritten by
-                    # _on_history_select()'s normal "not processed" text
-                    self._root.after(0, self._refresh_history)
-                    self._root.after(0, lambda msg=error_markdown: self._show_reprocess_error(msg))
-            else:
-                # success -- re-render the row list and the now-available report
-                if self._root is not None:
-                    self._root.after(0, self._refresh_history)
-                    self._root.after(0, self._on_history_select)
+    def _on_reprocess_with_profile(self) -> None:
+        """Like _on_reprocess, but first shows the same confirm/edit
+        profile dialog used at recording time (profile_confirm.py),
+        prefilled from this interview's current stored profile -- lets the
+        user redo the analysis under different role/seniority/industry/
+        competency settings without affecting the original recording."""
+        record = self._selected_record()
+        if record is None or not has_audio(record):
+            return
+        if record.id in (self.watcher.status.get("processing_jobs") or {}):
+            return
+        interview_id = record.id
+        current_profile = record.profile or GENERIC_PROFILE
+        if record.profile is not None:
+            intro_text = (
+                "This interview's current analysis was run with the profile below.\n"
+                "Adjust anything and confirm to redo the assessment with different settings\n"
+                "-- only the assessment is redone, the transcript stays exactly as-is."
+            )
+        else:
+            intro_text = (
+                "This interview has no saved profile yet (it predates this feature, or none "
+                "was set).\nPick settings below and confirm to redo the assessment with them\n"
+                "-- only the assessment is redone, the transcript stays exactly as-is."
+            )
+        self._reprocess_btn.config(state="disabled")
+        self._reprocess_with_profile_btn.config(state="disabled")
 
-        threading.Thread(target=_run, daemon=True).start()
+        def _confirm_then_reprocess():
+            # runs on its own thread (like _confirm_and_save_profile in
+            # watcher.py) -- confirm_profile blocks the calling thread while
+            # scheduling the dialog on the dashboard's own Tk root, which
+            # would deadlock if called directly from a button's own
+            # click handler (the same thread that needs to run the dialog).
+            chosen_profile = confirm_profile(current_profile, ui_root=self._root, intro_text=intro_text)
+            self._run_reprocess(interview_id, profile=chosen_profile)
+
+        threading.Thread(target=_confirm_then_reprocess, daemon=True).start()
+
+    def _run_reprocess_in_background(self, interview_id: int, profile: Optional[AssessmentProfile] = None) -> None:
+        threading.Thread(target=self._run_reprocess, args=(interview_id, profile), daemon=True).start()
+
+    def _run_reprocess(self, interview_id: int, profile: Optional[AssessmentProfile] = None) -> None:
+        """Shared body for reprocessing (with or without a profile
+        override) -- runs on a background thread; only re-renders the
+        dashboard via .after() since Tk widgets aren't safe to touch from
+        here directly."""
+        try:
+            self.watcher.reprocess_interview(interview_id, profile=profile)
+        except Exception as e:  # noqa: BLE001
+            logger.exception("Reprocessing interview #%s failed", interview_id)
+            # `e` is deleted when this except block exits (standard
+            # Python behavior for `except ... as e`), so the rendered
+            # markdown must be built now -- a lambda referring to `e`
+            # directly would raise NameError once .after() runs it
+            # later, since by then the name no longer exists.
+            error_markdown = _friendly_error_markdown("Reprocessing failed", e)
+            if self._root is not None:
+                # only re-render the row list (to re-enable Reprocess,
+                # since the audio is still there) -- NOT the detail
+                # pane, which already shows the error message below and
+                # would otherwise get immediately overwritten by
+                # _on_history_select()'s normal "not processed" text
+                self._root.after(0, self._refresh_history)
+                self._root.after(0, lambda msg=error_markdown: self._show_reprocess_error(msg))
+        else:
+            # success -- re-render the row list and the now-available report
+            if self._root is not None:
+                self._root.after(0, self._refresh_history)
+                self._root.after(0, self._on_history_select)
 
     def _show_reprocess_error(self, message: str) -> None:
         """`message` is already fully-formed markdown from
@@ -1435,6 +1615,9 @@ class Dashboard:
         _row(r, "Reports output dir", "output.output_dir", e); r += 1
 
         ttk.Separator(form, orient="horizontal").grid(row=r, column=0, columnspan=2, sticky="ew", pady=10); r += 1
+        r = self._build_assessment_profile_section(form, tk, ttk, r)
+
+        ttk.Separator(form, orient="horizontal").grid(row=r, column=0, columnspan=2, sticky="ew", pady=10); r += 1
 
         ttk.Label(form, text="Language packs", font=("Segoe UI", 10, "bold")).grid(
             row=r, column=0, columnspan=2, sticky="w"
@@ -1446,6 +1629,161 @@ class Dashboard:
         self._settings_status.pack(anchor="w")
 
         return outer
+
+    def _build_assessment_profile_section(self, form, tk, ttk, r: int) -> int:
+        """Role/seniority/industry/company + which of the 12 core
+        competencies to score (see profiles.py) -- saved as named,
+        reusable templates under this logged-in user (auth.py), with one
+        marked as the "active default" that profile_confirm.py's dialog
+        prefills from at recording time. This section is DB-backed
+        (assessment_profiles table), not config.yaml-backed like the rest
+        of this form, so it has its own status label/actions rather than
+        going through _on_save_settings."""
+        ttk.Label(form, text="Assessment profile", font=("Segoe UI", 10, "bold")).grid(
+            row=r, column=0, columnspan=2, sticky="w"
+        ); r += 1
+        ttk.Label(
+            form,
+            text="Which competencies to score, and the role/seniority/industry/company context\n"
+                 "used to weight them (see the Confirm dialog shown when a recording starts).\n"
+                 "Leaving everything unset scores generically -- all competencies, no context skew.",
+            foreground="#6b6b6b", justify="left",
+        ).grid(row=r, column=0, columnspan=2, sticky="w"); r += 1
+
+        active_template = self.watcher.db.get_active_profile_template(user_id=self.watcher.user_id)
+        starting_profile = active_template.profile if active_template else GENERIC_PROFILE
+
+        def _profile_dropdown(row: int, label: str, options: list[str], current_value):
+            ttk.Label(form, text=label).grid(row=row, column=0, sticky="w", pady=2, padx=(0, 12))
+            var = tk.StringVar(value=current_value or "(not specified)")
+            ttk.Combobox(
+                form, textvariable=var, values=["(not specified)"] + list(options), state="readonly", width=22,
+            ).grid(row=row, column=1, sticky="w", pady=2)
+            return var
+
+        self._profile_role_var = _profile_dropdown(r, "Role", ROLES, starting_profile.role); r += 1
+        self._profile_seniority_var = _profile_dropdown(r, "Seniority", SENIORITIES, starting_profile.seniority); r += 1
+        self._profile_industry_var = _profile_dropdown(r, "Industry", INDUSTRIES, starting_profile.industry); r += 1
+        self._profile_company_var = _profile_dropdown(
+            r, "Company type", COMPANY_TYPES, starting_profile.company_type
+        ); r += 1
+
+        ttk.Label(form, text="Competencies").grid(row=r, column=0, sticky="nw", pady=2, padx=(0, 12))
+        checks_frame = ttk.Frame(form)
+        checks_frame.grid(row=r, column=1, sticky="w", pady=2)
+        selected = set(starting_profile.competencies)
+        self._profile_competency_vars = {}
+        for i, competency in enumerate(CORE_COMPETENCIES):
+            var = tk.BooleanVar(value=competency in selected)
+            self._profile_competency_vars[competency] = var
+            tk.Checkbutton(checks_frame, text=competency, variable=var).grid(
+                row=i // 2, column=i % 2, sticky="w", padx=(0, 10)
+            )
+        r += 1
+
+        template_row = ttk.Frame(form)
+        template_row.grid(row=r, column=0, columnspan=2, sticky="ew", pady=(6, 2))
+        ttk.Label(template_row, text="Template name").pack(side="left")
+        self._profile_template_name_entry = ttk.Entry(template_row, width=20)
+        self._profile_template_name_entry.pack(side="left", padx=(6, 8))
+        ttk.Button(template_row, text="Save as template", command=self._on_save_profile_template).pack(side="left")
+        r += 1
+
+        picker_row = ttk.Frame(form)
+        picker_row.grid(row=r, column=0, columnspan=2, sticky="ew", pady=2)
+        ttk.Label(picker_row, text="Saved templates").pack(side="left")
+        self._profile_template_picker = ttk.Combobox(picker_row, state="readonly", width=20)
+        self._profile_template_picker.pack(side="left", padx=(6, 8))
+        ttk.Button(picker_row, text="Load", command=self._on_load_profile_template).pack(side="left")
+        ttk.Button(
+            picker_row, text="Set as active default", command=self._on_set_active_profile_template
+        ).pack(side="left", padx=(6, 0))
+        ttk.Button(picker_row, text="Delete", command=self._on_delete_profile_template).pack(side="left", padx=(6, 0))
+        r += 1
+
+        self._profile_status_label = ttk.Label(form, text="", foreground="#2f6f5e")
+        self._profile_status_label.grid(row=r, column=1, sticky="w"); r += 1
+
+        self._refresh_profile_template_picker()
+        return r
+
+    def _refresh_profile_template_picker(self) -> None:
+        templates = self.watcher.db.list_profile_templates(user_id=self.watcher.user_id)
+        names = [t.name for t in templates]
+        self._profile_template_picker.config(values=names)
+        active = next((t for t in templates if t.is_active), None)
+        if active is not None:
+            self._profile_template_picker.set(active.name)
+        elif names:
+            self._profile_template_picker.set(names[0])
+        else:
+            self._profile_template_picker.set("")
+
+    def _profile_from_settings_widgets(self) -> AssessmentProfile:
+        def _none_if_blank(value: str) -> Optional[str]:
+            return None if value in ("", "(not specified)") else value
+
+        selected_competencies = [c for c, var in self._profile_competency_vars.items() if var.get()]
+        return AssessmentProfile(
+            competencies=[c for c in CORE_COMPETENCIES if c in selected_competencies] or list(CORE_COMPETENCIES),
+            role=_none_if_blank(self._profile_role_var.get()),
+            seniority=_none_if_blank(self._profile_seniority_var.get()),
+            industry=_none_if_blank(self._profile_industry_var.get()),
+            company_type=_none_if_blank(self._profile_company_var.get()),
+        )
+
+    def _apply_profile_to_settings_widgets(self, profile: AssessmentProfile) -> None:
+        self._profile_role_var.set(profile.role or "(not specified)")
+        self._profile_seniority_var.set(profile.seniority or "(not specified)")
+        self._profile_industry_var.set(profile.industry or "(not specified)")
+        self._profile_company_var.set(profile.company_type or "(not specified)")
+        selected = set(profile.competencies)
+        for competency, var in self._profile_competency_vars.items():
+            var.set(competency in selected)
+
+    def _on_save_profile_template(self) -> None:
+        name = self._profile_template_name_entry.get().strip()
+        if not name:
+            self._profile_status_label.config(text="Enter a name to save this as a template.", foreground="#a8722a")
+            return
+        profile = self._profile_from_settings_widgets()
+        self.watcher.db.create_profile_template(user_id=self.watcher.user_id, name=name, profile=profile)
+        self._refresh_profile_template_picker()
+        self._profile_template_picker.set(name)
+        self._profile_status_label.config(text=f"Saved template '{name}'.", foreground="#2f6f5e")
+
+    def _selected_profile_template(self):
+        name = self._profile_template_picker.get()
+        if not name:
+            return None
+        return next(
+            (t for t in self.watcher.db.list_profile_templates(user_id=self.watcher.user_id) if t.name == name),
+            None,
+        )
+
+    def _on_load_profile_template(self) -> None:
+        template = self._selected_profile_template()
+        if template is None:
+            return
+        self._apply_profile_to_settings_widgets(template.profile)
+        self._profile_status_label.config(text=f"Loaded '{template.name}'.", foreground="#2f6f5e")
+
+    def _on_set_active_profile_template(self) -> None:
+        template = self._selected_profile_template()
+        if template is None:
+            self._profile_status_label.config(text="Save or pick a template first.", foreground="#a8722a")
+            return
+        self.watcher.db.set_active_profile_template(template.id, user_id=self.watcher.user_id)
+        self._refresh_profile_template_picker()
+        self._profile_status_label.config(text=f"'{template.name}' is now the active default.", foreground="#2f6f5e")
+
+    def _on_delete_profile_template(self) -> None:
+        template = self._selected_profile_template()
+        if template is None:
+            return
+        self.watcher.db.delete_profile_template(template.id, user_id=self.watcher.user_id)
+        self._refresh_profile_template_picker()
+        self._profile_status_label.config(text=f"Deleted '{template.name}'.", foreground="#2f6f5e")
 
     def _build_language_pack_rows(self, form, ttk, r: int) -> int:
         """One row per optional language pack (see language_packs.py) --

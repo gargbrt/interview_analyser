@@ -170,7 +170,7 @@ def test_reprocess_interview_reports_live_analysis_progress(tmp_path):
     observed_jobs = []
     fake_clock = iter([10.0, 11.0, 12.0])
 
-    def _fake_analyze(transcript, cfg, on_progress=None, calibration_notes=""):
+    def _fake_analyze(transcript, cfg, on_progress=None, profile=None, calibration_notes=""):
         for fraction in (0.4, 0.8, 1.0):
             on_progress(fraction)
             observed_jobs.append(dict(watcher.status["processing_jobs"][iid]))
@@ -201,6 +201,45 @@ def test_reprocess_interview_recovers_a_report_from_existing_audio(tmp_path):
     assert record.report_path is not None
     assert pathlib.Path(record.report_path).exists()
     assert watcher.status == {"state": "idle", "processing_jobs": {}}
+
+
+def test_reprocess_interview_reuses_an_existing_transcript_instead_of_re_transcribing(tmp_path):
+    """Regression coverage for a real bug: reprocessing (especially with a
+    different assessment profile) re-ran transcription from scratch even
+    though the interview already had a perfectly good, saved transcript --
+    wasteful (real time, and for a cloud engine, real API usage) and
+    surprising to a user who only wanted the assessment redone. Reprocessing
+    must reuse the existing transcript whenever one is already there."""
+    cfg = _test_config(tmp_path)
+    watcher = MeetingWatcher(cfg, user_id=1)
+    iid = _seed_interview(watcher, tmp_path)
+    watcher.db.save_transcript(iid, "[Interviewer] Original transcript.\n[You] Original answer.")
+
+    with patch("interview_analyzer.watcher.transcribe") as mock_transcribe, \
+         patch("interview_analyzer.watcher.analyze_transcript", return_value=FAKE_ANALYSIS) as mock_analyze:
+        watcher.reprocess_interview(iid)
+
+    mock_transcribe.assert_not_called()
+    mock_analyze.assert_called_once()
+    record = watcher.db.get(iid)
+    assert record.transcript == "[Interviewer] Original transcript.\n[You] Original answer."
+    assert record.analysis == FAKE_ANALYSIS
+
+
+def test_reprocess_interview_still_transcribes_when_no_transcript_exists_yet(tmp_path):
+    """The crash-recovery case (audio exists but the pipeline never got as
+    far as producing a transcript at all) must still transcribe normally --
+    only a genuinely *existing* transcript is reused."""
+    cfg = _test_config(tmp_path)
+    watcher = MeetingWatcher(cfg, user_id=1)
+    iid = _seed_interview(watcher, tmp_path)  # no transcript saved
+
+    with patch("interview_analyzer.watcher.transcribe", return_value="[Interviewer] Hi\n[You] Hello") as mock_transcribe, \
+         patch("interview_analyzer.watcher.analyze_transcript", return_value=FAKE_ANALYSIS):
+        watcher.reprocess_interview(iid)
+
+    mock_transcribe.assert_called_once()
+    assert watcher.db.get(iid).transcript == "[Interviewer] Hi\n[You] Hello"
 
 
 def test_reprocess_interview_rejects_missing_audio(tmp_path):

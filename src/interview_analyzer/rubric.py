@@ -1,19 +1,26 @@
 """The evaluation rubric used to analyze each of your interview answers.
 
-Edit CATEGORIES or the prompt template to tailor this to your field
-(e.g., add "system design depth" or "SQL correctness" categories) — no
-other code needs to change.
+Scoring is driven by an AssessmentProfile (see profiles.py): which of the 12
+core competencies apply to this interview, and the role/seniority/industry/
+company context used to weight them. Behavioral signals (clarity,
+confidence, structure, conciseness, etc.) are deliberately not separate
+scored dimensions -- per the reference framework this app's rubric is based
+on, they're supporting evidence that shows up inside each competency's
+qualitative remark instead of being scored on their own.
 """
+from __future__ import annotations
 
-CATEGORIES = [
-    "structure",        # e.g. STAR/CAR method used for behavioral questions
-    "clarity",           # rambling, filler words, vague phrasing
-    "specificity",         # concrete examples, metrics, outcomes vs generic claims
-    "confidence",            # hedging language, excessive qualifiers
-    "technical_accuracy",      # flagged only when the answer contains a checkable claim
+from .profiles import AssessmentProfile, GENERIC_PROFILE, build_profile_guidance
+
+# The reference framework's own hire-recommendation scale (its "Level 6:
+# Scoring Rubric") -- used for session_summary's hire_recommendation.level,
+# and reused as-is by confidence.py's selection-probability estimate so the
+# two never disagree about what the levels mean.
+HIRE_RECOMMENDATION_LEVELS = [
+    "Strong No Hire", "No Hire", "Lean No Hire", "Lean Hire", "Hire", "Strong Hire", "Exceptional",
 ]
 
-ANALYSIS_PROMPT_TEMPLATE = """You are an expert interview coach reviewing a transcript
+ANALYSIS_PROMPT_TEMPLATE = """You are an expert interview coach/assessor reviewing a transcript
 of a real job interview. Below is the full transcript with speakers labeled
 [Interviewer] and [You].
 
@@ -27,20 +34,25 @@ distinct questions into a single qa_pairs entry just because they're on
 the same topic. If the interviewer asked N distinct questions, return N
 separate entries in "qa_pairs", in the order they occurred.
 
-For EACH question/answer pair, evaluate the answer against these categories:
-{categories}
+For EACH question/answer pair, evaluate the answer against these competencies:
+{competencies}
 
 For each pair return:
 - question (short paraphrase)
 - answer_summary (1-2 sentence summary of what you said)
-- issues: list of specific problems found, tagged by category. For EACH issue,
-  quote the exact words from the transcript that illustrate it verbatim in
-  "excerpt" (copy-paste, do not paraphrase) -- this is what makes the
-  feedback concrete instead of generic. Leave "excerpt" as an empty string
-  only if the issue is about something absent (e.g. "no metric given")
-  rather than something said.
+- issues: list of specific problems found, tagged by competency (use ONLY the
+  competency names listed above). For EACH issue, quote the exact words from
+  the transcript that illustrate it verbatim in "excerpt" (copy-paste, do not
+  paraphrase) -- this is what makes the feedback concrete instead of generic.
+  Leave "excerpt" as an empty string only if the issue is about something
+  absent (e.g. "no metric given") rather than something said. Behavioral
+  signals you notice (e.g. clarity, confidence, structure, conciseness,
+  executive presence) are evidence FOR a competency's issue/remark, not
+  separate categories of their own.
 - suggested_improvement: a concise, concrete rewrite or specific advice,
   ideally showing how the quoted excerpt could be rephrased
+
+{profile_guidance}
 
 Then return an overall "session_summary" with:
 - top_strengths (max 3)
@@ -51,6 +63,12 @@ Then return an overall "session_summary" with:
   unclear audio, ambiguous speaker labels) and how much you had to infer
   vs. what was explicitly said. Don't default to a high number just to seem
   certain -- a noisy or ambiguous transcript should get a lower score.
+- competency_scores: one entry per competency listed above, each
+  {{"name": "<competency>", "score": integer 0-100, "remark": "1-2 sentence
+  qualitative assessment specifically for this competency, referencing
+  concrete evidence from the transcript"}}.
+- hire_recommendation: {{"level": one of {hire_levels}, "rationale": "1-2
+  sentences explaining the level, grounded in the competency scores above"}}
 {calibration_section}
 Respond ONLY with valid JSON in this shape, no markdown fences, no preamble:
 {{
@@ -66,7 +84,9 @@ Respond ONLY with valid JSON in this shape, no markdown fences, no preamble:
     "top_strengths": ["..."],
     "top_issues": ["..."],
     "one_thing_to_practice_next": "...",
-    "confidence": 0
+    "confidence": 0,
+    "competency_scores": [{{"name": "...", "score": 0, "remark": "..."}}],
+    "hire_recommendation": {{"level": "...", "rationale": "..."}}
   }}
 }}
 
@@ -77,10 +97,14 @@ Transcript:
 """
 
 
-def build_prompt(transcript: str, calibration_notes: str = "") -> str:
+def build_prompt(transcript: str, profile: AssessmentProfile = GENERIC_PROFILE, calibration_notes: str = "") -> str:
     calibration_section = f"\n{calibration_notes}\n" if calibration_notes else ""
     return ANALYSIS_PROMPT_TEMPLATE.format(
-        categories=", ".join(CATEGORIES), transcript=transcript, calibration_section=calibration_section
+        competencies=", ".join(profile.competencies),
+        profile_guidance=build_profile_guidance(profile),
+        hire_levels=", ".join(f'"{level}"' for level in HIRE_RECOMMENDATION_LEVELS),
+        transcript=transcript,
+        calibration_section=calibration_section,
     )
 
 
@@ -109,8 +133,8 @@ def split_transcript_for_chunked_analysis(transcript: str, max_chars: int) -> li
     return chunks
 
 
-# JSON Schema matching ANALYSIS_PROMPT_TEMPLATE's requested shape exactly,
-# for engines that support constrained/structured output (Ollama's
+# JSON Schema matching ANALYSIS_PROMPT_TEMPLATE's requested shape, for
+# engines that support constrained/structured output (Ollama's
 # /api/generate `format` field accepts a full JSON Schema, not just the
 # string "json" -- see OllamaEngine.run() in analyzer.py). Reproduced on a
 # real interview: a long transcript against llama3.1:8b -- asking only for
@@ -120,6 +144,14 @@ def split_transcript_for_chunked_analysis(transcript: str, max_chars: int) -> li
 # that passing this schema as `format` instead forces the model's output
 # to match it, even when tested against a prompt totally unrelated to
 # interview analysis.
+#
+# "category"/"name"/"level" are left as free-text strings rather than a
+# JSON-schema enum -- the specific competency names vary per
+# AssessmentProfile (see profiles.py), so a static enum here would need to
+# be regenerated per profile; the prompt text itself is what constrains the
+# model to the profile's chosen competency names, and
+# analyzer._has_the_expected_shape is the actual safety net for a
+# non-compliant response either way (same as it already was for categories).
 #
 # Every object also sets "additionalProperties": false and lists every
 # property as "required" -- not needed by Ollama, but required by Groq's
@@ -163,8 +195,33 @@ RESULT_JSON_SCHEMA = {
                 "top_issues": {"type": "array", "items": {"type": "string"}},
                 "one_thing_to_practice_next": {"type": "string"},
                 "confidence": {"type": "integer"},
+                "competency_scores": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "name": {"type": "string"},
+                            "score": {"type": "integer"},
+                            "remark": {"type": "string"},
+                        },
+                        "required": ["name", "score", "remark"],
+                        "additionalProperties": False,
+                    },
+                },
+                "hire_recommendation": {
+                    "type": "object",
+                    "properties": {
+                        "level": {"type": "string"},
+                        "rationale": {"type": "string"},
+                    },
+                    "required": ["level", "rationale"],
+                    "additionalProperties": False,
+                },
             },
-            "required": ["top_strengths", "top_issues", "one_thing_to_practice_next", "confidence"],
+            "required": [
+                "top_strengths", "top_issues", "one_thing_to_practice_next", "confidence",
+                "competency_scores", "hire_recommendation",
+            ],
             "additionalProperties": False,
         },
     },

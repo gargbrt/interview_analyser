@@ -8,6 +8,7 @@ from interview_analyzer import api_keys
 from interview_analyzer.analyzer import AnthropicEngine, GroqEngine, OllamaEngine, OpenAIEngine, analyze_transcript
 from interview_analyzer.config_loader import Config
 from interview_analyzer.engines import AnalysisEngine, get_engine, register_engine
+from interview_analyzer.profiles import AssessmentProfile
 from interview_analyzer.rubric import RESULT_JSON_SCHEMA
 
 
@@ -548,3 +549,111 @@ class TestChunkedAnalysis:
         result = analyze_transcript(self._long_transcript(10), cfg)
 
         assert result["parse_error"] is True
+
+    def test_merges_competency_scores_by_averaging_and_takes_the_last_hire_recommendation(self):
+        """Exercises _merge_chunk_analyses directly with a fixed, known list
+        of parsed chunks -- going through analyze_transcript's real
+        chunking would make the exact chunk count (and therefore the exact
+        average) depend on incidental transcript-splitting details
+        unrelated to this merge logic."""
+        from interview_analyzer.analyzer import _merge_chunk_analyses
+
+        chunk1 = {
+            "qa_pairs": [],
+            "session_summary": {
+                "competency_scores": [
+                    {"name": "Leadership", "score": 60, "remark": "Some ownership shown early on."},
+                ],
+                "hire_recommendation": {"level": "Lean Hire", "rationale": "Early impression."},
+            },
+        }
+        chunk2 = {
+            "qa_pairs": [],
+            "session_summary": {
+                "competency_scores": [
+                    {"name": "Leadership", "score": 80, "remark": "Stronger by the end."},
+                ],
+                "hire_recommendation": {"level": "Hire", "rationale": "Full conversation considered."},
+            },
+        }
+
+        result = _merge_chunk_analyses([chunk1, chunk2])
+
+        scores = {c["name"]: c for c in result["session_summary"]["competency_scores"]}
+        assert scores["Leadership"]["score"] == 70  # average of 60 and 80
+        assert "Some ownership" in scores["Leadership"]["remark"]
+        assert "Stronger by the end" in scores["Leadership"]["remark"]
+        # last chunk's hire_recommendation wins -- it saw the fuller conversation
+        assert result["session_summary"]["hire_recommendation"]["level"] == "Hire"
+
+    def test_merges_competency_scores_across_more_than_two_chunks_via_the_real_chunking_path(self):
+        """End-to-end version through the real chunking path -- every
+        chunk reports the *same* score for a competency, so the merged
+        average is unambiguous regardless of exactly how many chunks the
+        transcript actually got split into."""
+        same_score_chunk = json.dumps({
+            "qa_pairs": [],
+            "session_summary": {
+                "top_strengths": [], "top_issues": [], "one_thing_to_practice_next": "", "confidence": 70,
+                "competency_scores": [{"name": "Execution", "score": 75, "remark": "Consistent."}],
+                "hire_recommendation": {"level": "Hire", "rationale": "Consistent."},
+            },
+        })
+        engine = _FakeChunkedEngine(max_chars=120, responses=[same_score_chunk] * 20)
+        cfg = self._cfg_for(engine, "fake_chunked_uniform_competency")
+
+        result = analyze_transcript(self._long_transcript(10), cfg)
+
+        assert len(engine.calls) > 1  # actually exercised multiple chunks
+        scores = {c["name"]: c for c in result["session_summary"]["competency_scores"]}
+        assert scores["Execution"]["score"] == 75
+
+
+class TestAnalyzeTranscriptProfileThreading:
+    """Regression coverage for threading an AssessmentProfile through to the
+    prompt -- both the direct (un-chunked) and chunked paths must actually
+    use the given profile, not silently fall back to generic."""
+
+    def _cfg_for(self, engine, name) -> Config:
+        register_engine(name, lambda acfg: engine)
+        return Config(raw={"analysis": {"engine": name}})
+
+    def test_direct_path_passes_the_profile_to_the_prompt(self):
+        class _CapturingEngine(AnalysisEngine):
+            def __init__(self):
+                self.prompts: list[str] = []
+
+            def run(self, prompt, on_progress=None):
+                self.prompts.append(prompt)
+                return json.dumps({
+                    "qa_pairs": [],
+                    "session_summary": {"top_strengths": [], "top_issues": [], "one_thing_to_practice_next": "", "confidence": 50},
+                })
+
+        engine = _CapturingEngine()
+        cfg = self._cfg_for(engine, "fake_capturing_direct")
+        profile = AssessmentProfile(competencies=["Leadership", "Execution"], role="Sales")
+
+        analyze_transcript("[Interviewer] Hi\n[You] Hello", cfg, profile=profile)
+
+        assert "Leadership" in engine.prompts[0]
+        assert "Execution" in engine.prompts[0]
+        assert "Sales" in engine.prompts[0]
+        assert "Technical Expertise" not in engine.prompts[0]
+
+    def test_chunked_path_passes_the_profile_to_every_chunk(self):
+        good = json.dumps({
+            "qa_pairs": [],
+            "session_summary": {"top_strengths": [], "top_issues": [], "one_thing_to_practice_next": "", "confidence": 50},
+        })
+        engine = _FakeChunkedEngine(max_chars=120, responses=[good] * 20)
+        cfg = self._cfg_for(engine, "fake_capturing_chunked")
+        profile = AssessmentProfile(competencies=["Collaboration"], role="Design")
+
+        transcript = "\n".join(f"[Interviewer] Question {i}?\n[You] Answer number {i}." for i in range(10))
+        analyze_transcript(transcript, cfg, profile=profile)
+
+        assert len(engine.calls) > 1
+        for prompt in engine.calls:
+            assert "Collaboration" in prompt
+            assert "Design" in prompt
