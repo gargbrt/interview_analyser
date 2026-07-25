@@ -67,6 +67,11 @@ COMPANY_TYPES: list[str] = [
 _TIER_ORDER = ["minor", "low", "moderate", "high", "critical"]
 _TIER_VALUE: dict[str, int] = {tier: i for i, tier in enumerate(_TIER_ORDER)}
 
+# Public alias -- confidence.py's numeric weighting needs this same order to
+# interpolate between tiers (see competency_emphasis_value below); exported
+# rather than reaching across modules for the underscore-prefixed original.
+TIER_ORDER = _TIER_ORDER
+
 
 def _tier_at_least(tier: str, floor: str) -> bool:
     return _TIER_ORDER.index(tier) >= _TIER_ORDER.index(floor)
@@ -243,11 +248,44 @@ GENERIC_PROFILE = AssessmentProfile(
 )
 
 
+def competency_emphasis_value(profile: AssessmentProfile, competency: str) -> float:
+    """The continuous 0 (minor) - 4 (critical) average across whichever
+    profile dimensions apply (seniority/role/industry/company_type),
+    BEFORE rounding to a discrete tier label -- see _competency_emphasis,
+    which rounds this same average for the human-readable tier string.
+
+    Exists as its own function (not just an intermediate value inside
+    _competency_emphasis) because confidence.py's competency_weight needs
+    the unrounded average, not the rounded tier: rounding to one of only 5
+    buckets before converting to a number can silently erase a real
+    difference when 3 of the 4 dimensions are held fixed and only one
+    changes -- e.g. a profile with role="Product" fixes that dimension at
+    "critical" for many competencies, and when combined with two "Generic"
+    (unset, "moderate"-by-default) industry/company dimensions, a
+    Senior/Lead vs. Director+ swap in just the seniority dimension can
+    average out to the SAME rounded tier ("moderate" in both cases) despite
+    each seniority table's own raw value genuinely differing -- silently
+    flattening the seniority-comparison gauge's markers to identical
+    numbers (a real bug this was written to fix, not a hypothetical one)."""
+    tiers = []
+    if profile.seniority and profile.seniority in SENIORITY_EMPHASIS:
+        tiers.append(SENIORITY_EMPHASIS[profile.seniority].get(competency, "moderate"))
+    if profile.role and profile.role in ROLE_EMPHASIS:
+        tiers.append(ROLE_EMPHASIS[profile.role].get(competency, "moderate"))
+    if profile.industry and profile.industry in INDUSTRY_PRIORITY:
+        tiers.append(INDUSTRY_PRIORITY[profile.industry].get(competency, "moderate"))
+    if profile.company_type and profile.company_type in COMPANY_TYPE_EMPHASIS:
+        tiers.append(COMPANY_TYPE_EMPHASIS[profile.company_type].get(competency, "moderate"))
+    if not tiers:
+        return float(_TIER_VALUE["moderate"])
+    return sum(_TIER_VALUE[t] for t in tiers) / len(tiers)
+
+
 def _competency_emphasis(profile: AssessmentProfile, competency: str) -> str:
     """Combines seniority/role/industry/company_type emphasis for one
     competency into a single tier -- the AVERAGE of whichever dimensions
-    apply, rounded to the nearest tier (half rounds up), NOT the max of
-    them.
+    apply (see competency_emphasis_value), rounded to the nearest tier
+    (half rounds up), NOT the max of them.
 
     This used to take the max, on the reasoning that a competency critical
     for even one dimension genuinely matters. In practice, the seniority
@@ -262,18 +300,7 @@ def _competency_emphasis(profile: AssessmentProfile, competency: str) -> str:
     surface as critical, but one that's only strongly emphasized in a
     single dimension (with the others neutral/"moderate") now lands one
     tier lower instead of getting pulled all the way up."""
-    tiers = []
-    if profile.seniority and profile.seniority in SENIORITY_EMPHASIS:
-        tiers.append(SENIORITY_EMPHASIS[profile.seniority].get(competency, "moderate"))
-    if profile.role and profile.role in ROLE_EMPHASIS:
-        tiers.append(ROLE_EMPHASIS[profile.role].get(competency, "moderate"))
-    if profile.industry and profile.industry in INDUSTRY_PRIORITY:
-        tiers.append(INDUSTRY_PRIORITY[profile.industry].get(competency, "moderate"))
-    if profile.company_type and profile.company_type in COMPANY_TYPE_EMPHASIS:
-        tiers.append(COMPANY_TYPE_EMPHASIS[profile.company_type].get(competency, "moderate"))
-    if not tiers:
-        return "moderate"
-    average = sum(_TIER_VALUE[t] for t in tiers) / len(tiers)
+    average = competency_emphasis_value(profile, competency)
     index = min(len(_TIER_ORDER) - 1, math.floor(average + 0.5))
     return _TIER_ORDER[index]
 

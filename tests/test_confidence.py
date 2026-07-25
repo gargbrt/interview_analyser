@@ -479,3 +479,33 @@ class TestCompetencyWeight:
 
     def test_defaults_to_moderate_for_an_unrecognized_competency_under_a_generic_profile(self):
         assert competency_weight("Leadership") == competency_weight("Execution")
+
+    def test_interpolates_rather_than_snapping_to_the_nearest_rounded_tier(self):
+        """Regression coverage for the exact bug that flattened the
+        seniority-comparison gauge to identical numbers for adjacent
+        seniority levels: Senior/Lead and Director+ both round Technical
+        Expertise to "moderate" under a Product/Generic/Generic profile
+        (raw averages 2.25 vs 2.0), which used to collapse both to the
+        SAME 1.5 weight. The interpolated weight must differ instead,
+        since the raw averages genuinely do."""
+        senior_lead = AssessmentProfile(
+            role="Product", seniority="Senior/Lead", industry="Generic", company_type="Generic",
+        )
+        director_plus = AssessmentProfile(
+            role="Product", seniority="Director+", industry="Generic", company_type="Generic",
+        )
+        senior_weight = competency_weight("Technical Expertise", senior_lead)
+        director_weight = competency_weight("Technical Expertise", director_plus)
+        assert senior_weight > director_weight
+        assert director_weight == 1.5  # Director+'s raw average lands exactly on "moderate"
+
+    def test_interpolated_weight_still_matches_the_tier_weight_at_exact_boundaries(self):
+        """A profile whose average lands exactly on a tier boundary (no
+        fractional remainder) must still return that tier's own weight
+        exactly -- the interpolation shouldn't introduce drift at the
+        boundaries it's meant to preserve."""
+        profile = AssessmentProfile(
+            competencies=["Business Acumen"], role="Product", seniority="Senior/Lead",
+            industry="FinTech", company_type="Consulting",
+        )
+        assert competency_weight("Business Acumen", profile) == 3.0  # exactly "critical"

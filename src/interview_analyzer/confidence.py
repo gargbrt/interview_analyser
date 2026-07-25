@@ -46,7 +46,7 @@ import logging
 import re
 from typing import Optional
 
-from .profiles import AssessmentProfile, GENERIC_PROFILE, competency_emphasis_map
+from .profiles import TIER_ORDER, AssessmentProfile, GENERIC_PROFILE, competency_emphasis_value
 from .rubric import HIRE_RECOMMENDATION_LEVELS
 
 logger = logging.getLogger(__name__)
@@ -297,10 +297,27 @@ def transcript_specificity_nudge(
 def competency_weight(name: str, profile: AssessmentProfile = GENERIC_PROFILE) -> float:
     """The numeric weight (see _EMPHASIS_WEIGHT) this profile's context
     gives `name` -- a "critical" competency counts far more toward the
-    weighted total than a "minor" one. Falls back to "moderate" for a
-    competency the profile has no emphasis data for."""
-    emphasis = competency_emphasis_map(profile).get(name, "moderate")
-    return _EMPHASIS_WEIGHT.get(emphasis, 1.5)
+    weighted total than a "minor" one.
+
+    Interpolates linearly between _EMPHASIS_WEIGHT's tier weights using
+    competency_emphasis_value's CONTINUOUS 0-4 average, rather than looking
+    up competency_emphasis_map's already-rounded tier string -- rounding to
+    one of only 5 buckets before converting to a number can silently erase
+    a real difference when 3 of a profile's 4 dimensions (role/seniority/
+    industry/company_type) are held fixed and only one changes, since the
+    fixed dimensions can pull two different raw averages onto the exact
+    same rounded tier (see competency_emphasis_value's docstring for the
+    real case this was fixing: a Senior/Lead vs. Director+ swap that used
+    to average out to identical "moderate" weights for some competencies,
+    flattening the seniority-comparison gauge's markers to the same
+    number)."""
+    value = max(0.0, min(len(TIER_ORDER) - 1, competency_emphasis_value(profile, name)))
+    lower_index = min(int(value), len(TIER_ORDER) - 2)
+    upper_index = lower_index + 1
+    fraction = value - lower_index
+    lower_weight = _EMPHASIS_WEIGHT[TIER_ORDER[lower_index]]
+    upper_weight = _EMPHASIS_WEIGHT[TIER_ORDER[upper_index]]
+    return lower_weight + fraction * (upper_weight - lower_weight)
 
 
 def weighted_competency_total(

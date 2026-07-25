@@ -15,6 +15,7 @@ from interview_analyzer.profiles import (
     AssessmentProfile,
     build_profile_guidance,
     competency_emphasis_map,
+    competency_emphasis_value,
 )
 
 
@@ -127,6 +128,42 @@ def test_senior_lead_product_profile_is_no_longer_uniformly_critical():
     emphasis = competency_emphasis_map(profile)
     assert "critical" not in emphasis.values()
     assert "moderate" in emphasis.values()
+
+
+def test_competency_emphasis_value_matches_the_rounded_tier_for_a_whole_number_average():
+    # Business Acumen is "critical" for all four of Product/Senior-Lead/
+    # FinTech/Consulting (see test above), so the continuous average must
+    # land exactly on "critical"'s index (4), not merely round to it.
+    profile = AssessmentProfile(
+        competencies=["Business Acumen"], role="Product", seniority="Senior/Lead",
+        industry="FinTech", company_type="Consulting",
+    )
+    assert competency_emphasis_value(profile, "Business Acumen") == 4.0
+
+
+def test_competency_emphasis_value_preserves_a_fractional_average_the_rounded_tier_erases():
+    """Regression coverage for the exact bug that flattened the seniority-
+    comparison gauge to identical numbers: Senior/Lead and Director+ both
+    round Technical Expertise to "moderate" under a Product/Generic/Generic
+    profile (see test_senior_lead_product_profile_is_no_longer_uniformly_
+    critical), but their raw averages (2.25 vs 2.0) genuinely differ --
+    competency_emphasis_value must expose that difference instead of
+    collapsing both to the same rounded value."""
+    senior_lead = AssessmentProfile(
+        role="Product", seniority="Senior/Lead", industry="Generic", company_type="Generic",
+    )
+    director_plus = AssessmentProfile(
+        role="Product", seniority="Director+", industry="Generic", company_type="Generic",
+    )
+    senior_value = competency_emphasis_value(senior_lead, "Technical Expertise")
+    director_value = competency_emphasis_value(director_plus, "Technical Expertise")
+    assert senior_value != director_value
+    assert round(senior_value, 2) == 2.25
+    assert director_value == 2.0
+
+
+def test_competency_emphasis_value_defaults_to_moderate_with_no_dimensions_set():
+    assert competency_emphasis_value(GENERIC_PROFILE, "Leadership") == 2.0
 
 
 def test_generic_profile_guidance_has_no_emphasis_bullets():
