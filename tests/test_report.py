@@ -104,7 +104,7 @@ def test_write_interview_report_omits_excerpt_line_when_absent(tmp_path):
     report_path = write_interview_report(record, cfg)
     content = report_path.read_text(encoding="utf-8")
 
-    assert ">" not in content
+    assert '> "' not in content
 
 
 def test_write_interview_report_handles_no_speech_detected(tmp_path):
@@ -378,7 +378,8 @@ class TestInterviewReportProfileFields:
         profile = AssessmentProfile(competencies=["Leadership"], seniority="Entry Level")
         record = _record(1, "Zoom", self._analysis())
         content = render_interview_report_markdown(record, record.analysis, profile)
-        assert "(minor weight)" in content
+        assert "Weightage:** Minor" in content
+        assert "| Minor |" in content
 
     def test_renders_overall_competency_score(self, tmp_path):
         analysis = self._analysis(session_summary={
@@ -401,6 +402,64 @@ class TestInterviewReportProfileFields:
         record = _record(1, "Zoom", analysis)
         content = write_interview_report(record, _config(tmp_path)).read_text()
         assert "Overall competency score" not in content
+
+
+class TestScoreSummaryTableAndAnchors:
+    """The upfront "Score Summary" table (parameter/score/weightage/total +
+    decision) and the per-competency "## Competency Details" sections it
+    links into, each with a back-to-top link."""
+
+    def _analysis(self, **overrides):
+        base = {
+            "qa_pairs": [],
+            "session_summary": {
+                "top_strengths": [], "top_issues": [], "one_thing_to_practice_next": "",
+                "competency_scores": [
+                    {"name": "Leadership", "score": 82, "remark": "Took clear ownership."},
+                    {"name": "Execution", "score": 40, "remark": "Needs more detail."},
+                ],
+                "hire_recommendation": {"level": "Hire", "rationale": "Solid overall."},
+            },
+            "selection_probability": {"percent": 65, "label": "Hire", "binary_recommendation": "Recommended"},
+        }
+        base.update(overrides)
+        return base
+
+    def test_top_anchor_is_placed_before_the_title(self, tmp_path):
+        record = _record(1, "Zoom", self._analysis())
+        content = write_interview_report(record, _config(tmp_path)).read_text(encoding="utf-8")
+        assert content.startswith('<a id="top"></a>')
+
+    def test_score_summary_table_has_a_row_per_competency_linking_to_its_detail_section(self, tmp_path):
+        record = _record(1, "Zoom", self._analysis())
+        content = write_interview_report(record, _config(tmp_path)).read_text(encoding="utf-8")
+        assert "## Score Summary" in content
+        assert "| [Leadership](#leadership) | 82/100 | " in content
+        assert "### Leadership" in content
+
+    def test_score_summary_table_has_a_total_row(self, tmp_path):
+        record = _record(1, "Zoom", self._analysis())
+        content = write_interview_report(record, _config(tmp_path)).read_text(encoding="utf-8")
+        assert "**Overall competency score**" in content
+
+    def test_score_summary_includes_a_decision_line(self, tmp_path):
+        record = _record(1, "Zoom", self._analysis())
+        content = write_interview_report(record, _config(tmp_path)).read_text(encoding="utf-8")
+        assert "**Decision:** Hire · 65% selection probability · Recommended" in content
+
+    def test_competency_details_section_has_a_back_to_top_link_per_entry(self, tmp_path):
+        record = _record(1, "Zoom", self._analysis())
+        content = write_interview_report(record, _config(tmp_path)).read_text(encoding="utf-8")
+        assert content.count("[↑ Back to top](#top)") == 2
+
+    def test_no_competency_scores_omits_score_summary_section(self, tmp_path):
+        analysis = self._analysis(session_summary={
+            "top_strengths": [], "top_issues": [], "one_thing_to_practice_next": "",
+        })
+        record = _record(1, "Zoom", analysis)
+        content = write_interview_report(record, _config(tmp_path)).read_text(encoding="utf-8")
+        assert "## Score Summary" not in content
+        assert "## Competency Details" not in content
 
 
 class TestTrendsAreScopedPerUser:

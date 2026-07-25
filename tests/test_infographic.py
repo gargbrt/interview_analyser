@@ -299,6 +299,78 @@ class TestInterviewInfographicProfileFields:
         assert "Overall competency score" not in content
 
 
+class TestScoreSummaryTable:
+    """The "upfront" Score Summary table: one row per competency linking
+    down to its detail section, a total row, and a decision line -- plus
+    the "back to top" links each detail section gets in return."""
+
+    def _analysis(self, **overrides):
+        analysis = {
+            "qa_pairs": [],
+            "session_summary": {
+                "top_strengths": [], "top_issues": [], "one_thing_to_practice_next": "",
+                "competency_scores": [
+                    {"name": "Leadership", "score": 82, "remark": "Took clear ownership."},
+                    {"name": "Execution", "score": 40, "remark": "Needs more detail."},
+                ],
+                "hire_recommendation": {"level": "Hire", "rationale": "Solid overall."},
+            },
+            "selection_probability": {"percent": 65, "label": "Hire", "binary_recommendation": "Recommended"},
+        }
+        analysis.update(overrides)
+        return analysis
+
+    def test_renders_a_row_per_competency_linking_to_its_detail_section(self, tmp_path):
+        record = _record(tmp_path, analysis_json=json.dumps(self._analysis()))
+        content = write_interview_infographic(record, _cfg(tmp_path)).read_text(encoding="utf-8")
+        assert 'class="summary-table"' in content
+        assert '<a class="summary-link" href="#comp-leadership">Leadership</a>' in content
+        assert 'id="comp-leadership"' in content
+
+    def test_renders_weightage_column(self, tmp_path):
+        record = _record(tmp_path, analysis_json=json.dumps(self._analysis()))
+        content = write_interview_infographic(record, _cfg(tmp_path)).read_text(encoding="utf-8")
+        assert "Weightage" in content
+
+    def test_renders_total_row(self, tmp_path):
+        record = _record(tmp_path, analysis_json=json.dumps(self._analysis()))
+        content = write_interview_infographic(record, _cfg(tmp_path)).read_text(encoding="utf-8")
+        assert 'class="summary-total"' in content
+        assert "Overall competency score" in content
+
+    def test_renders_decision_line_with_hire_level_percent_and_recommendation(self, tmp_path):
+        record = _record(tmp_path, analysis_json=json.dumps(self._analysis()))
+        content = write_interview_infographic(record, _cfg(tmp_path)).read_text(encoding="utf-8")
+        assert 'class="summary-decision"' in content
+        assert "Hire" in content
+        assert "65% selection probability" in content
+        assert "Recommended" in content
+
+    def test_detail_sections_get_a_back_to_top_link(self, tmp_path):
+        record = _record(tmp_path, analysis_json=json.dumps(self._analysis()))
+        content = write_interview_infographic(record, _cfg(tmp_path)).read_text(encoding="utf-8")
+        assert '<a class="back-to-top" href="#top">' in content
+        assert 'id="top"' in content
+
+    def test_no_competency_scores_omits_the_summary_table(self, tmp_path):
+        analysis = {
+            "qa_pairs": [], "session_summary": {"top_strengths": [], "top_issues": [], "one_thing_to_practice_next": ""},
+        }
+        record = _record(tmp_path, analysis_json=json.dumps(analysis))
+        content = write_interview_infographic(record, _cfg(tmp_path)).read_text(encoding="utf-8")
+        assert 'class="summary-table"' not in content
+
+    def test_escapes_html_in_competency_names(self, tmp_path):
+        analysis = self._analysis(session_summary={
+            "top_strengths": [], "top_issues": [], "one_thing_to_practice_next": "",
+            "competency_scores": [{"name": "<script>alert(1)</script>", "score": 50, "remark": ""}],
+            "hire_recommendation": {"level": "Hire", "rationale": ""},
+        })
+        record = _record(tmp_path, analysis_json=json.dumps(analysis))
+        content = write_interview_infographic(record, _cfg(tmp_path)).read_text(encoding="utf-8")
+        assert "<script>alert" not in content
+
+
 def test_infographic_path_is_alongside_the_markdown_report(tmp_path):
     record = _record(tmp_path)
     cfg = _cfg(tmp_path)

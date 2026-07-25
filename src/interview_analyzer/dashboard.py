@@ -202,6 +202,11 @@ def _configure_report_tags(text_widget) -> None:
     text_widget.tag_configure("bullet", lmargin1=14, lmargin2=28, spacing3=2)
     text_widget.tag_configure("quote", font=("Segoe UI", 9, "italic"), foreground="#5b645f")
     text_widget.tag_configure("text", spacing3=2)
+    # The Score Summary table (report.py/report_view.py): cells are tab-
+    # separated, so fixed pixel tab stops give reasonable column alignment
+    # regardless of the widget's proportional font.
+    text_widget.tag_configure("table_header", font=("Segoe UI", 9, "bold"), spacing1=8, spacing3=2, tabs=(260, 340))
+    text_widget.tag_configure("table_row", spacing3=2, tabs=(260, 340))
 
 
 # Transcript speaker labels: [Speaker] text, one line per transcribed

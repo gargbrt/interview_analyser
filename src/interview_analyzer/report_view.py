@@ -9,6 +9,17 @@ probability) on a red (worst) -> amber -> green (best) scale, matching the
 same palette infographic.py uses, so the in-app text view and the HTML
 infographic never disagree about what "good" looks like.
 
+Also understands two more of report.py's markdown conventions well enough
+to make the Score Summary table clickable in-app, not just in a real
+markdown viewer: pipe-delimited tables (header + "---" separator row,
+skipped, + body rows), and `[label](#anchor)` links, which `render_into_
+text_widget` binds to a Tk mark set at the matching "### {heading}"'s
+slug (see _slugify) so clicking a table row -- or a "back to top" link --
+scrolls the Text widget there via `.see()`. A literal `<a id="...">
+</a>` line (report.py's #top anchor, for real markdown viewers) is
+recognized and simply dropped -- Tk's "top" mark is always the buffer
+start regardless, so the raw HTML tag has nothing useful to render here.
+
 The parsing is a pure function (`parse_markdown_lines`) so it's testable
 without a Tk display; `render_into_text_widget` is the thin Tk-specific
 adapter the dashboard actually calls.
@@ -32,6 +43,18 @@ _OVERALL_SCORE_RE = re.compile(r"^Overall competency score — (\d+)/100$")
 _HIRE_RECOMMENDATION_RE = re.compile(r"^Hire recommendation: (.+)$")
 _SELECTION_PROBABILITY_RE = re.compile(r"^Estimated selection probability: (\d+)%")
 _BINARY_RECOMMENDATION_RE = re.compile(r"^Recommendation: (Recommended|Not Recommended)$")
+
+# report.py's pipe-delimited Score Summary table: a "| --- | --- |"-style
+# separator row (any mix of dashes/colons/pipes/whitespace) is recognized
+# and dropped entirely -- it's a markdown-table-syntax marker, not content.
+_TABLE_SEPARATOR_RE = re.compile(r"^\|?[\s:|-]+\|?$")
+# report.py's own bare HTML anchor convention (`<a id="top"></a>`) for real
+# markdown viewers -- Tk always has a "top" mark at the buffer start
+# regardless, so this line is recognized and simply dropped here.
+_HTML_ANCHOR_RE = re.compile(r'^<a id="[a-z0-9\-]+"></a>$')
+# [label](#anchor) link syntax -- can appear inside a table cell or as a
+# standalone line (e.g. report.py's "[↑ Back to top](#top)").
+_LINK_RE = re.compile(r"\[([^\]]+)\]\(#([a-z0-9\-]+)\)")
 
 # Kept in sync with infographic.py's palette (_WATCH/_GOOD) so the in-app
 # text view and the HTML infographic agree on what "good" vs "needs work"
@@ -77,6 +100,24 @@ def _hire_level_to_color(level: str) -> str | None:
     return _score_to_color(score)
 
 
+def _slugify(text: str) -> str:
+    """Same algorithm as report.py's own `_slugify` (duplicated rather than
+    imported, same reasoning as the duplicated color palette above) --
+    this is what turns a "### {name}" heading into the Tk mark name a
+    matching [name](#slug) link jumps to, so the two MUST agree."""
+    slug = re.sub(r"[^a-z0-9]+", "-", text.strip().lower()).strip("-")
+    return slug or "section"
+
+
+def _split_table_cells(line: str) -> list[str]:
+    stripped = line.strip()
+    if stripped.startswith("|"):
+        stripped = stripped[1:]
+    if stripped.endswith("|"):
+        stripped = stripped[:-1]
+    return [cell.strip() for cell in stripped.split("|")]
+
+
 def _colored(base_tag: str, color_hex: str) -> str:
     """Encodes a color into the tag string itself (rather than changing
     parse_markdown_lines's 2-tuple return shape) -- render_into_text_widget
@@ -87,15 +128,33 @@ def _colored(base_tag: str, color_hex: str) -> str:
 
 def parse_markdown_lines(markdown: str) -> list[tuple[str, str]]:
     """Return [(tag, display_text), ...] for each line, where tag is one of
-    "h1", "h2", "h3", "bullet", "quote", "blank", or "text" -- or, for a
-    competency score / hire recommendation / selection probability line,
-    that same base tag with "|color:#rrggbb" appended (see _colored)."""
+    "h1", "h2", "h3", "bullet", "quote", "blank", "text", "table_header", or
+    "table_row" -- or, for a competency score / hire recommendation /
+    selection probability line, that same base tag with "|color:#rrggbb"
+    appended (see _colored). A table_header/table_row's display_text is its
+    cells tab-joined; a cell (or any other line) may itself contain raw
+    "[label](#anchor)" link syntax, left as-is here for render_into_text_
+    widget to turn into a clickable jump (see module docstring)."""
     lines: list[tuple[str, str]] = []
+    table_started = False
     for raw_line in markdown.splitlines():
         line = raw_line.rstrip()
         if not line.strip():
+            table_started = False
             lines.append(("blank", ""))
-        elif line.startswith("### "):
+            continue
+        if _HTML_ANCHOR_RE.match(line.strip()):
+            continue
+        if line.lstrip().startswith("|") and line.rstrip().endswith("|"):
+            if _TABLE_SEPARATOR_RE.match(line.strip()):
+                continue
+            cells = _split_table_cells(_strip_inline_markers(line))
+            tag = "table_row" if table_started else "table_header"
+            table_started = True
+            lines.append((tag, "\t".join(cells)))
+            continue
+        table_started = False
+        if line.startswith("### "):
             lines.append(("h3", _strip_inline_markers(line[4:])))
         elif line.startswith("## "):
             lines.append(("h2", _strip_inline_markers(line[3:])))
@@ -129,13 +188,52 @@ def parse_markdown_lines(markdown: str) -> list[tuple[str, str]]:
     return lines
 
 
+def _jump_to_anchor(text_widget, anchor: str) -> None:
+    mark_name = f"anchor_{anchor}"
+    if mark_name in text_widget.mark_names():
+        text_widget.see(mark_name)
+
+
+def _insert_with_links(text_widget, existing_tags: set, text: str, base_tags: tuple) -> None:
+    """Inserts `text`, turning any "[label](#anchor)" substrings into a
+    clickable jump to that anchor's Tk mark -- everything else is inserted
+    as plain tagged text. Shared by every line type (table cells, bullets,
+    standalone "back to top" links) since a link can appear in any of
+    them, not just one specific tag."""
+    pos = 0
+    for m in _LINK_RE.finditer(text):
+        if m.start() > pos:
+            text_widget.insert("end", text[pos:m.start()], base_tags)
+        label, anchor = m.group(1), m.group(2)
+        link_tag = f"link_to_{anchor}"
+        if link_tag not in existing_tags:
+            text_widget.tag_configure(link_tag, foreground="#0f6e77", underline=True)
+            text_widget.tag_bind(link_tag, "<Button-1>", lambda e, a=anchor: _jump_to_anchor(e.widget, a))
+            text_widget.tag_bind(link_tag, "<Enter>", lambda e: e.widget.config(cursor="hand2"))
+            text_widget.tag_bind(link_tag, "<Leave>", lambda e: e.widget.config(cursor=""))
+            existing_tags.add(link_tag)
+        text_widget.insert("end", label, base_tags + (link_tag,))
+        pos = m.end()
+    if pos < len(text):
+        text_widget.insert("end", text[pos:], base_tags)
+
+
 def render_into_text_widget(text_widget, markdown: str) -> None:
     """Populate a Tkinter Text widget (must already have the tags below
     configured, see dashboard.py) with a readable rendering of `markdown`.
     Leaves the widget in its normal (editable) state when done is up to
-    the caller -- this only inserts content."""
+    the caller -- this only inserts content.
+
+    Also sets up navigation: a "top" mark at the buffer start, and a mark
+    per heading keyed by its slug (see _slugify) -- report.py's Score
+    Summary table links and "back to top" lines are turned into real
+    clickable jumps to these marks by _insert_with_links, working even
+    though these Text widgets are left in state="disabled" after
+    rendering (tag bindings and .see() aren't gated by that option)."""
     text_widget.delete("1.0", "end")
     existing_tags = set(text_widget.tag_names())
+    text_widget.mark_set("anchor_top", "1.0")
+    text_widget.mark_gravity("anchor_top", "left")
     for raw_tag, content in parse_markdown_lines(markdown):
         base_tag, _, color_part = raw_tag.partition("|color:")
         tk_tags = [base_tag]
@@ -148,9 +246,12 @@ def render_into_text_widget(text_widget, markdown: str) -> None:
 
         if base_tag == "blank":
             text_widget.insert("end", "\n")
+        elif base_tag in ("h1", "h2", "h3"):
+            mark_name = f"anchor_{_slugify(content)}"
+            text_widget.mark_set(mark_name, "end")
+            text_widget.mark_gravity(mark_name, "left")
+            _insert_with_links(text_widget, existing_tags, f"{content}\n", tuple(tk_tags))
         elif base_tag == "bullet":
-            text_widget.insert("end", f"  •  {content}\n", tuple(tk_tags))
-        elif base_tag == "quote":
-            text_widget.insert("end", f"{content}\n", tuple(tk_tags))
+            _insert_with_links(text_widget, existing_tags, f"  •  {content}\n", tuple(tk_tags))
         else:
-            text_widget.insert("end", f"{content}\n", tuple(tk_tags))
+            _insert_with_links(text_widget, existing_tags, f"{content}\n", tuple(tk_tags))

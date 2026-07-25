@@ -11,12 +11,24 @@ import collections
 import datetime as dt
 import os
 import pathlib
+import re
 from typing import Optional
 
 from .config_loader import Config
 from .confidence import competency_weight, format_confidence, weighted_competency_total
 from .db import InterviewRecord
 from .profiles import GENERIC_PROFILE, AssessmentProfile, competency_emphasis_map
+
+
+def _slugify(text: str) -> str:
+    """A stable #anchor id for a competency name -- e.g. for the Score
+    Summary table's per-parameter links and its matching "### {name}"
+    detail heading further down. report_view.py duplicates this exact
+    algorithm (same reasoning as its duplicated color palette) so a Tk
+    heading's auto-computed anchor always matches the href a table link
+    points at."""
+    slug = re.sub(r"[^a-z0-9]+", "-", text.strip().lower()).strip("-")
+    return slug or "section"
 
 
 def _stringify(value) -> str:
@@ -56,6 +68,7 @@ def _interview_report_lines(
     summary = analysis.get("session_summary", {})
 
     lines = [
+        '<a id="top"></a>',
         f"# Interview Report — {record.source_app or 'Unknown app'} — {date_str}",
         "",
         f"_Interview #{record.id} · started {record.started_at}_",
@@ -80,10 +93,40 @@ def _interview_report_lines(
         ]
         return lines
 
+    competency_scores = summary.get("competency_scores")
+    selection_probability = analysis.get("selection_probability")
+    hire_recommendation = summary.get("hire_recommendation")
+    emphasis_map = competency_emphasis_map(profile) if competency_scores else {}
+    overall = weighted_competency_total(competency_scores, profile) if competency_scores else None
+
+    if competency_scores:
+        lines += ["## Score Summary", ""]
+        lines += ["| Parameter | Score | Weightage |", "| --- | --- | --- |"]
+        for entry in competency_scores:
+            if not isinstance(entry, dict):
+                continue
+            name = _stringify(entry.get("name", ""))
+            score = entry.get("score")
+            score_text = f"{score}/100" if isinstance(score, (int, float)) and not isinstance(score, bool) else "N/A"
+            weight_text = (emphasis_map.get(name) or "").title() or "—"
+            lines.append(f"| [{name}](#{_slugify(name)}) | {score_text} | {weight_text} |")
+        if overall is not None:
+            lines.append(f"| **Overall competency score** | **{round(overall)}/100** | |")
+        lines.append("")
+        decision_parts = []
+        if isinstance(hire_recommendation, dict) and hire_recommendation.get("level"):
+            decision_parts.append(hire_recommendation["level"])
+        if selection_probability and selection_probability.get("percent") is not None:
+            decision_parts.append(f"{selection_probability['percent']}% selection probability")
+        if selection_probability and selection_probability.get("binary_recommendation"):
+            decision_parts.append(selection_probability["binary_recommendation"])
+        if decision_parts:
+            lines.append(f"**Decision:** {' · '.join(decision_parts)}")
+            lines.append("")
+
     lines += ["## Session Summary", ""]
     lines.append(f"**Confidence in this assessment:** {format_confidence(analysis.get('confidence_info'))}")
     lines.append("")
-    selection_probability = analysis.get("selection_probability")
     if selection_probability and selection_probability.get("percent") is not None:
         label = selection_probability.get("label")
         label_suffix = f" ({label})" if label else ""
@@ -93,28 +136,10 @@ def _interview_report_lines(
         if selection_probability.get("basis"):
             lines.append(f"_{selection_probability['basis']}_")
         lines.append("")
-    hire_recommendation = summary.get("hire_recommendation")
     if isinstance(hire_recommendation, dict) and hire_recommendation.get("level"):
         lines.append(f"**Hire recommendation:** {hire_recommendation['level']}")
         if hire_recommendation.get("rationale"):
             lines.append(hire_recommendation["rationale"])
-        lines.append("")
-    competency_scores = summary.get("competency_scores")
-    if competency_scores:
-        emphasis_map = competency_emphasis_map(profile)
-        lines.append("**Competency scores:**")
-        for entry in competency_scores:
-            if not isinstance(entry, dict):
-                continue
-            name = _stringify(entry.get("name", ""))
-            score = entry.get("score")
-            score_text = f" — {score}/100" if isinstance(score, (int, float)) and not isinstance(score, bool) else ""
-            emphasis = emphasis_map.get(name)
-            weight_text = f" ({emphasis} weight)" if emphasis else ""
-            lines.append(f"- **{name}**{weight_text}{score_text}: {entry.get('remark', '')}")
-        overall = weighted_competency_total(competency_scores, profile)
-        if overall is not None:
-            lines.append(f"- **Overall competency score** — {round(overall)}/100")
         lines.append("")
     if summary.get("top_strengths"):
         lines.append("**Top strengths:**")
@@ -127,6 +152,24 @@ def _interview_report_lines(
     if summary.get("one_thing_to_practice_next"):
         lines.append(f"**Focus for next practice:** {summary['one_thing_to_practice_next']}")
         lines.append("")
+
+    if competency_scores:
+        lines += ["## Competency Details", ""]
+        for entry in competency_scores:
+            if not isinstance(entry, dict):
+                continue
+            name = _stringify(entry.get("name", ""))
+            score = entry.get("score")
+            score_text = f"{score}/100" if isinstance(score, (int, float)) and not isinstance(score, bool) else "N/A"
+            emphasis = emphasis_map.get(name)
+            weight_text = emphasis.title() if emphasis else "—"
+            lines.append(f"### {name}")
+            lines.append(f"**Score:** {score_text} · **Weightage:** {weight_text}")
+            if entry.get("remark"):
+                lines.append(entry["remark"])
+            lines.append("")
+            lines.append("[↑ Back to top](#top)")
+            lines.append("")
 
     lines += ["## Question-by-question breakdown", ""]
     for i, qa in enumerate(qa_pairs, 1):

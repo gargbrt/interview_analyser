@@ -3,7 +3,7 @@ the dashboard (no Tk display needed here -- only the Text-widget adapter
 in report_view.render_into_text_widget touches Tkinter)."""
 from __future__ import annotations
 
-from interview_analyzer.report_view import _score_to_color, parse_markdown_lines
+from interview_analyzer.report_view import _score_to_color, _slugify, parse_markdown_lines
 
 SAMPLE = """\
 # Interview Report — Zoom — 2026-07-16
@@ -148,3 +148,76 @@ class TestColorCodedLines:
         tag, content = parse_markdown_lines(markdown)[0]
         assert content == "Overall competency score — 75/100"
         assert tag.split("|color:")[1] == _score_to_color(75)
+
+
+class TestSlugify:
+    def test_lowercases_and_hyphenates(self):
+        assert _slugify("Technical Expertise") == "technical-expertise"
+
+    def test_strips_non_alphanumeric_characters(self):
+        assert _slugify("Culture & Values Fit") == "culture-values-fit"
+
+    def test_empty_input_falls_back_to_a_placeholder(self):
+        assert _slugify("") == "section"
+
+    def test_matches_the_anchor_a_table_link_would_use(self):
+        # report.py's table links are built as #{slugify(name)} -- this
+        # module's own _slugify must produce the identical string so a Tk
+        # mark set from a "### {name}" heading is actually findable.
+        assert _slugify("Leadership") == "leadership"
+
+
+class TestTableParsing:
+    """report.py's Score Summary table: a header row, a "---" separator
+    row (dropped), and body rows -- each cell tab-joined into one line of
+    display text (see report_view.py's module docstring)."""
+
+    TABLE_MARKDOWN = (
+        "| Parameter | Score | Weightage |\n"
+        "| --- | --- | --- |\n"
+        "| [Leadership](#leadership) | 82/100 | High |\n"
+        "| **Overall competency score** | **75/100** | |"
+    )
+
+    def test_header_row_is_tagged_table_header(self):
+        tag, content = parse_markdown_lines(self.TABLE_MARKDOWN)[0]
+        assert tag == "table_header"
+        assert content == "Parameter\tScore\tWeightage"
+
+    def test_separator_row_is_dropped(self):
+        lines = parse_markdown_lines(self.TABLE_MARKDOWN)
+        assert not any("---" in content for _, content in lines)
+
+    def test_body_rows_are_tagged_table_row(self):
+        lines = parse_markdown_lines(self.TABLE_MARKDOWN)
+        body_rows = [content for tag, content in lines if tag == "table_row"]
+        assert "[Leadership](#leadership)\t82/100\tHigh" in body_rows
+        # bold markers around the total row are stripped like everywhere else
+        assert "Overall competency score\t75/100\t" in body_rows
+
+    def test_a_blank_line_ends_the_table_so_a_later_pipe_isnt_misread(self):
+        markdown = self.TABLE_MARKDOWN + "\n\n| not a table row, just text with pipes |"
+        lines = parse_markdown_lines(markdown)
+        # the line after the blank starts a NEW table (its own header), not
+        # a continuation of the first one's body
+        table_tags = [tag for tag, content in lines if "not a table row" in content]
+        assert table_tags == ["table_header"]
+
+    def test_non_table_content_is_unaffected(self):
+        assert parse_markdown_lines("Just a plain paragraph.") == [("text", "Just a plain paragraph.")]
+
+
+class TestAnchorLine:
+    def test_html_anchor_line_is_dropped_entirely(self):
+        assert parse_markdown_lines('<a id="top"></a>') == []
+
+    def test_html_anchor_line_among_other_content_does_not_disrupt_it(self):
+        markdown = '<a id="top"></a>\n# Title'
+        assert parse_markdown_lines(markdown) == [("h1", "Title")]
+
+    def test_link_syntax_is_preserved_as_is_in_plain_text_content(self):
+        # link substitution into a clickable jump happens in
+        # render_into_text_widget (Tk-specific), not in this pure parser
+        tag, content = parse_markdown_lines("[↑ Back to top](#top)")[0]
+        assert tag == "text"
+        assert content == "[↑ Back to top](#top)"

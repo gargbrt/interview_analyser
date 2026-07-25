@@ -21,6 +21,7 @@ from __future__ import annotations
 import datetime as dt
 import html
 import pathlib
+import re
 from typing import Optional
 
 from .config_loader import Config
@@ -67,6 +68,15 @@ def _score_to_color(score: float) -> str:
     return f"#{r:02x}{g:02x}{b:02x}"
 
 
+def _slugify(text: str) -> str:
+    """A stable #anchor id for a competency name -- shared convention with
+    report_view.py's Tk-side heading anchors (kept independent/duplicated
+    there, same reasoning as the color palette) so a name like "Culture &
+    Values Fit" always resolves to the same id in both places."""
+    slug = re.sub(r"[^a-z0-9]+", "-", text.strip().lower()).strip("-")
+    return slug or "row"
+
+
 def _e(value: object) -> str:
     """Escapes arbitrary (possibly model-generated) text for safe HTML
     embedding -- this file is opened directly in a real browser, so
@@ -102,25 +112,99 @@ def _confidence_dial_svg(score: Optional[int], aria_label: str = "Confidence") -
     """Draws a ring dial for any 0-100 score -- shared by the confidence
     dial and the selection-probability dial (see _render), which just pass
     a different aria_label so each stays correctly described for
-    accessibility despite drawing identically."""
+    accessibility despite drawing identically.
+
+    Colors are set via the `style` attribute using CSS custom properties
+    (var(--ink) etc.), NOT literal hex passed to the `fill`/`stroke`
+    attributes -- this SVG is inlined directly into the page, so it
+    inherits the same :root variables the rest of the page uses, including
+    the dark-mode override. A literal hex here would freeze the dial to
+    light-mode colors, making the score text unreadable (near-black on a
+    near-black panel) once dark mode swaps the panel background."""
     if score is None:
         return f"""<svg width="88" height="88" viewBox="0 0 88 88" role="img" aria-label="{aria_label}: not available">
-<circle cx="44" cy="44" r="36" fill="none" stroke="{_LINE}" stroke-width="8"/>
-<text x="44" y="48" text-anchor="middle" font-family="-apple-system,sans-serif" font-size="12" fill="{_INK_FAINT}">N/A</text>
+<circle cx="44" cy="44" r="36" fill="none" style="stroke:var(--line);" stroke-width="8"/>
+<text x="44" y="48" text-anchor="middle" font-family="-apple-system,sans-serif" font-size="12" style="fill:var(--ink-faint);">N/A</text>
 </svg>"""
     circumference = 2 * 3.14159265 * 36
     offset = circumference * (1 - max(0, min(100, score)) / 100)
     return f"""<svg width="88" height="88" viewBox="0 0 88 88" role="img" aria-label="{aria_label} score: {score} out of 100">
-<circle cx="44" cy="44" r="36" fill="none" stroke="{_LINE}" stroke-width="8"/>
-<circle cx="44" cy="44" r="36" fill="none" stroke="{_ACCENT}" stroke-width="8" stroke-linecap="round"
+<circle cx="44" cy="44" r="36" fill="none" style="stroke:var(--line);" stroke-width="8"/>
+<circle cx="44" cy="44" r="36" fill="none" style="stroke:var(--accent);" stroke-width="8" stroke-linecap="round"
         stroke-dasharray="{circumference:.2f}" stroke-dashoffset="{offset:.2f}" transform="rotate(-90 44 44)"/>
 <text x="44" y="40" text-anchor="middle" font-family="Cascadia Code,SF Mono,Consolas,monospace"
-      font-size="22" font-weight="600" fill="{_INK}">{score}</text>
-<text x="44" y="55" text-anchor="middle" font-family="-apple-system,sans-serif" font-size="9" fill="{_INK_FAINT}">/ 100</text>
+      font-size="22" font-weight="600" style="fill:var(--ink);">{score}</text>
+<text x="44" y="55" text-anchor="middle" font-family="-apple-system,sans-serif" font-size="9" style="fill:var(--ink-faint);">/ 100</text>
 </svg>"""
 
 
-def _competency_row_html(entry: dict, weight: Optional[str] = None) -> str:
+def _score_summary_table_html(
+    competency_scores: list, emphasis_map: dict, overall_score: Optional[float],
+) -> str:
+    """The "upfront" table: one row per competency (name links down to its
+    full detail section via #comp-{slug}, see _competency_row_html), each
+    with its score and profile-context weightage, plus a bolded total row.
+    Empty string (renders nothing) if there are no usable competency scores
+    -- same gating as the detail section below it."""
+    rows = []
+    for entry in competency_scores:
+        if not isinstance(entry, dict):
+            continue
+        name = _stringify(entry.get("name", ""))
+        score = entry.get("score")
+        has_score = isinstance(score, (int, float)) and not isinstance(score, bool)
+        score_text = f"{score}/100" if has_score else "N/A"
+        score_style = f' style="color:{_score_to_color(score)};"' if has_score else ""
+        weight = emphasis_map.get(name)
+        weight_text = weight.title() if weight else "—"
+        rows.append(f"""<tr>
+<td><a class="summary-link" href="#comp-{_e(_slugify(name))}">{_e(name)}</a></td>
+<td{score_style}>{_e(score_text)}</td>
+<td>{_e(weight_text)}</td>
+</tr>""")
+    if not rows:
+        return ""
+    total_row = ""
+    if overall_score is not None:
+        total_row = (
+            f'<tr class="summary-total"><td>Overall competency score</td>'
+            f'<td style="color:{_score_to_color(overall_score)};">{round(overall_score)}/100</td><td></td></tr>'
+        )
+    return f"""<table class="summary-table">
+<thead><tr><th>Parameter</th><th>Score</th><th>Weightage</th></tr></thead>
+<tbody>
+{"".join(rows)}
+{total_row}
+</tbody>
+</table>"""
+
+
+def _decision_summary_html(
+    hire_level: str, selection_percent: Optional[int], binary_recommendation: Optional[str],
+) -> str:
+    """A compact "along with the decision" line shown right under the Score
+    Summary table -- the same three signals already shown elsewhere on the
+    page (hire-scale badge, selection-probability dial, recommendation
+    pill), repeated here so the upfront table is a genuinely standalone
+    summary a reader doesn't have to scroll further to understand."""
+    parts = []
+    if hire_level:
+        parts.append(_e(hire_level))
+    if selection_percent is not None:
+        parts.append(f"{selection_percent}% selection probability")
+    if binary_recommendation:
+        parts.append(_e(binary_recommendation))
+    if not parts:
+        return ""
+    return f'<p class="summary-decision"><strong>Decision:</strong> {" &middot; ".join(parts)}</p>'
+
+
+def _competency_row_html(entry: dict, weight: Optional[str] = None, anchor_id: Optional[str] = None) -> str:
+    """`anchor_id`, when given, makes this row a jump target for the Score
+    Summary table's per-parameter links (see _score_summary_table_html) and
+    adds a "back to top" link so the reader can return to that table --
+    omitted for write_trends_infographic's reuse of this same row markup,
+    since trends has no summary table linking into it."""
     if not isinstance(entry, dict):
         return ""
     name = _stringify(entry.get("name", ""))
@@ -132,10 +216,13 @@ def _competency_row_html(entry: dict, weight: Optional[str] = None) -> str:
     remark = entry.get("remark", "")
     remark_html = f'<p class="competency-remark">{_e(remark)}</p>' if remark else ""
     weight_html = f'<span class="competency-weight">{_e(weight)} weight</span>' if weight else ""
-    return f"""<div class="competency-row">
+    id_attr = f' id="{_e(anchor_id)}"' if anchor_id else ""
+    back_to_top_html = '<a class="back-to-top" href="#top">&uarr; Back to top</a>' if anchor_id else ""
+    return f"""<div class="competency-row"{id_attr}>
 <div class="competency-head"><span class="competency-name">{_e(name)}{weight_html}</span><span class="competency-score">{_e(score_text)}</span></div>
 <div class="bar-track"><div class="bar-fill" style="width:{width_pct}%; background:{bar_color};"></div></div>
 {remark_html}
+{back_to_top_html}
 </div>"""
 
 
@@ -223,7 +310,10 @@ def _render(record: InterviewRecord, analysis: dict) -> str:
     )
 
     competency_rows_html = "".join(
-        _competency_row_html(c, emphasis_map.get(_stringify(c.get("name", ""))))
+        _competency_row_html(
+            c, emphasis_map.get(_stringify(c.get("name", ""))),
+            anchor_id=f"comp-{_slugify(_stringify(c.get('name', '')))}",
+        )
         for c in competency_scores if isinstance(c, dict)
     )
     overall_score_html = (
@@ -236,6 +326,14 @@ def _render(record: InterviewRecord, analysis: dict) -> str:
 {overall_score_html}
 <div class="competency-list">{competency_rows_html}</div>"""
         if competency_rows_html else ""
+    )
+    score_summary_table_html = _score_summary_table_html(competency_scores, emphasis_map, overall_score)
+    decision_summary_html = _decision_summary_html(hire_level, selection_percent, binary_recommendation)
+    score_summary_block = (
+        f"""<p class="qa-heading">Score Summary</p>
+{score_summary_table_html}
+{decision_summary_html}"""
+        if score_summary_table_html else ""
     )
 
     return f"""<!doctype html>
@@ -295,6 +393,17 @@ body {{ background: var(--ground); margin: 0; }}
 .overall-score {{ display: flex; align-items: baseline; justify-content: space-between; background: var(--panel); border: 1px solid var(--line); border-radius: 12px; padding: .85rem 1.1rem; margin-bottom: .9rem; }}
 .overall-score-label {{ font-size: 12.5px; font-weight: 600; color: var(--ink-soft); }}
 .overall-score-value {{ font-family: var(--font-mono); font-size: 17px; font-weight: 700; }}
+.summary-table {{ width: 100%; border-collapse: collapse; background: var(--panel); border: 1px solid var(--line); border-radius: 12px; overflow: hidden; margin-bottom: .75rem; }}
+.summary-table th, .summary-table td {{ text-align: left; padding: .55rem .9rem; font-size: 13px; border-bottom: 1px solid var(--line); }}
+.summary-table th {{ font-size: 11px; letter-spacing: .04em; text-transform: uppercase; color: var(--ink-faint); font-weight: 600; }}
+.summary-table tr:last-child td {{ border-bottom: none; }}
+.summary-table td:nth-child(2) {{ font-family: var(--font-mono); font-weight: 600; }}
+.summary-link {{ color: var(--accent-ink); text-decoration: none; font-weight: 600; }}
+.summary-link:hover {{ text-decoration: underline; }}
+.summary-total td {{ font-weight: 700; border-top: 2px solid var(--line); }}
+.summary-decision {{ font-size: 13.5px; color: var(--ink-soft); margin: 0 0 1.75rem; }}
+.back-to-top {{ display: inline-block; font-size: 11.5px; color: var(--accent-ink); text-decoration: none; margin-top: .6rem; }}
+.back-to-top:hover {{ text-decoration: underline; }}
 .columns {{ display: grid; grid-template-columns: 1fr 1fr; gap: 1.25rem; margin-bottom: 2rem; }}
 .panel {{ background: var(--panel); border: 1px solid var(--line); border-radius: 12px; padding: 1.1rem 1.25rem 1.25rem; }}
 .panel h2 {{ font-family: var(--font-display); font-size: 15px; font-weight: 600; margin: 0 0 .75rem; display: flex; align-items: center; gap: .4rem; }}
@@ -322,12 +431,14 @@ body {{ background: var(--ground); margin: 0; }}
 </style>
 </head>
 <body>
-<div class="sheet">
+<div class="sheet" id="top">
   <div class="masthead">
     <p class="eyebrow">Interview Analyzer &middot; session report</p>
     <h1>{_e(title)}</h1>
     <p class="meta">{_e(app_name)} &middot; {_e(date_str)} &middot; <code>#{record.id}</code></p>
   </div>
+
+  {score_summary_block}
 
   <div class="top-grid">
     {focus_block}
