@@ -22,6 +22,7 @@ guidance is.
 """
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass, field
 from typing import Optional
 
@@ -64,6 +65,7 @@ COMPANY_TYPES: list[str] = [
 ]
 
 _TIER_ORDER = ["minor", "low", "moderate", "high", "critical"]
+_TIER_VALUE: dict[str, int] = {tier: i for i, tier in enumerate(_TIER_ORDER)}
 
 
 def _tier_at_least(tier: str, floor: str) -> bool:
@@ -243,9 +245,23 @@ GENERIC_PROFILE = AssessmentProfile(
 
 def _competency_emphasis(profile: AssessmentProfile, competency: str) -> str:
     """Combines seniority/role/industry/company_type emphasis for one
-    competency into a single tier -- the highest (most critical) tier any
-    one dimension assigns wins, since a competency that's critical for even
-    one dimension of the context genuinely matters for this interview."""
+    competency into a single tier -- the AVERAGE of whichever dimensions
+    apply, rounded to the nearest tier (half rounds up), NOT the max of
+    them.
+
+    This used to take the max, on the reasoning that a competency critical
+    for even one dimension genuinely matters. In practice, the seniority
+    and role tables are both built around the same "senior generalist"
+    competencies (ownership, communication, leadership, business acumen,
+    stakeholder management...), so their "critical" lists overlap heavily --
+    max-combining them meant a Senior/Lead + Product-style profile came out
+    critical/high on literally every competency and moderate/low/minor on
+    none, which defeats the point of showing a weightage at all (see the
+    bug report that prompted this change). Averaging still lets a
+    competency that's genuinely emphasized across multiple dimensions
+    surface as critical, but one that's only strongly emphasized in a
+    single dimension (with the others neutral/"moderate") now lands one
+    tier lower instead of getting pulled all the way up."""
     tiers = []
     if profile.seniority and profile.seniority in SENIORITY_EMPHASIS:
         tiers.append(SENIORITY_EMPHASIS[profile.seniority].get(competency, "moderate"))
@@ -257,7 +273,9 @@ def _competency_emphasis(profile: AssessmentProfile, competency: str) -> str:
         tiers.append(COMPANY_TYPE_EMPHASIS[profile.company_type].get(competency, "moderate"))
     if not tiers:
         return "moderate"
-    return max(tiers, key=_TIER_ORDER.index)
+    average = sum(_TIER_VALUE[t] for t in tiers) / len(tiers)
+    index = min(len(_TIER_ORDER) - 1, math.floor(average + 0.5))
+    return _TIER_ORDER[index]
 
 
 def competency_emphasis_map(profile: AssessmentProfile) -> dict[str, str]:

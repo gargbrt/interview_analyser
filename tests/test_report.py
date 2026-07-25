@@ -391,7 +391,7 @@ class TestInterviewReportProfileFields:
             "hire_recommendation": {"level": "Hire", "rationale": ""},
         })
         record = _record(1, "Zoom", analysis)
-        content = write_interview_report(record, _config(tmp_path)).read_text()
+        content = write_interview_report(record, _config(tmp_path)).read_text(encoding="utf-8")
         assert "Overall competency score" in content
 
     def test_omits_overall_competency_score_when_no_scores(self, tmp_path):
@@ -434,7 +434,8 @@ class TestScoreSummaryTableAndAnchors:
         record = _record(1, "Zoom", self._analysis())
         content = write_interview_report(record, _config(tmp_path)).read_text(encoding="utf-8")
         assert "## Score Summary" in content
-        assert "| [Leadership](#leadership) | 82/100 | " in content
+        assert "[Leadership](#leadership)" in content
+        assert "82/100 | " in content
         assert "### Leadership" in content
 
     def test_score_summary_table_has_a_total_row(self, tmp_path):
@@ -460,6 +461,83 @@ class TestScoreSummaryTableAndAnchors:
         content = write_interview_report(record, _config(tmp_path)).read_text(encoding="utf-8")
         assert "## Score Summary" not in content
         assert "## Competency Details" not in content
+
+
+class TestScoreSummaryBestAndWorstHighlighting:
+    """The Score Summary table flags the single highest-scoring row as
+    "Strongest" and the single lowest-scoring as "Needs focus", so a reader
+    can immediately spot what to look at without scanning every row."""
+
+    def _analysis(self, competency_scores, **overrides):
+        base = {
+            "qa_pairs": [],
+            "session_summary": {
+                "top_strengths": [], "top_issues": [], "one_thing_to_practice_next": "",
+                "competency_scores": competency_scores,
+                "hire_recommendation": {"level": "Hire", "rationale": ""},
+            },
+        }
+        base.update(overrides)
+        return base
+
+    def test_highest_score_is_flagged_strongest(self, tmp_path):
+        analysis = self._analysis([
+            {"name": "Leadership", "score": 82, "remark": ""},
+            {"name": "Execution", "score": 40, "remark": ""},
+            {"name": "Communication", "score": 60, "remark": ""},
+        ])
+        record = _record(1, "Zoom", analysis)
+        content = write_interview_report(record, _config(tmp_path)).read_text(encoding="utf-8")
+        assert "[Leadership](#leadership) · ⭐ Strongest" in content
+        assert content.count("⭐ Strongest") == 1
+
+    def test_lowest_score_is_flagged_needs_focus(self, tmp_path):
+        analysis = self._analysis([
+            {"name": "Leadership", "score": 82, "remark": ""},
+            {"name": "Execution", "score": 40, "remark": ""},
+            {"name": "Communication", "score": 60, "remark": ""},
+        ])
+        record = _record(1, "Zoom", analysis)
+        content = write_interview_report(record, _config(tmp_path)).read_text(encoding="utf-8")
+        assert "[Execution](#execution) · ⚠ Needs focus" in content
+
+    def test_middling_score_gets_no_badge(self, tmp_path):
+        analysis = self._analysis([
+            {"name": "Leadership", "score": 82, "remark": ""},
+            {"name": "Execution", "score": 40, "remark": ""},
+            {"name": "Communication", "score": 60, "remark": ""},
+        ])
+        record = _record(1, "Zoom", analysis)
+        content = write_interview_report(record, _config(tmp_path)).read_text(encoding="utf-8")
+        assert "[Communication](#communication) |" in content
+
+    def test_no_highlighting_when_all_scores_are_tied(self, tmp_path):
+        analysis = self._analysis([
+            {"name": "Leadership", "score": 70, "remark": ""},
+            {"name": "Execution", "score": 70, "remark": ""},
+        ])
+        record = _record(1, "Zoom", analysis)
+        content = write_interview_report(record, _config(tmp_path)).read_text(encoding="utf-8")
+        assert "⭐" not in content
+        assert "⚠" not in content
+
+    def test_no_highlighting_with_only_one_competency(self, tmp_path):
+        analysis = self._analysis([{"name": "Leadership", "score": 70, "remark": ""}])
+        record = _record(1, "Zoom", analysis)
+        content = write_interview_report(record, _config(tmp_path)).read_text(encoding="utf-8")
+        assert "⭐" not in content
+        assert "⚠" not in content
+
+    def test_ties_at_the_extremes_flag_every_tied_row(self, tmp_path):
+        analysis = self._analysis([
+            {"name": "Leadership", "score": 90, "remark": ""},
+            {"name": "Execution", "score": 90, "remark": ""},
+            {"name": "Communication", "score": 40, "remark": ""},
+        ])
+        record = _record(1, "Zoom", analysis)
+        content = write_interview_report(record, _config(tmp_path)).read_text(encoding="utf-8")
+        assert content.count("⭐ Strongest") == 2
+        assert content.count("⚠ Needs focus") == 1
 
 
 class TestTrendsAreScopedPerUser:

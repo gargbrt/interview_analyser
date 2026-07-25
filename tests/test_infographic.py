@@ -371,6 +371,79 @@ class TestScoreSummaryTable:
         assert "<script>alert" not in content
 
 
+class TestScoreSummaryBestAndWorstHighlighting:
+    """The highest-scoring row is flagged "Strongest" and the lowest-scoring
+    "Needs focus" so a reader can spot what to look at without scanning
+    every row (see report._best_and_worst_scores, shared with report.py)."""
+
+    def _analysis(self, competency_scores, **overrides):
+        analysis = {
+            "qa_pairs": [],
+            "session_summary": {
+                "top_strengths": [], "top_issues": [], "one_thing_to_practice_next": "",
+                "competency_scores": competency_scores,
+                "hire_recommendation": {"level": "Hire", "rationale": ""},
+            },
+        }
+        analysis.update(overrides)
+        return analysis
+
+    def test_highest_score_row_gets_the_best_class_and_badge(self, tmp_path):
+        analysis = self._analysis([
+            {"name": "Leadership", "score": 82, "remark": ""},
+            {"name": "Execution", "score": 40, "remark": ""},
+            {"name": "Communication", "score": 60, "remark": ""},
+        ])
+        record = _record(tmp_path, analysis_json=json.dumps(analysis))
+        content = write_interview_infographic(record, _cfg(tmp_path)).read_text(encoding="utf-8")
+        assert '<tr class="summary-best">' in content
+        assert "summary-badge-best" in content
+        assert "Strongest" in content
+
+    def test_lowest_score_row_gets_the_worst_class_and_badge(self, tmp_path):
+        analysis = self._analysis([
+            {"name": "Leadership", "score": 82, "remark": ""},
+            {"name": "Execution", "score": 40, "remark": ""},
+            {"name": "Communication", "score": 60, "remark": ""},
+        ])
+        record = _record(tmp_path, analysis_json=json.dumps(analysis))
+        content = write_interview_infographic(record, _cfg(tmp_path)).read_text(encoding="utf-8")
+        assert '<tr class="summary-worst">' in content
+        assert "summary-badge-worst" in content
+        assert "Needs focus" in content
+
+    def test_middling_score_gets_no_highlight_class(self, tmp_path):
+        analysis = self._analysis([
+            {"name": "Leadership", "score": 82, "remark": ""},
+            {"name": "Execution", "score": 40, "remark": ""},
+            {"name": "Communication", "score": 60, "remark": ""},
+        ])
+        record = _record(tmp_path, analysis_json=json.dumps(analysis))
+        content = write_interview_infographic(record, _cfg(tmp_path)).read_text(encoding="utf-8")
+        assert '<a class="summary-link" href="#comp-communication">Communication</a></td>' in content
+
+    def test_no_highlighting_when_all_scores_are_tied(self, tmp_path):
+        analysis = self._analysis([
+            {"name": "Leadership", "score": 70, "remark": ""},
+            {"name": "Execution", "score": 70, "remark": ""},
+        ])
+        record = _record(tmp_path, analysis_json=json.dumps(analysis))
+        content = write_interview_infographic(record, _cfg(tmp_path)).read_text(encoding="utf-8")
+        assert '<tr class="summary-best">' not in content
+        assert '<tr class="summary-worst">' not in content
+
+    def test_ties_at_the_extremes_flag_every_tied_row(self, tmp_path):
+        analysis = self._analysis([
+            {"name": "Leadership", "score": 90, "remark": ""},
+            {"name": "Execution", "score": 90, "remark": ""},
+            {"name": "Communication", "score": 40, "remark": ""},
+        ])
+        record = _record(tmp_path, analysis_json=json.dumps(analysis))
+        content = write_interview_infographic(record, _cfg(tmp_path)).read_text(encoding="utf-8")
+        assert content.count('<tr class="summary-best">') == 2
+        assert content.count('<tr class="summary-worst">') == 1
+
+
 def test_infographic_path_is_alongside_the_markdown_report(tmp_path):
     record = _record(tmp_path)
     cfg = _cfg(tmp_path)

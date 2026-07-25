@@ -85,16 +85,48 @@ def test_competency_emphasis_map_covers_every_selected_competency():
     assert all(v in ("critical", "high", "moderate", "low", "minor") for v in emphasis.values())
 
 
-def test_competency_emphasis_takes_the_highest_tier_across_dimensions():
-    """Regression coverage for the "any dimension calling it critical wins"
-    rule: Data role rates every competency "low", but Director+ seniority
-    rates Leadership "critical" -- the combined result must be critical, not
-    an average or the role's own low rating."""
+def test_competency_emphasis_averages_across_dimensions_not_takes_the_max():
+    """Regression coverage: this used to take the max tier across
+    dimensions, which meant a competency critical in just ONE dimension
+    stayed critical regardless of how neutral the others were. Since the
+    seniority and role tables both skew heavily toward the same "senior
+    generalist" competencies, max-combining them produced an almost-
+    all-critical/high profile for any Senior/Lead + Product-style profile,
+    with no differentiation left at all -- see the real bug report this
+    fixed. Data role rates Leadership "low" (1); Director+ seniority rates
+    it "critical" (4); their average (2.5, rounds up) is "high", not
+    "critical" and not the role's own "low" either."""
     profile = AssessmentProfile(
         competencies=["Leadership"], role="Data", seniority="Director+",
     )
     emphasis = competency_emphasis_map(profile)
-    assert emphasis["Leadership"] == "critical"
+    assert emphasis["Leadership"] == "high"
+
+
+def test_competency_emphasis_still_reaches_critical_when_multiple_dimensions_agree():
+    """A competency genuinely critical across enough dimensions should
+    still surface as critical -- averaging doesn't erase real signal, it
+    only stops a single strong dimension from dominating three neutral
+    ones."""
+    profile = AssessmentProfile(
+        competencies=["Business Acumen"], role="Product", seniority="Senior/Lead",
+        industry="FinTech", company_type="Consulting",
+    )
+    emphasis = competency_emphasis_map(profile)
+    assert emphasis["Business Acumen"] == "critical"
+
+
+def test_senior_lead_product_profile_is_no_longer_uniformly_critical():
+    """Regression coverage for the exact real-world case that surfaced the
+    bug: a Senior/Lead + Product (Generic industry/company) profile used to
+    come out critical/high on all 12 competencies with nothing lower --
+    averaging must produce at least some differentiation."""
+    profile = AssessmentProfile(
+        role="Product", seniority="Senior/Lead", industry="Generic", company_type="Generic",
+    )
+    emphasis = competency_emphasis_map(profile)
+    assert "critical" not in emphasis.values()
+    assert "moderate" in emphasis.values()
 
 
 def test_generic_profile_guidance_has_no_emphasis_bullets():

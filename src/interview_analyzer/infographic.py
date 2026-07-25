@@ -28,7 +28,7 @@ from .config_loader import Config
 from .confidence import weighted_competency_total
 from .db import InterviewRecord
 from .profiles import GENERIC_PROFILE, competency_emphasis_map
-from .report import _stringify, aggregate_trends, trends_report_path
+from .report import _best_and_worst_scores, _stringify, aggregate_trends, trends_report_path
 
 # Muted, professional palette -- avoids the near-universal AI-generated-
 # design defaults (warm cream + terracotta, or neon-on-near-black).
@@ -144,8 +144,12 @@ def _score_summary_table_html(
     """The "upfront" table: one row per competency (name links down to its
     full detail section via #comp-{slug}, see _competency_row_html), each
     with its score and profile-context weightage, plus a bolded total row.
-    Empty string (renders nothing) if there are no usable competency scores
-    -- same gating as the detail section below it."""
+    The single highest-scoring row is flagged "Strongest" and the single
+    lowest-scoring "Needs focus" (see _best_and_worst_scores) so a reader
+    can spot what to look at without scanning every row. Empty string
+    (renders nothing) if there are no usable competency scores -- same
+    gating as the detail section below it."""
+    best_score, worst_score = _best_and_worst_scores(competency_scores)
     rows = []
     for entry in competency_scores:
         if not isinstance(entry, dict):
@@ -157,8 +161,16 @@ def _score_summary_table_html(
         score_style = f' style="color:{_score_to_color(score)};"' if has_score else ""
         weight = emphasis_map.get(name)
         weight_text = weight.title() if weight else "—"
-        rows.append(f"""<tr>
-<td><a class="summary-link" href="#comp-{_e(_slugify(name))}">{_e(name)}</a></td>
+        row_class = ""
+        badge_html = ""
+        if has_score and best_score is not None and score == best_score:
+            row_class = ' class="summary-best"'
+            badge_html = '<span class="summary-badge summary-badge-best">&#9733; Strongest</span>'
+        elif has_score and worst_score is not None and score == worst_score:
+            row_class = ' class="summary-worst"'
+            badge_html = '<span class="summary-badge summary-badge-worst">&#9888; Needs focus</span>'
+        rows.append(f"""<tr{row_class}>
+<td><a class="summary-link" href="#comp-{_e(_slugify(name))}">{_e(name)}</a>{badge_html}</td>
 <td{score_style}>{_e(score_text)}</td>
 <td>{_e(weight_text)}</td>
 </tr>""")
@@ -402,6 +414,11 @@ body {{ background: var(--ground); margin: 0; }}
 .summary-link:hover {{ text-decoration: underline; }}
 .summary-total td {{ font-weight: 700; border-top: 2px solid var(--line); }}
 .summary-decision {{ font-size: 13.5px; color: var(--ink-soft); margin: 0 0 1.75rem; }}
+.summary-table tr.summary-best td {{ background: var(--good-tint); }}
+.summary-table tr.summary-worst td {{ background: var(--watch-tint); }}
+.summary-badge {{ display: inline-block; margin-left: .5rem; font-size: 10px; font-weight: 700; text-transform: uppercase; letter-spacing: .03em; }}
+.summary-badge-best {{ color: var(--good); }}
+.summary-badge-worst {{ color: var(--watch); }}
 .back-to-top {{ display: inline-block; font-size: 11.5px; color: var(--accent-ink); text-decoration: none; margin-top: .6rem; }}
 .back-to-top:hover {{ text-decoration: underline; }}
 .columns {{ display: grid; grid-template-columns: 1fr 1fr; gap: 1.25rem; margin-bottom: 2rem; }}

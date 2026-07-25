@@ -31,6 +31,25 @@ def _slugify(text: str) -> str:
     return slug or "section"
 
 
+def _best_and_worst_scores(competency_scores: Optional[list]) -> tuple:
+    """The single highest and lowest competency scores, for flagging the
+    strongest and most-in-need-of-focus rows in the Score Summary table
+    (used by both this module and infographic.py). Returns (None, None) --
+    nothing to highlight -- when there are fewer than two distinct scores
+    to meaningfully rank (a single competency, or every competency tied at
+    the same score)."""
+    scores = [
+        e.get("score") for e in (competency_scores or [])
+        if isinstance(e, dict) and isinstance(e.get("score"), (int, float)) and not isinstance(e.get("score"), bool)
+    ]
+    if len(scores) < 2:
+        return None, None
+    best, worst = max(scores), min(scores)
+    if best == worst:
+        return None, None
+    return best, worst
+
+
 def _stringify(value) -> str:
     """LLM output doesn't always exactly match the requested JSON schema --
     smaller/local models in particular sometimes return a richer object
@@ -100,6 +119,7 @@ def _interview_report_lines(
     overall = weighted_competency_total(competency_scores, profile) if competency_scores else None
 
     if competency_scores:
+        best_score, worst_score = _best_and_worst_scores(competency_scores)
         lines += ["## Score Summary", ""]
         lines += ["| Parameter | Score | Weightage |", "| --- | --- | --- |"]
         for entry in competency_scores:
@@ -107,9 +127,15 @@ def _interview_report_lines(
                 continue
             name = _stringify(entry.get("name", ""))
             score = entry.get("score")
-            score_text = f"{score}/100" if isinstance(score, (int, float)) and not isinstance(score, bool) else "N/A"
+            has_score = isinstance(score, (int, float)) and not isinstance(score, bool)
+            score_text = f"{score}/100" if has_score else "N/A"
             weight_text = (emphasis_map.get(name) or "").title() or "—"
-            lines.append(f"| [{name}](#{_slugify(name)}) | {score_text} | {weight_text} |")
+            badge = ""
+            if has_score and best_score is not None and score == best_score:
+                badge = " · ⭐ Strongest"
+            elif has_score and worst_score is not None and score == worst_score:
+                badge = " · ⚠ Needs focus"
+            lines.append(f"| [{name}](#{_slugify(name)}){badge} | {score_text} | {weight_text} |")
         if overall is not None:
             lines.append(f"| **Overall competency score** | **{round(overall)}/100** | |")
         lines.append("")
