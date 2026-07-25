@@ -463,6 +463,71 @@ class TestScoreSummaryTableAndAnchors:
         assert "## Competency Details" not in content
 
 
+class TestCompetencyLinksToRelatedQuestions:
+    """Each competency's detail section links to the specific Q&A pairs
+    whose issues were tagged under it (report._questions_for_competency),
+    behind a collapsible "View details" toggle (see report_view.py's
+    Tk-side elide-tag implementation of that toggle)."""
+
+    def _analysis(self, qa_pairs, **overrides):
+        base = {
+            "qa_pairs": qa_pairs,
+            "session_summary": {
+                "top_strengths": [], "top_issues": [], "one_thing_to_practice_next": "",
+                "competency_scores": [{"name": "Problem Solving", "score": 60, "remark": "Mixed."}],
+                "hire_recommendation": {"level": "Hire", "rationale": ""},
+            },
+        }
+        base.update(overrides)
+        return base
+
+    def test_links_to_each_question_tagged_with_this_competency(self, tmp_path):
+        qa_pairs = [
+            {
+                "question": "How would you scale this system?",
+                "answer_summary": "...",
+                "issues": [{"category": "Problem Solving", "detail": "Vague.", "excerpt": ""}],
+            },
+            {
+                "question": "Tell me about a conflict you resolved.",
+                "answer_summary": "...",
+                "issues": [{"category": "Communication", "detail": "Rambled.", "excerpt": ""}],
+            },
+        ]
+        record = _record(1, "Zoom", self._analysis(qa_pairs))
+        content = write_interview_report(record, _config(tmp_path)).read_text(encoding="utf-8")
+        assert "View details (1 question)" in content
+        assert "[Q1. How would you scale this system?](#q1-how-would-you-scale-this-system)" in content
+        assert "Tell me about a conflict" not in content.split("Related questions:")[1].split("<!--")[0]
+
+    def test_pluralizes_the_question_count(self, tmp_path):
+        qa_pairs = [
+            {"question": "Q A", "answer_summary": "", "issues": [{"category": "Problem Solving", "detail": "", "excerpt": ""}]},
+            {"question": "Q B", "answer_summary": "", "issues": [{"category": "Problem Solving", "detail": "", "excerpt": ""}]},
+        ]
+        record = _record(1, "Zoom", self._analysis(qa_pairs))
+        content = write_interview_report(record, _config(tmp_path)).read_text(encoding="utf-8")
+        assert "View details (2 questions)" in content
+
+    def test_wraps_related_questions_in_collapsible_sentinels(self, tmp_path):
+        qa_pairs = [
+            {"question": "Q A", "answer_summary": "", "issues": [{"category": "Problem Solving", "detail": "", "excerpt": ""}]},
+        ]
+        record = _record(1, "Zoom", self._analysis(qa_pairs))
+        content = write_interview_report(record, _config(tmp_path)).read_text(encoding="utf-8")
+        assert "<!-- collapsible:problem-solving:start -->" in content
+        assert "<!-- collapsible:problem-solving:end -->" in content
+        assert "(#toggle-problem-solving)" in content
+
+    def test_no_matching_questions_omits_the_view_details_link(self, tmp_path):
+        qa_pairs = [
+            {"question": "Q A", "answer_summary": "", "issues": [{"category": "Communication", "detail": "", "excerpt": ""}]},
+        ]
+        record = _record(1, "Zoom", self._analysis(qa_pairs))
+        content = write_interview_report(record, _config(tmp_path)).read_text(encoding="utf-8")
+        assert "View details" not in content
+
+
 class TestScoreSummaryBestAndWorstHighlighting:
     """The Score Summary table flags the single highest-scoring row as
     "Strongest" and the single lowest-scoring as "Needs focus", so a reader

@@ -371,6 +371,80 @@ class TestScoreSummaryTable:
         assert "<script>alert" not in content
 
 
+class TestCompetencyLinksToRelatedQuestions:
+    """Each competency card gets a native <details>/<summary> listing the
+    Q&A pairs whose issues were tagged under it, linking to that question's
+    card (id="q{i}", see _qa_card) in the breakdown below."""
+
+    def _analysis(self, qa_pairs, **overrides):
+        analysis = {
+            "qa_pairs": qa_pairs,
+            "session_summary": {
+                "top_strengths": [], "top_issues": [], "one_thing_to_practice_next": "",
+                "competency_scores": [{"name": "Problem Solving", "score": 60, "remark": "Mixed."}],
+                "hire_recommendation": {"level": "Hire", "rationale": ""},
+            },
+        }
+        analysis.update(overrides)
+        return analysis
+
+    def test_qa_cards_get_a_stable_id(self, tmp_path):
+        qa_pairs = [{"question": "Q1?", "answer_summary": "", "issues": []}]
+        record = _record(tmp_path, analysis_json=json.dumps(self._analysis(qa_pairs)))
+        content = write_interview_infographic(record, _cfg(tmp_path)).read_text(encoding="utf-8")
+        assert '<div class="qa-card" id="q1">' in content
+
+    def test_renders_a_details_element_linking_to_the_matching_question(self, tmp_path):
+        qa_pairs = [
+            {
+                "question": "How would you scale this system?",
+                "answer_summary": "...",
+                "issues": [{"category": "Problem Solving", "detail": "Vague.", "excerpt": ""}],
+            },
+            {
+                "question": "Tell me about a conflict.",
+                "answer_summary": "...",
+                "issues": [{"category": "Communication", "detail": "Rambled.", "excerpt": ""}],
+            },
+        ]
+        record = _record(tmp_path, analysis_json=json.dumps(self._analysis(qa_pairs)))
+        content = write_interview_infographic(record, _cfg(tmp_path)).read_text(encoding="utf-8")
+        assert '<details class="competency-questions">' in content
+        assert "View details (1 question)" in content
+        assert '<a href="#q1">Q1. How would you scale this system?</a>' in content
+        details_block = content.split('<details class="competency-questions">')[1].split("</details>")[0]
+        assert "Tell me about a conflict" not in details_block
+
+    def test_pluralizes_the_question_count(self, tmp_path):
+        qa_pairs = [
+            {"question": "A?", "answer_summary": "", "issues": [{"category": "Problem Solving", "detail": "", "excerpt": ""}]},
+            {"question": "B?", "answer_summary": "", "issues": [{"category": "Problem Solving", "detail": "", "excerpt": ""}]},
+        ]
+        record = _record(tmp_path, analysis_json=json.dumps(self._analysis(qa_pairs)))
+        content = write_interview_infographic(record, _cfg(tmp_path)).read_text(encoding="utf-8")
+        assert "View details (2 questions)" in content
+
+    def test_no_matching_questions_omits_the_details_element(self, tmp_path):
+        qa_pairs = [
+            {"question": "A?", "answer_summary": "", "issues": [{"category": "Communication", "detail": "", "excerpt": ""}]},
+        ]
+        record = _record(tmp_path, analysis_json=json.dumps(self._analysis(qa_pairs)))
+        content = write_interview_infographic(record, _cfg(tmp_path)).read_text(encoding="utf-8")
+        assert '<details class="competency-questions">' not in content
+
+    def test_escapes_html_in_linked_question_text(self, tmp_path):
+        qa_pairs = [
+            {
+                "question": "<script>alert(1)</script>",
+                "answer_summary": "",
+                "issues": [{"category": "Problem Solving", "detail": "", "excerpt": ""}],
+            },
+        ]
+        record = _record(tmp_path, analysis_json=json.dumps(self._analysis(qa_pairs)))
+        content = write_interview_infographic(record, _cfg(tmp_path)).read_text(encoding="utf-8")
+        assert "<script>alert" not in content
+
+
 class TestScoreSummaryBestAndWorstHighlighting:
     """The highest-scoring row is flagged "Strongest" and the lowest-scoring
     "Needs focus" so a reader can spot what to look at without scanning

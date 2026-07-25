@@ -66,6 +66,27 @@ def _stringify(value) -> str:
     return str(value)
 
 
+def _questions_for_competency(qa_pairs: list, competency_name: str) -> list[tuple[int, str]]:
+    """Every question (1-indexed, matching the "### Q{i}. ..." headings
+    below) whose issues[] tagged an issue under this exact competency name
+    -- the cross-reference that lets a reader jump from a competency's
+    Score Summary row/detail section straight to the specific answers that
+    earned it that score, instead of having to scan the whole Q&A
+    breakdown themselves. Exact-name match, same as how rubric.py's prompt
+    asks the model to tag issues ("use ONLY the competency names listed
+    above") -- a model that doesn't comply just means that question won't
+    surface here, same graceful-miss behavior as any other free-text
+    field this app doesn't hard-validate."""
+    matches = []
+    for i, qa in enumerate(qa_pairs, 1):
+        for issue in qa.get("issues", []) or []:
+            category = issue.get("category") if isinstance(issue, dict) else None
+            if category and _stringify(category) == competency_name:
+                matches.append((i, _stringify(qa.get("question", "(question)"))))
+                break
+    return matches
+
+
 def _interview_report_lines(
     record: InterviewRecord, analysis: dict, profile: Optional[AssessmentProfile] = None,
 ) -> list[str]:
@@ -194,6 +215,23 @@ def _interview_report_lines(
             if entry.get("remark"):
                 lines.append(entry["remark"])
             lines.append("")
+            related_questions = _questions_for_competency(qa_pairs, name)
+            if related_questions:
+                slug = _slugify(name)
+                count = len(related_questions)
+                lines.append(f"[&#9654; View details ({count} question{'s' if count != 1 else ''})](#toggle-{slug})")
+                # HTML-comment sentinels: invisible in a real markdown
+                # viewer (so the list there is just always shown, a
+                # harmless degradation), but report_view.py's Tk renderer
+                # recognizes them to make this a genuine collapsible
+                # section -- everything between start/end gets tagged so
+                # the toggle link above can hide/show it as one block.
+                lines.append(f"<!-- collapsible:{slug}:start -->")
+                lines.append("**Related questions:**")
+                for q_index, question in related_questions:
+                    lines.append(f"- [Q{q_index}. {question}](#{_slugify(f'Q{q_index}. {question}')})")
+                lines.append(f"<!-- collapsible:{slug}:end -->")
+                lines.append("")
             lines.append("[↑ Back to top](#top)")
             lines.append("")
 

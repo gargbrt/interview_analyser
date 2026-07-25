@@ -221,3 +221,26 @@ class TestAnchorLine:
         tag, content = parse_markdown_lines("[↑ Back to top](#top)")[0]
         assert tag == "text"
         assert content == "[↑ Back to top](#top)"
+
+
+class TestCollapsibleSentinels:
+    """report.py's "Related questions" sections are wrapped in HTML-comment
+    sentinels (invisible in a real markdown viewer) so this parser can
+    make the matching "[View details](#toggle-{slug})" link a genuine
+    expand/collapse toggle in the Tk view (see render_into_text_widget)."""
+
+    def test_start_and_end_sentinels_are_recognized_with_their_slug(self):
+        markdown = "<!-- collapsible:problem-solving:start -->\n- item\n<!-- collapsible:problem-solving:end -->"
+        lines = parse_markdown_lines(markdown)
+        assert lines[0] == ("collapsible_start", "problem-solving")
+        assert lines[-1] == ("collapsible_end", "problem-solving")
+
+    def test_content_between_sentinels_is_parsed_normally(self):
+        markdown = "<!-- collapsible:x:start -->\n- an item\n<!-- collapsible:x:end -->"
+        lines = parse_markdown_lines(markdown)
+        assert ("bullet", "an item") in lines
+
+    def test_toggle_link_is_preserved_as_plain_text_like_any_other_link(self):
+        tag, content = parse_markdown_lines("[&#9654; View details (2 questions)](#toggle-problem-solving)")[0]
+        assert tag == "text"
+        assert content == "[&#9654; View details (2 questions)](#toggle-problem-solving)"

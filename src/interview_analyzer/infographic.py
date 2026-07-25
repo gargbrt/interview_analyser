@@ -28,7 +28,7 @@ from .config_loader import Config
 from .confidence import weighted_competency_total
 from .db import InterviewRecord
 from .profiles import GENERIC_PROFILE, competency_emphasis_map
-from .report import _best_and_worst_scores, _stringify, aggregate_trends, trends_report_path
+from .report import _best_and_worst_scores, _questions_for_competency, _stringify, aggregate_trends, trends_report_path
 
 # Muted, professional palette -- avoids the near-universal AI-generated-
 # design defaults (warm cream + terracotta, or neon-on-near-black).
@@ -211,12 +211,35 @@ def _decision_summary_html(
     return f'<p class="summary-decision"><strong>Decision:</strong> {" &middot; ".join(parts)}</p>'
 
 
-def _competency_row_html(entry: dict, weight: Optional[str] = None, anchor_id: Optional[str] = None) -> str:
+def _related_questions_html(qa_pairs: Optional[list], name: str) -> str:
+    """A native <details>/<summary> (real, browser-built-in expand/collapse,
+    no JS needed) listing every question whose issues[] were tagged under
+    this competency, each linking to its card in the Q&A breakdown (see
+    _qa_card's id="q{i}") -- empty string if there's nothing to link, same
+    gating as report.py's markdown counterpart (_questions_for_competency)."""
+    if not qa_pairs:
+        return ""
+    related = _questions_for_competency(qa_pairs, name)
+    if not related:
+        return ""
+    items_html = "".join(f'<li><a href="#q{i}">Q{i}. {_e(question)}</a></li>' for i, question in related)
+    count = len(related)
+    label = f"{count} question{'s' if count != 1 else ''}"
+    return f"""<details class="competency-questions">
+<summary>View details ({label})</summary>
+<ul>{items_html}</ul>
+</details>"""
+
+
+def _competency_row_html(
+    entry: dict, weight: Optional[str] = None, anchor_id: Optional[str] = None, qa_pairs: Optional[list] = None,
+) -> str:
     """`anchor_id`, when given, makes this row a jump target for the Score
     Summary table's per-parameter links (see _score_summary_table_html) and
     adds a "back to top" link so the reader can return to that table --
     omitted for write_trends_infographic's reuse of this same row markup,
-    since trends has no summary table linking into it."""
+    since trends has no summary table linking into it (nor does it pass
+    qa_pairs, since a trends average isn't about one interview's Q&A)."""
     if not isinstance(entry, dict):
         return ""
     name = _stringify(entry.get("name", ""))
@@ -229,11 +252,13 @@ def _competency_row_html(entry: dict, weight: Optional[str] = None, anchor_id: O
     remark_html = f'<p class="competency-remark">{_e(remark)}</p>' if remark else ""
     weight_html = f'<span class="competency-weight">{_e(weight)} weight</span>' if weight else ""
     id_attr = f' id="{_e(anchor_id)}"' if anchor_id else ""
+    related_questions_html = _related_questions_html(qa_pairs, name)
     back_to_top_html = '<a class="back-to-top" href="#top">&uarr; Back to top</a>' if anchor_id else ""
     return f"""<div class="competency-row"{id_attr}>
 <div class="competency-head"><span class="competency-name">{_e(name)}{weight_html}</span><span class="competency-score">{_e(score_text)}</span></div>
 <div class="bar-track"><div class="bar-fill" style="width:{width_pct}%; background:{bar_color};"></div></div>
 {remark_html}
+{related_questions_html}
 {back_to_top_html}
 </div>"""
 
@@ -261,7 +286,7 @@ def _qa_card(index: int, qa: dict) -> str:
         if improvement else ""
     )
 
-    return f"""<div class="qa-card">
+    return f"""<div class="qa-card" id="q{index}">
 <span class="qnum">Q{index}</span>
 <p class="question">{_e(question)}</p>
 <p class="answer-label">Answer summary</p>
@@ -325,6 +350,7 @@ def _render(record: InterviewRecord, analysis: dict) -> str:
         _competency_row_html(
             c, emphasis_map.get(_stringify(c.get("name", ""))),
             anchor_id=f"comp-{_slugify(_stringify(c.get('name', '')))}",
+            qa_pairs=qa_pairs,
         )
         for c in competency_scores if isinstance(c, dict)
     )
@@ -421,6 +447,12 @@ body {{ background: var(--ground); margin: 0; }}
 .summary-badge-worst {{ color: var(--watch); }}
 .back-to-top {{ display: inline-block; font-size: 11.5px; color: var(--accent-ink); text-decoration: none; margin-top: .6rem; }}
 .back-to-top:hover {{ text-decoration: underline; }}
+.competency-questions {{ margin-top: .6rem; font-size: 12.5px; }}
+.competency-questions summary {{ cursor: pointer; color: var(--accent-ink); font-weight: 600; }}
+.competency-questions summary:hover {{ text-decoration: underline; }}
+.competency-questions ul {{ margin: .5rem 0 0; padding: 0; list-style: none; display: flex; flex-direction: column; gap: .4rem; }}
+.competency-questions li a {{ color: var(--ink-soft); text-decoration: none; }}
+.competency-questions li a:hover {{ color: var(--accent-ink); text-decoration: underline; }}
 .columns {{ display: grid; grid-template-columns: 1fr 1fr; gap: 1.25rem; margin-bottom: 2rem; }}
 .panel {{ background: var(--panel); border: 1px solid var(--line); border-radius: 12px; padding: 1.1rem 1.25rem 1.25rem; }}
 .panel h2 {{ font-family: var(--font-display); font-size: 15px; font-weight: 600; margin: 0 0 .75rem; display: flex; align-items: center; gap: .4rem; }}

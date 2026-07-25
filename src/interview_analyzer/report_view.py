@@ -55,6 +55,13 @@ _HTML_ANCHOR_RE = re.compile(r'^<a id="[a-z0-9\-]+"></a>$')
 # [label](#anchor) link syntax -- can appear inside a table cell or as a
 # standalone line (e.g. report.py's "[↑ Back to top](#top)").
 _LINK_RE = re.compile(r"\[([^\]]+)\]\(#([a-z0-9\-]+)\)")
+# report.py's collapsible-section sentinels around a competency's "Related
+# questions" list (e.g. "<!-- collapsible:problem-solving:start -->") --
+# invisible HTML comments in a real markdown viewer (so that list there is
+# just always shown), but recognized here to make the matching "[View
+# details](#toggle-{slug})" link a genuine expand/collapse toggle in Tk.
+_COLLAPSIBLE_START_RE = re.compile(r"^<!-- collapsible:([a-z0-9\-]+):start -->$")
+_COLLAPSIBLE_END_RE = re.compile(r"^<!-- collapsible:([a-z0-9\-]+):end -->$")
 
 # Kept in sync with infographic.py's palette (_WATCH/_GOOD) so the in-app
 # text view and the HTML infographic agree on what "good" vs "needs work"
@@ -128,13 +135,15 @@ def _colored(base_tag: str, color_hex: str) -> str:
 
 def parse_markdown_lines(markdown: str) -> list[tuple[str, str]]:
     """Return [(tag, display_text), ...] for each line, where tag is one of
-    "h1", "h2", "h3", "bullet", "quote", "blank", "text", "table_header", or
-    "table_row" -- or, for a competency score / hire recommendation /
-    selection probability line, that same base tag with "|color:#rrggbb"
-    appended (see _colored). A table_header/table_row's display_text is its
-    cells tab-joined; a cell (or any other line) may itself contain raw
-    "[label](#anchor)" link syntax, left as-is here for render_into_text_
-    widget to turn into a clickable jump (see module docstring)."""
+    "h1", "h2", "h3", "bullet", "quote", "blank", "text", "table_header",
+    "table_row", "collapsible_start", or "collapsible_end" -- or, for a
+    competency score / hire recommendation / selection probability line,
+    that same base tag with "|color:#rrggbb" appended (see _colored). A
+    table_header/table_row's display_text is its cells tab-joined; a cell
+    (or any other line) may itself contain raw "[label](#anchor)" link
+    syntax, left as-is here for render_into_text_widget to turn into a
+    clickable jump (see module docstring). collapsible_start/end's
+    display_text is the section's slug (see _COLLAPSIBLE_START_RE)."""
     lines: list[tuple[str, str]] = []
     table_started = False
     for raw_line in markdown.splitlines():
@@ -144,6 +153,14 @@ def parse_markdown_lines(markdown: str) -> list[tuple[str, str]]:
             lines.append(("blank", ""))
             continue
         if _HTML_ANCHOR_RE.match(line.strip()):
+            continue
+        start_match = _COLLAPSIBLE_START_RE.match(line.strip())
+        if start_match:
+            lines.append(("collapsible_start", start_match.group(1)))
+            continue
+        end_match = _COLLAPSIBLE_END_RE.match(line.strip())
+        if end_match:
+            lines.append(("collapsible_end", end_match.group(1)))
             continue
         if line.lstrip().startswith("|") and line.rstrip().endswith("|"):
             if _TABLE_SEPARATOR_RE.match(line.strip()):
@@ -189,6 +206,23 @@ def parse_markdown_lines(markdown: str) -> list[tuple[str, str]]:
 
 
 def _jump_to_anchor(text_widget, anchor: str) -> None:
+    """Handles both link kinds report.py emits: "#toggle-{slug}" expands
+    or collapses that competency's "Related questions" section (see
+    render_into_text_widget's collapsible_start/end handling); anything
+    else scrolls to that heading's mark, same as before."""
+    if anchor.startswith("toggle-"):
+        slug = anchor[len("toggle-"):]
+        tag = f"collapsible_{slug}"
+        if tag not in text_widget.tag_names():
+            return
+        expanded_state = getattr(text_widget, "_collapsible_expanded", None)
+        if expanded_state is None:
+            expanded_state = {}
+            text_widget._collapsible_expanded = expanded_state
+        expanded = not expanded_state.get(tag, False)
+        expanded_state[tag] = expanded
+        text_widget.tag_configure(tag, elide=not expanded)
+        return
     mark_name = f"anchor_{anchor}"
     if mark_name in text_widget.mark_names():
         text_widget.see(mark_name)
@@ -229,11 +263,21 @@ def render_into_text_widget(text_widget, markdown: str) -> None:
     Summary table links and "back to top" lines are turned into real
     clickable jumps to these marks by _insert_with_links, working even
     though these Text widgets are left in state="disabled" after
-    rendering (tag bindings and .see() aren't gated by that option)."""
+    rendering (tag bindings and .see() aren't gated by that option).
+
+    Also handles report.py's collapsible "Related questions" sections
+    (collapsible_start/end, see parse_markdown_lines): everything between
+    a start/end pair gets an extra `collapsible_{slug}` tag, initially
+    elided (hidden) -- clicking the matching "[View details](#toggle-
+    {slug})" link (handled by _jump_to_anchor) flips that tag's elide
+    state to show/hide the whole section as one block. Expand/collapse
+    state resets to collapsed every render, same as a fresh page load."""
     text_widget.delete("1.0", "end")
+    text_widget._collapsible_expanded = {}
     existing_tags = set(text_widget.tag_names())
     text_widget.mark_set("anchor_top", "1.0")
     text_widget.mark_gravity("anchor_top", "left")
+    current_collapsible: str | None = None
     for raw_tag, content in parse_markdown_lines(markdown):
         base_tag, _, color_part = raw_tag.partition("|color:")
         tk_tags = [base_tag]
@@ -244,8 +288,25 @@ def render_into_text_widget(text_widget, markdown: str) -> None:
                 existing_tags.add(color_tag)
             tk_tags.append(color_tag)
 
+        if base_tag == "collapsible_start":
+            current_collapsible = content
+            continue
+        if base_tag == "collapsible_end":
+            current_collapsible = None
+            continue
+        if current_collapsible is not None:
+            collapsible_tag = f"collapsible_{current_collapsible}"
+            if collapsible_tag not in existing_tags:
+                text_widget.tag_configure(collapsible_tag, elide=True)
+                existing_tags.add(collapsible_tag)
+            tk_tags.append(collapsible_tag)
+
         if base_tag == "blank":
-            text_widget.insert("end", "\n")
+            # tagged (not a bare insert) so a blank line inside a
+            # collapsible section is elided along with the rest of it --
+            # untagged text is immune to elide and would otherwise leave a
+            # stray visible empty line even while "collapsed"
+            text_widget.insert("end", "\n", tuple(tk_tags))
         elif base_tag in ("h1", "h2", "h3"):
             mark_name = f"anchor_{_slugify(content)}"
             text_widget.mark_set(mark_name, "end")
