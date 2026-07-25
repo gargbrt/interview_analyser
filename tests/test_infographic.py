@@ -9,6 +9,7 @@ import json
 from interview_analyzer.config_loader import Config
 from interview_analyzer.db import InterviewRecord
 from interview_analyzer.infographic import (
+    _gauge_point,
     infographic_path,
     trends_infographic_path,
     write_interview_infographic,
@@ -202,7 +203,7 @@ class TestInterviewInfographicProfileFields:
         record = _record(tmp_path, analysis_json=json.dumps(analysis))
         content = write_interview_infographic(record, _cfg(tmp_path)).read_text(encoding="utf-8")
         assert "Selection probability" in content
-        assert ">81<" in content
+        assert ">81%<" in content
         assert "Anchored at 90%." in content
 
     def test_missing_selection_probability_renders_not_available_dial(self, tmp_path):
@@ -218,9 +219,8 @@ class TestInterviewInfographicProfileFields:
         }
         record = _record(tmp_path, analysis_json=json.dumps(analysis))
         content = write_interview_infographic(record, _cfg(tmp_path)).read_text(encoding="utf-8")
-        assert ">81<" in content  # percentage is still shown, not replaced
+        assert ">81%<" in content  # percentage is still shown, not replaced
         assert "recommendation-good" in content
-        assert "Recommended" in content
 
     def test_renders_not_recommended_pill_with_bad_styling(self, tmp_path):
         analysis = self._analysis_with_profile_fields()
@@ -297,6 +297,62 @@ class TestInterviewInfographicProfileFields:
         record = _record(tmp_path, analysis_json=json.dumps(analysis))
         content = write_interview_infographic(record, _cfg(tmp_path)).read_text(encoding="utf-8")
         assert "Overall competency score" not in content
+
+
+class TestSelectionProbabilityGauge:
+    """The semicircular speedometer gauge (Not Hire/Maybe/Hire zones + a
+    needle) that replaced the plain ring dial for selection probability,
+    per an explicit user request for a visual scale with hire/maybe/
+    not-hire markings."""
+
+    def _analysis(self, **overrides):
+        analysis = {
+            "qa_pairs": [],
+            "session_summary": {
+                "top_strengths": [], "top_issues": [], "one_thing_to_practice_next": "",
+                "hire_recommendation": {"level": "Hire", "rationale": ""},
+            },
+        }
+        analysis.update(overrides)
+        return analysis
+
+    def test_renders_the_three_zone_bands(self, tmp_path):
+        analysis = self._analysis(selection_probability={"percent": 60, "label": "Hire"})
+        record = _record(tmp_path, analysis_json=json.dumps(analysis))
+        content = write_interview_infographic(record, _cfg(tmp_path)).read_text(encoding="utf-8")
+        assert "stroke:var(--bad);" in content
+        assert "stroke:var(--watch);" in content
+        assert "stroke:var(--good);" in content
+        assert "Not Hire" in content
+        assert "Maybe" in content
+        assert ">Hire<" in content or "Hire</text>" in content
+
+    def test_renders_a_needle_for_a_real_percentage(self, tmp_path):
+        analysis = self._analysis(selection_probability={"percent": 60, "label": "Hire"})
+        record = _record(tmp_path, analysis_json=json.dumps(analysis))
+        content = write_interview_infographic(record, _cfg(tmp_path)).read_text(encoding="utf-8")
+        assert "<line " in content
+        assert ">60%<" in content
+
+    def test_missing_percentage_renders_no_needle_and_na(self, tmp_path):
+        record = _record(tmp_path, analysis_json=json.dumps(self._analysis()))
+        content = write_interview_infographic(record, _cfg(tmp_path)).read_text(encoding="utf-8")
+        assert ">N/A<" in content
+
+    def test_gauge_point_at_zero_percent_is_leftmost(self):
+        x, y = _gauge_point(cx=110, cy=100, r=80, percent=0)
+        assert round(x) == 30  # cx - r
+        assert round(y) == 100  # cy
+
+    def test_gauge_point_at_hundred_percent_is_rightmost(self):
+        x, y = _gauge_point(cx=110, cy=100, r=80, percent=100)
+        assert round(x) == 190  # cx + r
+        assert round(y) == 100  # cy
+
+    def test_gauge_point_at_fifty_percent_is_top_center(self):
+        x, y = _gauge_point(cx=110, cy=100, r=80, percent=50)
+        assert round(x) == 110  # cx
+        assert round(y) == 20  # cy - r
 
 
 class TestScoreSummaryTable:

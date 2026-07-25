@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import datetime as dt
 import html
+import math
 import pathlib
 import re
 from typing import Optional
@@ -135,6 +136,77 @@ def _confidence_dial_svg(score: Optional[int], aria_label: str = "Confidence") -
 <text x="44" y="40" text-anchor="middle" font-family="Cascadia Code,SF Mono,Consolas,monospace"
       font-size="22" font-weight="600" style="fill:var(--ink);">{score}</text>
 <text x="44" y="55" text-anchor="middle" font-family="-apple-system,sans-serif" font-size="9" style="fill:var(--ink-faint);">/ 100</text>
+</svg>"""
+
+
+# Fixed zone boundaries for the selection-probability speedometer below --
+# deliberately centered on the same neutral 50% the underlying estimate
+# itself pulls toward (see confidence.py's _NEUTRAL_PERCENT), so "Maybe"
+# reads as "too close to call" rather than an arbitrary middle third.
+_GAUGE_ZONES = [(0, 35, "var(--bad)", "Not Hire"), (35, 65, "var(--watch)", "Maybe"), (65, 100, "var(--good)", "Hire")]
+
+
+def _gauge_point(cx: float, cy: float, r: float, percent: float) -> tuple[float, float]:
+    """A point on the gauge's semicircle for a 0-100 percent -- 0% is the
+    leftmost point, 100% the rightmost, 50% dead center at the top,
+    matching a real speedometer's left-low/right-high sweep."""
+    angle_deg = 180 * (1 - percent / 100)
+    angle_rad = math.radians(angle_deg)
+    return cx + r * math.cos(angle_rad), cy - r * math.sin(angle_rad)
+
+
+def _gauge_arc_path(cx: float, cy: float, r: float, p_start: float, p_end: float) -> str:
+    """SVG path for the arc between two percentages along the gauge's
+    semicircle -- large-arc-flag is always 0 since the full 0-100 range is
+    exactly 180 degrees, so no sub-range can ever need the major arc;
+    sweep-flag 1 draws left-to-right along the top, not under the bottom."""
+    x1, y1 = _gauge_point(cx, cy, r, p_start)
+    x2, y2 = _gauge_point(cx, cy, r, p_end)
+    return f"M {x1:.2f},{y1:.2f} A {r:.2f},{r:.2f} 0 0 1 {x2:.2f},{y2:.2f}"
+
+
+def _selection_probability_gauge_svg(percent: Optional[int]) -> str:
+    """A semicircular speedometer -- three fixed zones (Not Hire/Maybe/Hire,
+    see _GAUGE_ZONES) with a needle pointing at the actual estimate --
+    replacing a plain ring dial with something that reads at a glance the
+    way a real gauge does, per the explicit user request this was built
+    for. Zone colors are CSS vars (var(--bad) etc.), not literal hex, for
+    the same dark-mode-correctness reason as _confidence_dial_svg above."""
+    cx, cy, r, band_width = 110, 100, 82, 16
+    band_paths = "".join(
+        f'<path d="{_gauge_arc_path(cx, cy, r, p1, p2)}" fill="none" style="stroke:{color};" '
+        f'stroke-width="{band_width}"/>'
+        for p1, p2, color, _ in _GAUGE_ZONES
+    )
+    label_svg_parts = []
+    for p1, p2, _, label in _GAUGE_ZONES:
+        lx, ly = _gauge_point(cx, cy, r + 20, (p1 + p2) / 2)
+        label_svg_parts.append(
+            f'<text x="{lx:.1f}" y="{ly:.1f}" text-anchor="middle" font-family="-apple-system,sans-serif" '
+            f'font-size="10.5" font-weight="600" style="fill:var(--ink-faint);">{label}</text>'
+        )
+    labels_svg = "".join(label_svg_parts)
+
+    if percent is None:
+        needle_svg = ""
+        value_text = "N/A"
+        aria_value = "not available"
+    else:
+        clamped = max(0, min(100, percent))
+        needle_x, needle_y = _gauge_point(cx, cy, r - band_width / 2 - 10, clamped)
+        needle_svg = (
+            f'<line x1="{cx}" y1="{cy}" x2="{needle_x:.1f}" y2="{needle_y:.1f}" '
+            f'style="stroke:var(--ink);" stroke-width="3" stroke-linecap="round"/>'
+            f'<circle cx="{cx}" cy="{cy}" r="6" style="fill:var(--ink);"/>'
+        )
+        value_text = f"{percent}%"
+        aria_value = f"{percent} out of 100"
+    return f"""<svg width="220" height="128" viewBox="0 0 220 128" role="img" aria-label="Selection probability gauge: {aria_value}">
+{band_paths}
+{needle_svg}
+{labels_svg}
+<text x="{cx}" y="{cy + 34}" text-anchor="middle" font-family="Cascadia Code,SF Mono,Consolas,monospace"
+      font-size="22" font-weight="700" style="fill:var(--ink);">{value_text}</text>
 </svg>"""
 
 
@@ -406,7 +478,7 @@ body {{ background: var(--ground); margin: 0; }}
 .masthead h1 {{ font-family: var(--font-display); font-weight: 600; font-size: 26px; margin: 0; }}
 .masthead .meta {{ font-size: 13px; color: var(--ink-soft); margin-top: .4rem; }}
 .masthead .meta code {{ font-family: var(--font-mono); font-size: 12px; }}
-.top-grid {{ display: grid; grid-template-columns: minmax(0,1fr) 168px 168px; gap: 1.25rem; margin-bottom: 1.25rem; }}
+.top-grid {{ display: grid; grid-template-columns: minmax(0,1fr) 168px minmax(220px, 240px); gap: 1.25rem; margin-bottom: 1.25rem; }}
 .practice-note {{ background: var(--panel); border: 1px solid var(--line); border-radius: 12px; padding: 1.1rem 1.25rem; display: flex; flex-direction: column; justify-content: center; }}
 .practice-note .label {{ font-size: 11px; letter-spacing: .06em; text-transform: uppercase; color: var(--accent-ink); margin: 0 0 .4rem; }}
 .practice-note p {{ margin: 0; font-size: 15px; line-height: 1.5; }}
@@ -495,8 +567,8 @@ body {{ background: var(--ground); margin: 0; }}
       {_confidence_dial_svg(score)}
       <p class="dial-label">Confidence</p>
     </div>
-    <div class="confidence-card">
-      {_confidence_dial_svg(selection_percent, aria_label="Selection probability")}
+    <div class="confidence-card gauge-card">
+      {_selection_probability_gauge_svg(selection_percent)}
       <p class="dial-label">Selection probability</p>
       {selection_value_html}
       {recommendation_pill_html}
