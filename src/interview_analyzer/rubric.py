@@ -48,7 +48,9 @@ For each pair return:
   absent (e.g. "no metric given") rather than something said. Behavioral
   signals you notice (e.g. clarity, confidence, structure, conciseness,
   executive presence) are evidence FOR a competency's issue/remark, not
-  separate categories of their own.
+  separate categories of their own -- but tag them under whichever ONE
+  competency in the list above they actually reflect, not every
+  competency the candidate happened to discuss while being unclear.
 - suggested_improvement: a concise, concrete rewrite or specific advice,
   ideally showing how the quoted excerpt could be rephrased
 
@@ -66,7 +68,15 @@ Then return an overall "session_summary" with:
 - competency_scores: one entry per competency listed above, each
   {{"name": "<competency>", "score": integer 0-100, "remark": "1-2 sentence
   qualitative assessment specifically for this competency, referencing
-  concrete evidence from the transcript"}}.
+  concrete evidence from the transcript"}}. Ground each remark in evidence
+  intrinsic to what THAT competency is actually about, not a generic "was
+  unclear"/"lacked clarity" complaint copied across every competency's
+  remark just because the candidate was hard to follow in general -- a
+  communication-style observation belongs under whichever competency in
+  the list above is actually about clarity/structure/conciseness, not
+  every other one too. If an answer was too vague to judge a given
+  competency at all, say that plainly instead of substituting a
+  communication complaint as if it were evidence against that competency.
 - hire_recommendation: {{"level": one of {hire_levels}, "rationale": "1-2
   sentences explaining the level, grounded in the competency scores above"}}
 {calibration_section}

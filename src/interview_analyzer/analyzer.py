@@ -18,6 +18,7 @@ To add a different engine entirely, see engines.py / docs/using_cloud_apis.md.
 """
 from __future__ import annotations
 
+import difflib
 import json
 import logging
 import os
@@ -344,9 +345,39 @@ def _parse_and_validate(raw: str, context: str = "") -> Optional[dict]:
     return parsed
 
 
+_REMARK_SIMILARITY_THRESHOLD = 0.45
+_MAX_MERGED_REMARKS = 2
+
+
+def _is_near_duplicate_remark(a: str, b: str) -> bool:
+    return difflib.SequenceMatcher(None, a.lower(), b.lower()).ratio() >= _REMARK_SIMILARITY_THRESHOLD
+
+
+def _dedupe_remarks(remarks: list[str]) -> list[str]:
+    """Collapses near-duplicate remarks down to a small number of
+    genuinely distinct observations. A long (chunked) interview asks the
+    model to score the same competency once per chunk, and when the
+    candidate's behavior for that competency is consistent throughout,
+    every chunk tends to restate the same observation in slightly
+    different words (e.g. seven near-identical "lacked clarity" sentences
+    for a single competency, reproduced directly on a real interview) --
+    naively concatenating all of them produced a repetitive wall of text
+    that added no new information. Longest-first so the most substantive
+    phrasing of a repeated point is the one that survives."""
+    kept: list[str] = []
+    for remark in sorted(remarks, key=len, reverse=True):
+        if any(_is_near_duplicate_remark(remark, existing) for existing in kept):
+            continue
+        kept.append(remark)
+        if len(kept) >= _MAX_MERGED_REMARKS:
+            break
+    return kept
+
+
 def _merge_competency_scores(parsed_chunks: list[dict]) -> list[dict]:
     """Averages each competency's score (by name) across every chunk that
-    reported it, and joins each chunk's remark into one combined note --
+    reported it, and combines each chunk's remark into a small number of
+    deduplicated, genuinely distinct observations (see _dedupe_remarks) --
     one entry per competency actually seen, in first-seen order (matches
     the profile's own competency order, since every chunk was asked to
     score the same fixed list -- see rubric.py's build_prompt)."""
@@ -376,7 +407,7 @@ def _merge_competency_scores(parsed_chunks: list[dict]) -> list[dict]:
         {
             "name": name,
             "score": round(sum(scores_by_name[name]) / len(scores_by_name[name])) if scores_by_name[name] else 0,
-            "remark": " ".join(remarks_by_name[name]),
+            "remark": " ".join(_dedupe_remarks(remarks_by_name[name])),
         }
         for name in order
     ]

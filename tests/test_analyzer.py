@@ -609,6 +609,77 @@ class TestChunkedAnalysis:
         assert scores["Execution"]["score"] == 75
 
 
+class TestMergedRemarksAreDeduped:
+    """Regression coverage for a real bug: a long (chunked) interview where
+    the candidate's behavior for one competency was consistent throughout
+    produced SEVEN near-identical restatements of the same observation,
+    naively concatenated into one repetitive, uninformative remark (see
+    the bug report this fixed). _merge_competency_scores must collapse
+    near-duplicates down to a small number of genuinely distinct ones."""
+
+    def _chunks_with_remarks(self, remarks: list[str]) -> list[dict]:
+        return [
+            {
+                "qa_pairs": [],
+                "session_summary": {
+                    "competency_scores": [{"name": "Technical Expertise", "score": 60, "remark": remark}],
+                    "hire_recommendation": {"level": "Hire", "rationale": ""},
+                },
+            }
+            for remark in remarks
+        ]
+
+    def test_seven_near_duplicate_remarks_collapse_to_two(self):
+        """The exact real-world remarks (reproduced verbatim) that
+        prompted this fix -- seven independently-generated chunk remarks
+        all restating "some technical understanding but lacked clarity/
+        detail" in slightly different words."""
+        from interview_analyzer.analyzer import _merge_chunk_analyses
+
+        remarks = [
+            "The candidate demonstrated a good understanding of technical concepts, but could provide more "
+            "specific examples and details.",
+            "The candidate demonstrated some technical knowledge, but lacked clear and concise explanations "
+            "of technical concepts.",
+            "Demonstrated knowledge of the IPO application process, but could improve in explaining complex "
+            "concepts clearly.",
+            "Lack of specific data and technical details in explanations.",
+            "The user showed some understanding of technical concepts, but lacked depth and clarity in "
+            "their explanations.",
+            "The candidate demonstrated some technical knowledge, but lacked detailed technical analysis "
+            "and explanation.",
+            "Shows some knowledge but lacks clarity in explanations.",
+        ]
+        result = _merge_chunk_analyses(self._chunks_with_remarks(remarks))
+        merged_remark = result["session_summary"]["competency_scores"][0]["remark"]
+        # collapsed to the 2 most substantive, genuinely distinct
+        # observations -- not all 7 near-duplicates concatenated verbatim
+        assert merged_remark != " ".join(remarks)
+        assert merged_remark == (
+            "The candidate demonstrated a good understanding of technical concepts, but could provide more "
+            "specific examples and details. Lack of specific data and technical details in explanations."
+        )
+
+    def test_genuinely_distinct_remarks_are_both_kept(self):
+        from interview_analyzer.analyzer import _merge_chunk_analyses
+
+        remarks = [
+            "Showed strong ownership of the migration project from start to finish.",
+            "Struggled to explain database indexing trade-offs when pressed.",
+        ]
+        result = _merge_chunk_analyses(self._chunks_with_remarks(remarks))
+        merged_remark = result["session_summary"]["competency_scores"][0]["remark"]
+        assert "ownership of the migration" in merged_remark
+        assert "indexing trade-offs" in merged_remark
+
+    def test_a_single_remark_is_unaffected(self):
+        from interview_analyzer.analyzer import _merge_chunk_analyses
+
+        result = _merge_chunk_analyses(self._chunks_with_remarks(["Only one chunk saw this competency."]))
+        merged_remark = result["session_summary"]["competency_scores"][0]["remark"]
+        assert merged_remark == "Only one chunk saw this competency."
+
+
 class TestAnalyzeTranscriptProfileThreading:
     """Regression coverage for threading an AssessmentProfile through to the
     prompt -- both the direct (un-chunked) and chunked paths must actually
