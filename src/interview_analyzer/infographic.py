@@ -171,8 +171,21 @@ def _selection_probability_gauge_svg(percent: Optional[int]) -> str:
     replacing a plain ring dial with something that reads at a glance the
     way a real gauge does, per the explicit user request this was built
     for. Zone colors are CSS vars (var(--bad) etc.), not literal hex, for
-    the same dark-mode-correctness reason as _confidence_dial_svg above."""
-    cx, cy, r, band_width = 110, 100, 82, 16
+    the same dark-mode-correctness reason as _confidence_dial_svg above.
+
+    Layout constants below are chosen so every element -- especially the
+    "Maybe" label, which sits at the gauge's 90-degree (straight up) point
+    and therefore needs the MOST headroom above the center of any of the
+    three zone labels -- stays inside the viewBox with margin to spare;
+    reproduced directly: an earlier version placed "Maybe" just past the
+    top edge (clipped/invisible) and put the percentage readout close
+    enough to the needle's pivot circle to visually overlap it."""
+    cx, cy, r, band_width = 110, 112, 78, 15
+    label_radius = r + 20
+    needle_radius = r - band_width / 2 - 10
+    value_text_y = cy + 42
+    svg_height = value_text_y + 20
+
     band_paths = "".join(
         f'<path d="{_gauge_arc_path(cx, cy, r, p1, p2)}" fill="none" style="stroke:{color};" '
         f'stroke-width="{band_width}"/>'
@@ -180,7 +193,7 @@ def _selection_probability_gauge_svg(percent: Optional[int]) -> str:
     )
     label_svg_parts = []
     for p1, p2, _, label in _GAUGE_ZONES:
-        lx, ly = _gauge_point(cx, cy, r + 20, (p1 + p2) / 2)
+        lx, ly = _gauge_point(cx, cy, label_radius, (p1 + p2) / 2)
         label_svg_parts.append(
             f'<text x="{lx:.1f}" y="{ly:.1f}" text-anchor="middle" font-family="-apple-system,sans-serif" '
             f'font-size="10.5" font-weight="600" style="fill:var(--ink-faint);">{label}</text>'
@@ -193,7 +206,7 @@ def _selection_probability_gauge_svg(percent: Optional[int]) -> str:
         aria_value = "not available"
     else:
         clamped = max(0, min(100, percent))
-        needle_x, needle_y = _gauge_point(cx, cy, r - band_width / 2 - 10, clamped)
+        needle_x, needle_y = _gauge_point(cx, cy, needle_radius, clamped)
         needle_svg = (
             f'<line x1="{cx}" y1="{cy}" x2="{needle_x:.1f}" y2="{needle_y:.1f}" '
             f'style="stroke:var(--ink);" stroke-width="3" stroke-linecap="round"/>'
@@ -201,11 +214,11 @@ def _selection_probability_gauge_svg(percent: Optional[int]) -> str:
         )
         value_text = f"{percent}%"
         aria_value = f"{percent} out of 100"
-    return f"""<svg width="220" height="128" viewBox="0 0 220 128" role="img" aria-label="Selection probability gauge: {aria_value}">
+    return f"""<svg width="220" height="{svg_height:.0f}" viewBox="0 0 220 {svg_height:.0f}" role="img" aria-label="Selection probability gauge: {aria_value}">
 {band_paths}
 {needle_svg}
 {labels_svg}
-<text x="{cx}" y="{cy + 34}" text-anchor="middle" font-family="Cascadia Code,SF Mono,Consolas,monospace"
+<text x="{cx}" y="{value_text_y:.0f}" text-anchor="middle" font-family="Cascadia Code,SF Mono,Consolas,monospace"
       font-size="22" font-weight="700" style="fill:var(--ink);">{value_text}</text>
 </svg>"""
 
