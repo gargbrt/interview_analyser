@@ -230,6 +230,34 @@ class TestEstimateSelectionProbability:
         assert "Hire" in result["basis"]
         assert "confidence" in result["basis"].lower()
 
+    def test_basis_states_confidence_as_how_much_it_stayed_near_baseline_not_how_hard_it_was_pulled(self):
+        """Regression coverage for a real point of confusion: the basis
+        text used to read "pulled toward a neutral 50% at X% strength"
+        where X was actually confidence_weight -- the fraction of the
+        baseline KEPT, not the fraction pulled toward neutral. A reader
+        took that at face value and asked why a 74%-confidence result
+        (36%) wasn't close to 50 -- it wasn't a bug, the wording was just
+        backwards about which direction the percentage applied to."""
+        result = estimate_selection_probability(
+            {"level": "Lean No Hire"}, [{"name": "X", "score": 53}], confidence_info={"score": 74},
+        )
+        assert result["percent"] == 36
+        assert "74% assessment confidence kept the estimate close to that baseline" in result["basis"]
+        assert "pulling only 26% of the way toward a neutral 50%" in result["basis"]
+
+    def test_low_anchor_can_never_cross_neutral_regardless_of_nudge_or_confidence(self):
+        """Confirms a real ceiling: from a sub-50 hire-scale anchor, no
+        combination of competency score or confidence can push the
+        estimate to 95+ -- confidence only ever moves the number BETWEEN
+        the anchor+nudge baseline and 50%, never past 50%."""
+        for confidence_score in (0, 25, 50, 74, 100):
+            result = estimate_selection_probability(
+                {"level": "Lean No Hire"},  # anchors at 30%
+                [{"name": "X", "score": 100}],  # max possible competency nudge
+                confidence_info={"score": confidence_score},
+            )
+            assert result["percent"] <= 50
+
     def test_binary_recommendation_is_recommended_at_or_above_the_pivot(self):
         result = estimate_selection_probability(
             {"level": "Strong Hire"}, [], confidence_info={"score": 90},

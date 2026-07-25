@@ -207,7 +207,12 @@ def estimate_selection_probability(
       3. confidence_info (from calibrated_confidence) pulls the whole
          estimate toward a neutral 50% the less trustworthy the underlying
          assessment is -- a low-confidence assessment must not produce a
-         falsely precise-looking selection probability.
+         falsely precise-looking selection probability. This pull only
+         ever moves the number BETWEEN the anchor+nudge baseline and 50%,
+         never past either one -- so a low hire-scale anchor (e.g. "Lean
+         No Hire" = 30%) can never end up at 95+ regardless of competency
+         scores or confidence; only a high anchor itself (Strong Hire/
+         Exceptional) can.
     """
     level = (hire_recommendation or {}).get("level") or ""
     anchor = _HIRE_LEVEL_ANCHOR.get(level, _NEUTRAL_PERCENT)
@@ -227,11 +232,20 @@ def estimate_selection_probability(
     pulled = _NEUTRAL_PERCENT + (baseline - _NEUTRAL_PERCENT) * confidence_weight
     percent = max(1, min(99, round(pulled)))
 
+    # confidence_weight is how much of the baseline is KEPT (1.0 = fully
+    # trust it, 0.0 = ignore it entirely and land exactly on neutral), so
+    # the fraction actually pulled toward 50% is its complement -- stating
+    # confidence_weight itself as "pulled toward neutral at X% strength"
+    # reads backwards (a reader wrote it that way once and asked whether
+    # the resulting number was a bug -- it wasn't, the wording was just
+    # confusing about which direction X% applied to).
+    pulled_fraction = 1 - confidence_weight
     basis = (
         f"Hire-scale call: \"{level or 'not given'}\" (anchors {anchor}%); "
-        f"competency weighting nudged it by {nudge:+.0f} points; "
-        f"pulled toward a neutral 50% at {round(confidence_weight * 100)}% strength based on "
-        f"assessment confidence."
+        f"competency weighting nudged it by {nudge:+.0f} points to {baseline:.0f}%; "
+        f"{round(confidence_weight * 100)}% assessment confidence kept the estimate close to "
+        f"that baseline, pulling only {round(pulled_fraction * 100)}% of the way toward a "
+        f"neutral 50%."
     )
     binary_recommendation = "Recommended" if percent >= _RECOMMENDED_THRESHOLD else "Not Recommended"
     return {"percent": percent, "label": level or None, "basis": basis, "binary_recommendation": binary_recommendation}
