@@ -526,6 +526,87 @@ class TestViewInfographicButton:
         assert opened_path.exists()
         assert f"_{iid}_infographic.html" in opened_path.name
 
+
+class TestViewTranscriptToggle:
+    """The "View transcript" button toggles _history_text between the
+    transcript and the default report/analysis view, relabeling itself to
+    "View Analysis/Report" while the transcript is showing (see
+    _history_view_mode) -- regression coverage for a real bug where the
+    button stayed labeled "View transcript" (and re-rendered the same
+    transcript) even while it was already open, with no way back to the
+    report short of reselecting the row."""
+
+    def _dashboard_with_selected(self, tmp_path, transcript="[You] Hello there.", analysis=None):
+        watcher = _watcher(tmp_path)
+        iid = watcher.db.start_interview("Zoom", str(tmp_path / "a.wav"), retention_days=3, user_id=1)
+        if transcript:
+            watcher.db.save_transcript(iid, transcript)
+        if analysis is not None:
+            watcher.db.save_analysis(iid, analysis)
+
+        dashboard = Dashboard(watcher)
+        dashboard._history_tree = MagicMock()
+        dashboard._history_tree.selection.return_value = [str(iid)]
+        for attr in (
+            "_reprocess_btn", "_reprocess_with_profile_btn", "_open_audio_btn", "_view_transcript_btn",
+            "_view_infographic_btn", "_delete_btn", "_cancel_btn",
+            "_history_toggle_btn", "_assessment_history_tree", "_assessment_history_preview",
+        ):
+            setattr(dashboard, attr, MagicMock())
+        dashboard._assessment_history_tree.get_children.return_value = []
+        dashboard._history_text = MagicMock()
+        return dashboard, iid
+
+    def test_starts_in_report_mode_with_the_default_label(self, tmp_path):
+        dashboard, _ = self._dashboard_with_selected(tmp_path)
+        assert dashboard._history_view_mode == "report"
+        dashboard._update_action_buttons()
+        dashboard._view_transcript_btn.config.assert_called_with(text="View transcript", state="normal")
+
+    def test_clicking_switches_to_transcript_mode_and_relabels(self, tmp_path):
+        dashboard, _ = self._dashboard_with_selected(tmp_path)
+
+        dashboard._on_view_transcript()
+
+        assert dashboard._history_view_mode == "transcript"
+        dashboard._view_transcript_btn.config.assert_called_with(text="View Analysis/Report", state="normal")
+
+    def test_clicking_again_switches_back_to_report_mode(self, tmp_path):
+        dashboard, _ = self._dashboard_with_selected(tmp_path, analysis=VALID_ANALYSIS)
+        dashboard._on_view_transcript()  # -> transcript
+
+        dashboard._on_view_transcript()  # -> back to report
+
+        assert dashboard._history_view_mode == "report"
+        dashboard._view_transcript_btn.config.assert_called_with(text="View transcript", state="normal")
+
+    def test_switching_back_when_no_report_exists_falls_back_gracefully(self, tmp_path):
+        """The explicit requirement: if the report isn't generated/present,
+        switching back must land on whatever the default no-report page is,
+        not error out."""
+        dashboard, _ = self._dashboard_with_selected(tmp_path, analysis=None)
+        dashboard._on_view_transcript()  # -> transcript
+
+        dashboard._on_view_transcript()  # -> back to the (non-existent) report
+
+        assert dashboard._history_view_mode == "report"
+        content_calls = [c.args[1] for c in dashboard._history_text.insert.call_args_list]
+        assert any("Report not available" in text for text in content_calls)
+
+    def test_selecting_a_different_interview_resets_the_mode(self, tmp_path):
+        dashboard, _ = self._dashboard_with_selected(tmp_path)
+        dashboard._on_view_transcript()  # -> transcript
+        assert dashboard._history_view_mode == "transcript"
+
+        dashboard._on_history_select()
+
+        assert dashboard._history_view_mode == "report"
+
+    def test_button_disabled_in_report_mode_when_no_transcript_exists(self, tmp_path):
+        dashboard, _ = self._dashboard_with_selected(tmp_path, transcript="")
+        dashboard._update_action_buttons()
+        dashboard._view_transcript_btn.config.assert_called_with(text="View transcript", state="disabled")
+
     def test_clicking_with_no_usable_analysis_does_not_try_to_open_anything(self, tmp_path):
         dashboard, _ = self._dashboard_with_selected(tmp_path, analysis=None)
 

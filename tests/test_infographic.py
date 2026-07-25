@@ -10,11 +10,13 @@ from interview_analyzer.config_loader import Config
 from interview_analyzer.db import InterviewRecord
 from interview_analyzer.infographic import (
     _gauge_point,
+    _seniority_comparison,
     infographic_path,
     trends_infographic_path,
     write_interview_infographic,
     write_trends_infographic,
 )
+from interview_analyzer.profiles import AssessmentProfile
 
 VALID_ANALYSIS = {
     "qa_pairs": [
@@ -353,6 +355,96 @@ class TestSelectionProbabilityGauge:
         x, y = _gauge_point(cx=110, cy=100, r=80, percent=50)
         assert round(x) == 110  # cx
         assert round(y) == 20  # cy - r
+
+
+class TestSeniorityComparison:
+    """What the selection probability would be for the SAME hire-scale
+    call/competency scores/confidence at one seniority level below and one
+    above the profile's actual seniority (see infographic._seniority_
+    comparison) -- helps a reader see which seniority bar this performance
+    actually clears, per an explicit user request."""
+
+    def _inputs(self, seniority):
+        profile = AssessmentProfile(role="Product", seniority=seniority, competencies=["Leadership"])
+        hire_recommendation = {"level": "Lean Hire", "rationale": ""}
+        competency_scores = [{"name": "Leadership", "score": 70, "remark": ""}]
+        confidence_info = {"score": 80}
+        return profile, hire_recommendation, competency_scores, confidence_info
+
+    def test_returns_one_level_below_and_above_for_a_middle_seniority(self):
+        profile, hire_recommendation, competency_scores, confidence_info = self._inputs("Senior/Lead")
+        result = _seniority_comparison(profile, hire_recommendation, competency_scores, confidence_info)
+        labels = [seniority for seniority, _percent in result]
+        assert labels == ["Mid Level", "Director+"]
+
+    def test_only_returns_the_level_above_at_the_bottom_of_the_scale(self):
+        profile, hire_recommendation, competency_scores, confidence_info = self._inputs("Entry Level")
+        result = _seniority_comparison(profile, hire_recommendation, competency_scores, confidence_info)
+        labels = [seniority for seniority, _percent in result]
+        assert labels == ["Mid Level"]
+
+    def test_only_returns_the_level_below_at_the_top_of_the_scale(self):
+        profile, hire_recommendation, competency_scores, confidence_info = self._inputs("Director+")
+        result = _seniority_comparison(profile, hire_recommendation, competency_scores, confidence_info)
+        labels = [seniority for seniority, _percent in result]
+        assert labels == ["Senior/Lead"]
+
+    def test_empty_when_profile_has_no_seniority(self):
+        profile = AssessmentProfile(role="Product", seniority=None, competencies=["Leadership"])
+        result = _seniority_comparison(profile, {"level": "Hire"}, [{"name": "Leadership", "score": 70}], {"score": 80})
+        assert result == []
+
+    def test_percentages_differ_by_seniority_context(self):
+        """Leadership and Technical Expertise are weighted differently
+        across seniority levels (see profiles.SENIORITY_EMPHASIS), so
+        with contrasting scores on each, the comparison must actually
+        produce different numbers per level, not just relabel the same
+        one."""
+        profile = AssessmentProfile(
+            role="Product", seniority="Senior/Lead", competencies=["Leadership", "Technical Expertise"],
+        )
+        hire_recommendation = {"level": "Lean Hire", "rationale": ""}
+        competency_scores = [
+            {"name": "Leadership", "score": 70, "remark": ""},
+            {"name": "Technical Expertise", "score": 40, "remark": ""},
+        ]
+        result = _seniority_comparison(profile, hire_recommendation, competency_scores, {"score": 80})
+        assert result == [("Mid Level", 55), ("Director+", 56)]
+
+    def test_infographic_renders_comparison_markers_and_caption(self, tmp_path):
+        analysis = {
+            "qa_pairs": [],
+            "session_summary": {
+                "top_strengths": [], "top_issues": [], "one_thing_to_practice_next": "",
+                "competency_scores": [{"name": "Leadership", "score": 70, "remark": ""}],
+                "hire_recommendation": {"level": "Lean Hire", "rationale": ""},
+            },
+            "selection_probability": {"percent": 55, "label": "Lean Hire"},
+            "confidence_info": {"score": 80},
+        }
+        profile = {
+            "competencies": ["Leadership"], "role": "Product", "seniority": "Senior/Lead",
+            "industry": None, "company_type": None, "name": None,
+        }
+        record = _record(tmp_path, analysis_json=json.dumps(analysis), profile_snapshot_json=json.dumps(profile))
+        content = write_interview_infographic(record, _cfg(tmp_path)).read_text(encoding="utf-8")
+        assert "gauge-comparison" in content
+        assert "Mid Level" in content
+        assert "Director+" in content
+
+    def test_no_seniority_omits_the_comparison_caption(self, tmp_path):
+        analysis = {
+            "qa_pairs": [],
+            "session_summary": {
+                "top_strengths": [], "top_issues": [], "one_thing_to_practice_next": "",
+                "competency_scores": [{"name": "Leadership", "score": 70, "remark": ""}],
+                "hire_recommendation": {"level": "Lean Hire", "rationale": ""},
+            },
+            "selection_probability": {"percent": 55, "label": "Lean Hire"},
+        }
+        record = _record(tmp_path, analysis_json=json.dumps(analysis))
+        content = write_interview_infographic(record, _cfg(tmp_path)).read_text(encoding="utf-8")
+        assert '<p class="gauge-comparison">' not in content
 
 
 class TestScoreSummaryTable:

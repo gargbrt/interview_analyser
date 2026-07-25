@@ -322,6 +322,11 @@ class Dashboard:
         self._reprocess_with_profile_btn = None
         self._open_audio_btn = None
         self._view_transcript_btn = None
+        # What _history_text currently shows for the selected interview --
+        # "report" (the default) or "transcript" -- so the toggle button
+        # knows both what to switch to and what to label itself. Reset to
+        # "report" whenever the selection changes (see _on_history_select).
+        self._history_view_mode = "report"
         self._view_infographic_btn = None
         self._delete_btn = None
         self._cancel_btn = None
@@ -1122,8 +1127,16 @@ class Dashboard:
         self._reprocess_with_profile_btn.config(state="normal" if can_reprocess_with_profile else "disabled")
         can_play = record is not None and has_audio(record)
         self._open_audio_btn.config(state="normal" if can_play else "disabled")
-        can_view_transcript = record is not None and bool(record.transcript)
-        self._view_transcript_btn.config(state="normal" if can_view_transcript else "disabled")
+        if self._history_view_mode == "transcript":
+            # Already viewing the transcript -- this button's job now is
+            # just to switch back, which _on_history_select always
+            # handles safely (falls back to its own "Report not
+            # available" message if there's no report yet), so it stays
+            # enabled regardless of whether a report actually exists.
+            self._view_transcript_btn.config(text="View Analysis/Report", state="normal" if record is not None else "disabled")
+        else:
+            can_view_transcript = record is not None and bool(record.transcript)
+            self._view_transcript_btn.config(text="View transcript", state="normal" if can_view_transcript else "disabled")
         can_view_infographic = (
             record is not None and bool(record.analysis)
             and not _analysis_is_malformed(record)
@@ -1141,6 +1154,7 @@ class Dashboard:
         self.watcher.cancel_processing(record.id)
 
     def _on_history_select(self) -> None:
+        self._history_view_mode = "report"
         record = self._selected_record()
         self._update_action_buttons()
         self._history_text.config(state="normal")
@@ -1343,15 +1357,29 @@ class Dashboard:
             self._history_text.config(state="disabled")
 
     def _on_view_transcript(self) -> None:
+        """Toggles _history_text between the transcript and the default
+        report/analysis view -- the button itself relabels to match (see
+        _update_action_buttons). Switching back reuses _on_history_select
+        wholesale rather than re-deriving "what should show here", so it
+        automatically falls back to whatever that already renders for a
+        missing/pending report instead of needing its own copy of that
+        logic."""
         record = self._selected_record()
-        if record is None or not record.transcript:
+        if record is None:
             return
+        if self._history_view_mode == "transcript":
+            self._on_history_select()
+            return
+        if not record.transcript:
+            return
+        self._history_view_mode = "transcript"
         self._history_text.config(state="normal")
         self._history_text.delete("1.0", "end")
         self._history_text.insert("end", "Transcript\n", ("h1",))
         self._history_text.insert("end", "\n")
         self._render_transcript_with_speaker_colors(self._history_text, record.transcript)
         self._history_text.config(state="disabled")
+        self._update_action_buttons()
 
     def _on_view_infographic(self) -> None:
         """Generates (or regenerates, so it always reflects the current
