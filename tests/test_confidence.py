@@ -270,6 +270,68 @@ class TestEstimateSelectionProbability:
         assert isinstance(result["percent"], int)
         assert result["binary_recommendation"] in ("Recommended", "Not Recommended")
 
+    def test_competency_scores_omitted_behaves_identically_to_before(self):
+        """Adding the competency-disagreement sanity check must not change
+        behavior for callers that don't pass competency_scores at all."""
+        without = estimate_selection_probability({"level": "Lean No Hire"}, 0.9, confidence_info={"score": 74})
+        assert without["percent"] == 36
+        assert "sanity-check" not in without["basis"]
+
+    def test_competency_scores_agreeing_with_anchor_makes_no_correction(self):
+        """A weighted competency average close to the hire-scale anchor is
+        not a disagreement -- no correction should be applied."""
+        scores = [{"name": "Ownership", "score": 30}]
+        result = estimate_selection_probability(
+            {"level": "Lean No Hire"}, 0, confidence_info={"score": 90}, competency_scores=scores,
+        )
+        assert "sanity-check" not in result["basis"]
+
+    def test_competency_scores_disagreeing_sharply_nudges_the_estimate_up(self):
+        """Real-data regression: interview #11 had hire level 'Lean No
+        Hire' (anchors 30%) but a weighted competency average of ~59%, a
+        29-point disagreement -- past the 20-point threshold, this should
+        apply a small positive correction rather than leaving the estimate
+        pinned to the raw anchor."""
+        scores = [{"name": "Ownership", "score": 59}]
+        without = estimate_selection_probability(
+            {"level": "Lean No Hire"}, 0, confidence_info={"score": 76},
+        )
+        with_disagreement = estimate_selection_probability(
+            {"level": "Lean No Hire"}, 0, confidence_info={"score": 76}, competency_scores=scores,
+        )
+        assert with_disagreement["percent"] > without["percent"]
+        assert "disagreeing enough" in with_disagreement["basis"]
+
+    def test_competency_disagreement_correction_is_capped(self):
+        """Even an extreme disagreement (e.g. a 0% anchor vs. a 100%
+        competency average) must not blow past
+        _MAX_COMPETENCY_DISAGREEMENT_CORRECTION -- this is a sanity check,
+        not a second primary driver."""
+        mild = estimate_selection_probability(
+            {"level": "Strong No Hire"}, 0, confidence_info={"score": 100},
+            competency_scores=[{"name": "Ownership", "score": 70}],
+        )
+        extreme = estimate_selection_probability(
+            {"level": "Strong No Hire"}, 0, confidence_info={"score": 100},
+            competency_scores=[{"name": "Ownership", "score": 100}],
+        )
+        # both disagreements exceed the threshold, so both should be capped
+        # to the same maximum correction rather than scaling without bound
+        assert extreme["percent"] == mild["percent"]
+
+    def test_competency_disagreement_correction_can_pull_the_estimate_down_too(self):
+        """A weighted competency average well BELOW the hire-scale anchor
+        is just as much a disagreement as one above it, and should pull the
+        estimate down, not just up."""
+        without = estimate_selection_probability(
+            {"level": "Strong Hire"}, 0, confidence_info={"score": 90},
+        )
+        with_disagreement = estimate_selection_probability(
+            {"level": "Strong Hire"}, 0, confidence_info={"score": 90},
+            competency_scores=[{"name": "Ownership", "score": 10}],
+        )
+        assert with_disagreement["percent"] < without["percent"]
+
 
 class TestCandidateTurns:
     """The candidate's ("You") own speech, read directly off the raw

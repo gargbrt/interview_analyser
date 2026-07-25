@@ -18,6 +18,7 @@ correctly offline.
 """
 from __future__ import annotations
 
+import dataclasses
 import datetime as dt
 import html
 import math
@@ -26,9 +27,9 @@ import re
 from typing import Optional
 
 from .config_loader import Config
-from .confidence import weighted_competency_total
+from .confidence import estimate_selection_probability, weighted_competency_total
 from .db import InterviewRecord
-from .profiles import GENERIC_PROFILE, competency_emphasis_map
+from .profiles import GENERIC_PROFILE, SENIORITIES, competency_emphasis_map
 from .report import _best_and_worst_scores, _questions_for_competency, _stringify, aggregate_trends, trends_report_path
 
 # Muted, professional palette -- avoids the near-universal AI-generated-
@@ -145,19 +146,61 @@ def _confidence_dial_svg(score: Optional[int], aria_label: str = "Confidence") -
 # reads as "too close to call" rather than an arbitrary middle third.
 _GAUGE_ZONES = [(0, 35, "var(--bad)", "Not Hire"), (35, 65, "var(--watch)", "Maybe"), (65, 100, "var(--good)", "Hire")]
 
-# A prior version of this gauge also plotted ring markers for what the
-# estimate would be one seniority level below/above the profile's actual
-# one (re-running estimate_selection_probability with only the seniority
-# swapped). That relied on the nudge being derived from weighted_
-# competency_total, which varies by seniority -- confidence.py has since
-# switched the nudge to transcript_specificity_nudge (a signal read
-# straight from the transcript text, deliberately independent of
-# hire_recommendation/competency_scores), which doesn't vary by seniority
-# at all, so re-running the estimate per adjacent level now always
-# returns the same number. Removed rather than left showing identical,
-# misleading "comparisons". A real seniority comparison going forward
-# would need its own metric (e.g. weighted_competency_total itself, which
-# still varies by seniority) rather than reusing this gauge.
+def _seniority_comparisons(
+    hire_recommendation: Optional[dict],
+    nudge: Optional[float],
+    confidence_info: Optional[dict],
+    competency_scores: Optional[list],
+    profile,
+) -> list[tuple[str, int]]:
+    """Re-runs estimate_selection_probability with the SAME hire-scale call,
+    transcript-derived nudge, and confidence, but `profile.seniority` swapped
+    to the adjacent seniority level(s) in SENIORITIES -- shows what this same
+    performance's probability would read as one level below/above the
+    interview's actual seniority bar, so a candidate can see roughly what
+    seniority their performance currently supports.
+
+    Only produces genuinely different numbers because confidence.py's
+    competency-disagreement sanity check weights competency_scores by
+    profile/seniority (see weighted_competency_total) -- the hire-scale
+    anchor and transcript nudge themselves don't vary by seniority at all.
+    A prior version of this feature was removed when the nudge briefly
+    became the only signal (seniority-independent, so every comparison
+    collapsed to the same number); reinstated now that the sanity check
+    gives it real seniority sensitivity again.
+
+    Returns [] when the profile has no recognized seniority set -- there's
+    nothing to compare against for a generic/unset profile.
+    """
+    if not profile.seniority or profile.seniority not in SENIORITIES:
+        return []
+    idx = SENIORITIES.index(profile.seniority)
+    comparisons: list[tuple[str, int]] = []
+    for offset in (-1, 1):
+        adjacent_idx = idx + offset
+        if not (0 <= adjacent_idx < len(SENIORITIES)):
+            continue
+        adjacent_seniority = SENIORITIES[adjacent_idx]
+        adjacent_profile = dataclasses.replace(profile, seniority=adjacent_seniority)
+        result = estimate_selection_probability(
+            hire_recommendation,
+            nudge,
+            confidence_info=confidence_info,
+            competency_scores=competency_scores,
+            profile=adjacent_profile,
+        )
+        comparisons.append((adjacent_seniority, result["percent"]))
+    return comparisons
+
+
+def _seniority_comparison_caption_html(comparisons: list[tuple[str, int]]) -> str:
+    """Caption under the gauge naming what each ring marker means -- the
+    markers alone (small ticks on the band) aren't self-explanatory about
+    which seniority each one represents."""
+    if not comparisons:
+        return ""
+    parts = [f"{_e(seniority)}: {percent}%" for seniority, percent in comparisons]
+    return f'<p class="dial-comparison">At adjacent seniority levels &mdash; {" &middot; ".join(parts)}</p>'
 
 
 def _gauge_point(cx: float, cy: float, r: float, percent: float) -> tuple[float, float]:
@@ -179,13 +222,22 @@ def _gauge_arc_path(cx: float, cy: float, r: float, p_start: float, p_end: float
     return f"M {x1:.2f},{y1:.2f} A {r:.2f},{r:.2f} 0 0 1 {x2:.2f},{y2:.2f}"
 
 
-def _selection_probability_gauge_svg(percent: Optional[int]) -> str:
+def _selection_probability_gauge_svg(
+    percent: Optional[int], comparisons: Optional[list[tuple[str, int]]] = None,
+) -> str:
     """A semicircular speedometer -- three fixed zones (Not Hire/Maybe/Hire,
     see _GAUGE_ZONES) with a needle pointing at the actual estimate --
     replacing a plain ring dial with something that reads at a glance the
     way a real gauge does, per the explicit user request this was built
     for. Zone colors are CSS vars (var(--bad) etc.), not literal hex, for
     the same dark-mode-correctness reason as _confidence_dial_svg above.
+
+    `comparisons` (see _seniority_comparisons), when given, draws a short
+    tick mark just outside the band at each comparison's percent -- a
+    lighter-weight visual than the needle so it reads as "for reference"
+    rather than competing with the actual estimate; see
+    _seniority_comparison_caption_html for the accompanying text naming
+    which seniority each tick represents.
 
     Layout constants below are chosen so every element -- especially the
     "Maybe" label, which sits at the gauge's 90-degree (straight up) point
@@ -224,6 +276,17 @@ def _selection_probability_gauge_svg(percent: Optional[int]) -> str:
         )
     labels_svg = "".join(label_svg_parts)
 
+    comparison_svg_parts = []
+    for _seniority, comp_percent in (comparisons or []):
+        cp = max(0, min(100, comp_percent))
+        tx1, ty1 = _gauge_point(cx, cy, r + band_width / 2 + 2, cp)
+        tx2, ty2 = _gauge_point(cx, cy, r + band_width / 2 + 10, cp)
+        comparison_svg_parts.append(
+            f'<line x1="{tx1:.1f}" y1="{ty1:.1f}" x2="{tx2:.1f}" y2="{ty2:.1f}" '
+            f'style="stroke:var(--ink-faint);" stroke-width="2.5" stroke-linecap="round"/>'
+        )
+    comparisons_svg = "".join(comparison_svg_parts)
+
     if percent is None:
         needle_svg = ""
         value_text = "N/A"
@@ -240,6 +303,7 @@ def _selection_probability_gauge_svg(percent: Optional[int]) -> str:
         aria_value = f"{percent} out of 100"
     return f"""<svg width="220" height="{svg_height:.0f}" viewBox="0 0 220 {svg_height:.0f}" role="img" aria-label="Selection probability gauge: {aria_value}">
 {band_paths}
+{comparisons_svg}
 {needle_svg}
 {labels_svg}
 <text x="{cx}" y="{value_text_y:.0f}" text-anchor="middle" font-family="Cascadia Code,SF Mono,Consolas,monospace"
@@ -414,11 +478,16 @@ def _render(record: InterviewRecord, analysis: dict) -> str:
     selection_percent = selection_probability.get("percent")
     selection_label = selection_probability.get("label")
     selection_basis = selection_probability.get("basis")
+    selection_nudge = selection_probability.get("nudge")
     hire_recommendation = summary.get("hire_recommendation") or {}
     competency_scores = summary.get("competency_scores") or []
     profile = record.profile or GENERIC_PROFILE
     emphasis_map = competency_emphasis_map(profile)
     overall_score = weighted_competency_total(competency_scores, profile)
+    seniority_comparisons = _seniority_comparisons(
+        hire_recommendation, selection_nudge, confidence_info, competency_scores, profile,
+    )
+    seniority_comparison_caption_html = _seniority_comparison_caption_html(seniority_comparisons)
 
     date_str = record.started_at.split("T")[0]
     app_name = record.source_app or "Unknown app"
@@ -523,6 +592,7 @@ body {{ background: var(--ground); margin: 0; }}
 .confidence-card .dial-label {{ font-size: 10.5px; letter-spacing: .06em; text-transform: uppercase; color: var(--ink-faint); margin: .5rem 0 0; }}
 .confidence-card .dial-value {{ font-family: var(--font-mono); font-size: 12px; color: var(--ink-soft); }}
 .confidence-card .dial-basis {{ font-size: 10px; color: var(--ink-faint); line-height: 1.35; margin: .3rem 0 0; }}
+.confidence-card .dial-comparison {{ font-size: 10px; color: var(--ink-faint); line-height: 1.35; margin: .3rem 0 0; }}
 .recommendation-pill {{ font-size: 10.5px; font-weight: 700; text-transform: uppercase; letter-spacing: .04em; border-radius: 999px; padding: .15rem .6rem; margin: .35rem 0 0; }}
 .recommendation-pill.recommendation-good {{ color: var(--good); background: var(--good-tint); }}
 .recommendation-pill.recommendation-bad {{ color: var(--bad); background: var(--watch-tint); }}
@@ -605,11 +675,12 @@ body {{ background: var(--ground); margin: 0; }}
       <p class="dial-label">Confidence</p>
     </div>
     <div class="confidence-card gauge-card">
-      {_selection_probability_gauge_svg(selection_percent)}
+      {_selection_probability_gauge_svg(selection_percent, comparisons=seniority_comparisons)}
       <p class="dial-label">Selection probability</p>
       {selection_value_html}
       {recommendation_pill_html}
       {selection_basis_html}
+      {seniority_comparison_caption_html}
     </div>
   </div>
 

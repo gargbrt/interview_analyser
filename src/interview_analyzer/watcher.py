@@ -838,7 +838,7 @@ class MeetingWatcher:
             # Computed from the raw transcript text (never from anything
             # the model produced), read relative to this user's own past
             # interviews -- see transcript_specificity_nudge's docstring
-            # for why the nudge no longer reuses competency_scores.
+            # for why the primary nudge no longer reuses competency_scores.
             nudge = transcript_specificity_nudge(
                 self.db, self.user_id, transcript, exclude_interview_id=interview_id,
             )
@@ -846,6 +846,8 @@ class MeetingWatcher:
                 session_summary.get("hire_recommendation"),
                 nudge,
                 confidence_info=analysis["confidence_info"],
+                competency_scores=session_summary.get("competency_scores"),
+                profile=profile,
             )
         self.db.save_analysis(interview_id, analysis)
         # keeps a snapshot of every completed analysis attempt (the first

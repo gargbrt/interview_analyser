@@ -28,10 +28,17 @@ Independent things live here:
   - `estimate_selection_probability`: a distinct 0-100 estimate of how
     likely the candidate would be selected/hired -- NOT the same thing as
     `calibrated_confidence` above (that measures trust in the assessment's
-    *accuracy*; this measures the assessed *outcome*). Deliberately blends
-    the model's own hire-scale call (nudged by transcript_specificity_
-    nudge) with the assessment's own calibrated confidence, so it can never
-    look more precise than the assessment backing it actually is.
+    *accuracy*; this measures the assessed *outcome*). Blends the model's
+    own hire-scale call (nudged by transcript_specificity_nudge, the
+    primary independent signal) with a small, capped competency-
+    disagreement sanity check -- weighted_competency_total is allowed a
+    limited say again, but only when it diverges sharply from the hire-
+    scale anchor, not as a primary driver (see estimate_selection_
+    probability's own docstring for why the earlier all-or-nothing designs
+    -- competency scores as the main nudge, then no competency influence at
+    all -- each went too far) -- then pulls the whole result toward a
+    neutral 50% based on the assessment's own calibrated confidence, so it
+    can never look more precise than the assessment backing it actually is.
 """
 from __future__ import annotations
 
@@ -154,6 +161,20 @@ _MAX_NUDGE = 15  # caps how far transcript_specificity_nudge alone can move the 
 # recommendation reads "Recommended" -- deliberately the same pivot as
 # _NEUTRAL_PERCENT, so "better than neutral" and "recommended" always agree.
 _RECOMMENDED_THRESHOLD = 50
+
+# How far the weighted competency total (0-100) must diverge from the
+# hire-scale anchor (also 0-100) before it's treated as a genuine
+# disagreement worth a small correction -- roughly one hire-scale "step"
+# (the anchors are ~15-25 points apart), so this only fires when the
+# competency math and the model's own holistic verdict meaningfully
+# disagree, not on ordinary noise.
+_COMPETENCY_DISAGREEMENT_THRESHOLD = 20
+# The disagreement, past the threshold, is scaled down (not applied
+# 1-for-1) and capped well below _MAX_NUDGE -- this is a sanity check on
+# the anchor, not a second primary driver alongside transcript_
+# specificity_nudge.
+_COMPETENCY_DISAGREEMENT_SCALE = 0.3
+_MAX_COMPETENCY_DISAGREEMENT_CORRECTION = 10
 
 # Below this many past interviews (with a usable transcript) for this
 # user, "the average so far" isn't a meaningful baseline yet -- same
@@ -315,6 +336,8 @@ def estimate_selection_probability(
     hire_recommendation: Optional[dict],
     nudge: Optional[float] = None,
     confidence_info: Optional[dict] = None,
+    competency_scores: Optional[list[dict]] = None,
+    profile: AssessmentProfile = GENERIC_PROFILE,
 ) -> dict:
     """A distinct-from-`calibrated_confidence` estimate of how likely this
     candidate would be selected, expressed as {"percent": int (1-99),
@@ -327,11 +350,10 @@ def estimate_selection_probability(
 
     A deliberately pure function -- `nudge` is a precomputed float (see
     transcript_specificity_nudge, which does the actual DB-reading/text-
-    analysis work), not a transcript or competency_scores, so this stays as
-    trivially testable as it always was: no db, no I/O, plain numbers in,
-    plain numbers out.
+    analysis work), not a transcript, so this stays as trivially testable as
+    it always was: no db, no I/O, plain numbers in, plain numbers out.
 
-    Combines two inputs:
+    Combines three inputs:
       1. hire_recommendation["level"] (the model's own 7-point hire-scale
          call, see rubric.py) anchors a baseline percentage.
       2. `nudge`, clamped to +-_MAX_NUDGE, shifts that baseline up or down --
@@ -340,21 +362,44 @@ def estimate_selection_probability(
          for why the previous design, nudging with the same competency
          scores the model was told to ground hire_recommendation in,
          wasn't really independent evidence at all).
+      3. `competency_scores`/`profile` (optional): a small, capped "sanity
+         check" correction -- when the profile-weighted competency average
+         diverges sharply (more than _COMPETENCY_DISAGREEMENT_THRESHOLD
+         points) from the hire-scale anchor, that disagreement is scaled
+         down (_COMPETENCY_DISAGREEMENT_SCALE) and capped
+         (_MAX_COMPETENCY_DISAGREEMENT_CORRECTION) into a second, smaller
+         correction to the baseline. This is deliberately NOT a primary
+         driver like #2 -- it only fires on meaningful disagreement, and
+         even then moves the number far less than the transcript nudge can,
+         because the model was explicitly told to ground the hire-scale
+         call in these same competency scores (see rubric.py), so this
+         corrects for cases where it visibly failed to do so rather than
+         treating the two as independent evidence.
 
-    A third input, confidence_info (from calibrated_confidence), pulls the
+    A fourth input, confidence_info (from calibrated_confidence), pulls the
     whole estimate toward a neutral 50% the less trustworthy the underlying
     assessment is -- a low-confidence assessment must not produce a falsely
     precise-looking selection probability. This pull only ever moves the
-    number BETWEEN the anchor+nudge baseline and 50%, never past either
-    one -- so a low hire-scale anchor (e.g. "Lean No Hire" = 30%) can never
-    end up at 95+ regardless of the nudge or confidence; only a high anchor
-    itself (Strong Hire/Exceptional) can.
+    number BETWEEN the corrected baseline and 50%, never past either one --
+    so a low hire-scale anchor (e.g. "Lean No Hire" = 30%) can never end up
+    at 95+ regardless of the nudge, disagreement correction, or confidence;
+    only a high anchor itself (Strong Hire/Exceptional) can.
     """
     level = (hire_recommendation or {}).get("level") or ""
     anchor = _HIRE_LEVEL_ANCHOR.get(level, _NEUTRAL_PERCENT)
 
     clamped_nudge = max(-_MAX_NUDGE, min(_MAX_NUDGE, nudge)) if nudge is not None else 0.0
-    baseline = max(0, min(100, anchor + clamped_nudge))
+    after_nudge = max(0, min(100, anchor + clamped_nudge))
+
+    weighted_avg = weighted_competency_total(competency_scores, profile) if competency_scores else None
+    disagreement_correction = 0.0
+    if weighted_avg is not None:
+        disagreement = weighted_avg - anchor
+        if abs(disagreement) > _COMPETENCY_DISAGREEMENT_THRESHOLD:
+            excess = abs(disagreement) - _COMPETENCY_DISAGREEMENT_THRESHOLD
+            magnitude = min(excess * _COMPETENCY_DISAGREEMENT_SCALE, _MAX_COMPETENCY_DISAGREEMENT_CORRECTION)
+            disagreement_correction = magnitude if disagreement > 0 else -magnitude
+    baseline = max(0, min(100, after_nudge + disagreement_correction))
 
     confidence_score = (confidence_info or {}).get("score")
     # No usable confidence figure at all -> treat as low-trust (0.5), same
@@ -372,13 +417,32 @@ def estimate_selection_probability(
     # the resulting number was a bug -- it wasn't, the wording was just
     # confusing about which direction X% applied to).
     pulled_fraction = 1 - confidence_weight
+    disagreement_clause = ""
+    if disagreement_correction != 0.0:
+        disagreement_clause = (
+            f" competency scores averaged {weighted_avg:.0f}%, disagreeing enough with the "
+            f"hire-scale anchor to apply a further {disagreement_correction:+.0f} point sanity-check "
+            f"correction to {baseline:.0f}%;"
+        )
     basis = (
         f"Hire-scale call: \"{level or 'not given'}\" (anchors {anchor}%); "
         f"answer specificity vs. your own past interviews nudged it by {clamped_nudge:+.0f} points to "
-        f"{baseline:.0f}%; "
+        f"{after_nudge:.0f}%;"
+        f"{disagreement_clause} "
         f"{round(confidence_weight * 100)}% assessment confidence kept the estimate close to "
         f"that baseline, pulling only {round(pulled_fraction * 100)}% of the way toward a "
         f"neutral 50%."
     )
     binary_recommendation = "Recommended" if percent >= _RECOMMENDED_THRESHOLD else "Not Recommended"
-    return {"percent": percent, "label": level or None, "basis": basis, "binary_recommendation": binary_recommendation}
+    return {
+        "percent": percent,
+        "label": level or None,
+        "basis": basis,
+        "binary_recommendation": binary_recommendation,
+        # The precomputed nudge this estimate used, carried through so
+        # callers with only the persisted result (e.g. infographic.py's
+        # seniority comparison) can re-run this same function with a
+        # different profile/seniority without needing the db/transcript
+        # access transcript_specificity_nudge itself requires.
+        "nudge": clamped_nudge,
+    }

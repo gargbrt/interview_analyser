@@ -10,11 +10,14 @@ from interview_analyzer.config_loader import Config
 from interview_analyzer.db import InterviewRecord
 from interview_analyzer.infographic import (
     _gauge_point,
+    _seniority_comparison_caption_html,
+    _seniority_comparisons,
     infographic_path,
     trends_infographic_path,
     write_interview_infographic,
     write_trends_infographic,
 )
+from interview_analyzer.profiles import AssessmentProfile
 
 VALID_ANALYSIS = {
     "qa_pairs": [
@@ -353,6 +356,107 @@ class TestSelectionProbabilityGauge:
         x, y = _gauge_point(cx=110, cy=100, r=80, percent=50)
         assert round(x) == 110  # cx
         assert round(y) == 20  # cy - r
+
+
+class TestSeniorityComparison:
+    """What this same performance's selection probability would read as
+    one seniority level below/above the interview's actual bar (see
+    infographic.py's _seniority_comparisons) -- reinstated after
+    confidence.py's competency-disagreement sanity check made
+    estimate_selection_probability sensitive to seniority again (a prior
+    version was removed when the nudge became seniority-independent and
+    every comparison collapsed to the same number)."""
+
+    # Two competencies whose SENIORITY_EMPHASIS weights move in opposite
+    # directions across levels (Leadership rises, Technical Expertise
+    # falls, see profiles.SENIORITY_EMPHASIS) -- with scores far apart
+    # (90 vs 40), the weighted average genuinely shifts per seniority
+    # instead of coincidentally landing on the same number.
+    _SCORES = [{"name": "Leadership", "score": 90}, {"name": "Technical Expertise", "score": 40}]
+
+    def test_returns_one_level_below_and_above_for_a_mid_seniority_profile(self):
+        profile = AssessmentProfile(competencies=["Leadership", "Technical Expertise"], seniority="Mid Level")
+        comparisons = _seniority_comparisons(
+            {"level": "Lean No Hire"}, 0.0, {"score": 76}, self._SCORES, profile,
+        )
+        labels = [label for label, _percent in comparisons]
+        assert labels == ["Entry Level", "Senior/Lead"]
+
+    def test_omits_the_level_below_at_the_bottom_of_the_scale(self):
+        profile = AssessmentProfile(competencies=["Leadership", "Technical Expertise"], seniority="Entry Level")
+        comparisons = _seniority_comparisons(
+            {"level": "Lean No Hire"}, 0.0, {"score": 76}, self._SCORES, profile,
+        )
+        labels = [label for label, _percent in comparisons]
+        assert labels == ["Mid Level"]
+
+    def test_omits_the_level_above_at_the_top_of_the_scale(self):
+        profile = AssessmentProfile(competencies=["Leadership", "Technical Expertise"], seniority="Director+")
+        comparisons = _seniority_comparisons(
+            {"level": "Lean No Hire"}, 0.0, {"score": 76}, self._SCORES, profile,
+        )
+        labels = [label for label, _percent in comparisons]
+        assert labels == ["Senior/Lead"]
+
+    def test_empty_when_the_profile_has_no_seniority_set(self):
+        profile = AssessmentProfile(competencies=["Leadership", "Technical Expertise"], seniority=None)
+        comparisons = _seniority_comparisons(
+            {"level": "Lean No Hire"}, 0.0, {"score": 76}, self._SCORES, profile,
+        )
+        assert comparisons == []
+
+    def test_adjacent_levels_genuinely_differ_not_identical_placeholders(self):
+        """Regression guard for the exact bug that got this feature
+        removed the first time: re-running the estimate per seniority must
+        not always return the same number."""
+        profile = AssessmentProfile(competencies=["Leadership", "Technical Expertise"], seniority="Mid Level")
+        comparisons = _seniority_comparisons(
+            {"level": "Lean No Hire"}, 0.0, {"score": 76}, self._SCORES, profile,
+        )
+        percents = [percent for _label, percent in comparisons]
+        assert len(set(percents)) == len(percents)
+
+    def test_caption_names_each_seniority_and_its_percent(self):
+        html = _seniority_comparison_caption_html([("Entry Level", 35), ("Senior/Lead", 40)])
+        assert "Entry Level: 35%" in html
+        assert "Senior/Lead: 40%" in html
+
+    def test_caption_is_empty_string_when_there_are_no_comparisons(self):
+        assert _seniority_comparison_caption_html([]) == ""
+
+    def _analysis(self, **overrides):
+        analysis = {
+            "qa_pairs": [],
+            "session_summary": {
+                "top_strengths": [], "top_issues": [], "one_thing_to_practice_next": "",
+                "competency_scores": self._SCORES,
+                "hire_recommendation": {"level": "Lean No Hire", "rationale": ""},
+            },
+            "selection_probability": {"percent": 33, "label": "Lean No Hire", "basis": "...", "nudge": 0.0},
+        }
+        analysis.update(overrides)
+        return analysis
+
+    def _profile_json(self, seniority):
+        return json.dumps({
+            "competencies": ["Leadership", "Technical Expertise"], "role": None, "seniority": seniority,
+            "industry": None, "company_type": None, "name": None,
+        })
+
+    def test_infographic_renders_the_comparison_caption_and_gauge_ticks(self, tmp_path):
+        record = _record(
+            tmp_path, analysis_json=json.dumps(self._analysis()),
+            profile_snapshot_json=self._profile_json("Mid Level"),
+        )
+        content = write_interview_infographic(record, _cfg(tmp_path)).read_text(encoding="utf-8")
+        assert "adjacent seniority levels" in content
+        assert "Entry Level:" in content
+        assert "Senior/Lead:" in content
+
+    def test_infographic_omits_the_comparison_when_profile_has_no_seniority(self, tmp_path):
+        record = _record(tmp_path, analysis_json=json.dumps(self._analysis()))
+        content = write_interview_infographic(record, _cfg(tmp_path)).read_text(encoding="utf-8")
+        assert "adjacent seniority levels" not in content
 
 
 class TestScoreSummaryTable:
