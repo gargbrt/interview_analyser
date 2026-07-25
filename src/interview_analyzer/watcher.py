@@ -31,6 +31,7 @@ from .confidence import (
     calibrated_confidence,
     calibration_notes as build_calibration_notes,
     estimate_selection_probability,
+    transcript_specificity_nudge,
 )
 from .consent import ask_consent
 from .control_panel import RecordingControlPanel
@@ -834,10 +835,16 @@ class MeetingWatcher:
         model_reported_confidence = session_summary.get("confidence") if isinstance(session_summary, dict) else None
         analysis["confidence_info"] = calibrated_confidence(self.db, self.user_id, model_reported_confidence)
         if isinstance(session_summary, dict):
+            # Computed from the raw transcript text (never from anything
+            # the model produced), read relative to this user's own past
+            # interviews -- see transcript_specificity_nudge's docstring
+            # for why the nudge no longer reuses competency_scores.
+            nudge = transcript_specificity_nudge(
+                self.db, self.user_id, transcript, exclude_interview_id=interview_id,
+            )
             analysis["selection_probability"] = estimate_selection_probability(
                 session_summary.get("hire_recommendation"),
-                session_summary.get("competency_scores"),
-                profile=profile,
+                nudge,
                 confidence_info=analysis["confidence_info"],
             )
         self.db.save_analysis(interview_id, analysis)

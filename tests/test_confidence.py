@@ -8,12 +8,16 @@ from unittest.mock import MagicMock
 
 from interview_analyzer.confidence import (
     MIN_FEEDBACK_SAMPLES,
+    MIN_SPECIFICITY_SAMPLES,
     NEGATIVE_SCORE_THRESHOLD,
+    _candidate_turns,
+    _specificity_fraction,
     calibrated_confidence,
     calibration_notes,
     competency_weight,
     estimate_selection_probability,
     format_confidence,
+    transcript_specificity_nudge,
     weighted_competency_total,
 )
 from interview_analyzer.db import InterviewDB
@@ -159,74 +163,67 @@ class TestEstimateSelectionProbability:
     """estimate_selection_probability is deliberately NOT the same thing as
     calibrated_confidence -- it's an estimate of the assessed *outcome*
     (would this candidate be selected), not trust in the assessment's
-    accuracy. It blends the model's own hire-scale call, competency
-    weighting, and the assessment's own confidence."""
+    accuracy. It blends the model's own hire-scale call with a precomputed
+    `nudge` float (see transcript_specificity_nudge -- estimate_selection_
+    probability itself stays a pure function, no db/transcript involved)
+    and the assessment's own confidence."""
 
     def test_never_returns_a_false_certainty_of_0_or_100(self):
         # even a maximally-positive call at full confidence should not claim
         # absolute certainty
-        result = estimate_selection_probability(
-            {"level": "Exceptional"}, [{"name": "Leadership", "score": 100}],
-            confidence_info={"score": 100},
-        )
+        result = estimate_selection_probability({"level": "Exceptional"}, 15, confidence_info={"score": 100})
         assert 1 <= result["percent"] <= 99
 
-        result = estimate_selection_probability(
-            {"level": "Strong No Hire"}, [{"name": "Leadership", "score": 0}],
-            confidence_info={"score": 100},
-        )
+        result = estimate_selection_probability({"level": "Strong No Hire"}, -15, confidence_info={"score": 100})
         assert 1 <= result["percent"] <= 99
 
     def test_higher_hire_scale_levels_produce_higher_percentages(self):
-        low = estimate_selection_probability({"level": "Strong No Hire"}, [], confidence_info={"score": 90})
-        mid = estimate_selection_probability({"level": "Lean Hire"}, [], confidence_info={"score": 90})
-        high = estimate_selection_probability({"level": "Exceptional"}, [], confidence_info={"score": 90})
+        low = estimate_selection_probability({"level": "Strong No Hire"}, None, confidence_info={"score": 90})
+        mid = estimate_selection_probability({"level": "Lean Hire"}, None, confidence_info={"score": 90})
+        high = estimate_selection_probability({"level": "Exceptional"}, None, confidence_info={"score": 90})
         assert low["percent"] < mid["percent"] < high["percent"]
 
     def test_low_confidence_pulls_the_estimate_toward_a_neutral_midpoint(self):
         """Regression coverage for the explicit requirement: a low-
         confidence assessment must not produce a falsely-precise-looking
         selection probability."""
-        confident = estimate_selection_probability(
-            {"level": "Exceptional"}, [], confidence_info={"score": 95},
-        )
-        unsure = estimate_selection_probability(
-            {"level": "Exceptional"}, [], confidence_info={"score": 10},
-        )
+        confident = estimate_selection_probability({"level": "Exceptional"}, None, confidence_info={"score": 95})
+        unsure = estimate_selection_probability({"level": "Exceptional"}, None, confidence_info={"score": 10})
         assert unsure["percent"] < confident["percent"]
         assert abs(unsure["percent"] - 50) < abs(confident["percent"] - 50)
 
     def test_missing_confidence_info_is_treated_as_low_trust_not_full_trust(self):
-        with_none = estimate_selection_probability({"level": "Exceptional"}, [], confidence_info=None)
-        with_high = estimate_selection_probability({"level": "Exceptional"}, [], confidence_info={"score": 100})
+        with_none = estimate_selection_probability({"level": "Exceptional"}, None, confidence_info=None)
+        with_high = estimate_selection_probability({"level": "Exceptional"}, None, confidence_info={"score": 100})
         assert with_none["percent"] < with_high["percent"]
 
     def test_unrecognized_or_missing_hire_level_anchors_to_neutral(self):
-        result = estimate_selection_probability(None, [], confidence_info={"score": 90})
+        result = estimate_selection_probability(None, None, confidence_info={"score": 90})
         assert 40 <= result["percent"] <= 60
         assert result["label"] is None
 
-    def test_competency_weighting_nudges_the_estimate(self):
-        """A profile that emphasizes Leadership as critical should let a
-        high Leadership score push the estimate up more than the same
-        score would under a profile where it's only "minor"."""
-        high_emphasis_profile = AssessmentProfile(competencies=["Leadership"], seniority="Director+")
-        low_emphasis_profile = AssessmentProfile(competencies=["Leadership"], role="Data")
+    def test_positive_nudge_raises_the_estimate_negative_lowers_it(self):
+        boosted = estimate_selection_probability({"level": "Lean Hire"}, 15, confidence_info={"score": 90})
+        muted = estimate_selection_probability({"level": "Lean Hire"}, -15, confidence_info={"score": 90})
+        neutral = estimate_selection_probability({"level": "Lean Hire"}, 0, confidence_info={"score": 90})
+        assert muted["percent"] < neutral["percent"] < boosted["percent"]
 
-        boosted = estimate_selection_probability(
-            {"level": "Lean Hire"}, [{"name": "Leadership", "score": 95}],
-            profile=high_emphasis_profile, confidence_info={"score": 90},
-        )
-        muted = estimate_selection_probability(
-            {"level": "Lean Hire"}, [{"name": "Leadership", "score": 95}],
-            profile=low_emphasis_profile, confidence_info={"score": 90},
-        )
-        assert boosted["percent"] >= muted["percent"]
+    def test_nudge_beyond_the_max_is_clamped(self):
+        clamped = estimate_selection_probability({"level": "Lean Hire"}, 1000, confidence_info={"score": 100})
+        at_max = estimate_selection_probability({"level": "Lean Hire"}, 15, confidence_info={"score": 100})
+        assert clamped["percent"] == at_max["percent"]
+
+    def test_none_nudge_is_treated_as_no_adjustment(self):
+        """None (e.g. a mono transcript with no isolable candidate speech,
+        see transcript_specificity_nudge) means "no signal available", not
+        "penalize this interview" -- it should read the same as an
+        explicit 0."""
+        with_none = estimate_selection_probability({"level": "Lean Hire"}, None, confidence_info={"score": 100})
+        with_zero = estimate_selection_probability({"level": "Lean Hire"}, 0, confidence_info={"score": 100})
+        assert with_none["percent"] == with_zero["percent"]
 
     def test_basis_mentions_the_hire_level_and_confidence(self):
-        result = estimate_selection_probability(
-            {"level": "Hire"}, [{"name": "Execution", "score": 80}], confidence_info={"score": 85},
-        )
+        result = estimate_selection_probability({"level": "Hire"}, 5, confidence_info={"score": 85})
         assert "Hire" in result["basis"]
         assert "confidence" in result["basis"].lower()
 
@@ -238,37 +235,30 @@ class TestEstimateSelectionProbability:
         took that at face value and asked why a 74%-confidence result
         (36%) wasn't close to 50 -- it wasn't a bug, the wording was just
         backwards about which direction the percentage applied to."""
-        result = estimate_selection_probability(
-            {"level": "Lean No Hire"}, [{"name": "X", "score": 53}], confidence_info={"score": 74},
-        )
+        result = estimate_selection_probability({"level": "Lean No Hire"}, 0.9, confidence_info={"score": 74})
         assert result["percent"] == 36
         assert "74% assessment confidence kept the estimate close to that baseline" in result["basis"]
         assert "pulling only 26% of the way toward a neutral 50%" in result["basis"]
 
     def test_low_anchor_can_never_cross_neutral_regardless_of_nudge_or_confidence(self):
         """Confirms a real ceiling: from a sub-50 hire-scale anchor, no
-        combination of competency score or confidence can push the
-        estimate to 95+ -- confidence only ever moves the number BETWEEN
-        the anchor+nudge baseline and 50%, never past 50%."""
+        combination of nudge or confidence can push the estimate to 95+ --
+        confidence only ever moves the number BETWEEN the anchor+nudge
+        baseline and 50%, never past 50%."""
         for confidence_score in (0, 25, 50, 74, 100):
             result = estimate_selection_probability(
-                {"level": "Lean No Hire"},  # anchors at 30%
-                [{"name": "X", "score": 100}],  # max possible competency nudge
+                {"level": "Lean No Hire"}, 15,  # anchors at 30%; max possible nudge
                 confidence_info={"score": confidence_score},
             )
             assert result["percent"] <= 50
 
     def test_binary_recommendation_is_recommended_at_or_above_the_pivot(self):
-        result = estimate_selection_probability(
-            {"level": "Strong Hire"}, [], confidence_info={"score": 90},
-        )
+        result = estimate_selection_probability({"level": "Strong Hire"}, None, confidence_info={"score": 90})
         assert result["percent"] >= 50
         assert result["binary_recommendation"] == "Recommended"
 
     def test_binary_recommendation_is_not_recommended_below_the_pivot(self):
-        result = estimate_selection_probability(
-            {"level": "Strong No Hire"}, [], confidence_info={"score": 90},
-        )
+        result = estimate_selection_probability({"level": "Strong No Hire"}, None, confidence_info={"score": 90})
         assert result["percent"] < 50
         assert result["binary_recommendation"] == "Not Recommended"
 
@@ -276,11 +266,115 @@ class TestEstimateSelectionProbability:
         """Regression guard for the explicit user requirement: the output
         must be a probability WITH a recommendation, never a bare binary in
         place of the percentage."""
-        result = estimate_selection_probability(
-            {"level": "Hire"}, [], confidence_info={"score": 90},
-        )
+        result = estimate_selection_probability({"level": "Hire"}, None, confidence_info={"score": 90})
         assert isinstance(result["percent"], int)
         assert result["binary_recommendation"] in ("Recommended", "Not Recommended")
+
+
+class TestCandidateTurns:
+    """The candidate's ("You") own speech, read directly off the raw
+    transcript -- the whole point of transcript_specificity_nudge's
+    independence from hire_recommendation/competency_scores is that this
+    never touches anything the model produced."""
+
+    def test_extracts_only_the_candidate_speaker(self):
+        transcript = "[Interviewer] Hi\n[You] Hello\n[Interviewer] How are you\n[You] Good"
+        assert _candidate_turns(transcript) == ["Hello", "Good"]
+
+    def test_merges_consecutive_candidate_lines_into_one_turn(self):
+        """faster-whisper often splits one continuous utterance across
+        several segments -- a real answer that starts with a one-word
+        acknowledgment shouldn't count as two separate, mostly-trivial
+        turns."""
+        transcript = "[You] Mm-hmm.\n[You] So, for that project I led a team.\n[Interviewer] Great."
+        assert _candidate_turns(transcript) == ["Mm-hmm. So, for that project I led a team."]
+
+    def test_empty_transcript_returns_no_turns(self):
+        assert _candidate_turns("") == []
+
+    def test_mono_fallback_speaker_label_yields_no_candidate_turns(self):
+        """A no-diarization transcript labels everyone "Speaker", not
+        "You" (see transcriber.py's fallback path) -- there's no reliable
+        way to isolate candidate-only speech from that, so this correctly
+        finds nothing rather than guessing."""
+        transcript = "[Speaker] Hello\n[Speaker] there"
+        assert _candidate_turns(transcript) == []
+
+
+class TestSpecificityFraction:
+    def test_none_when_no_candidate_turns(self):
+        assert _specificity_fraction("[Interviewer] Hi") is None
+
+    def test_fraction_of_turns_containing_a_digit(self):
+        transcript = "[You] I grew revenue by 20%.\n[Interviewer] ok\n[You] I think it went well overall."
+        assert _specificity_fraction(transcript) == 0.5
+
+
+class TestTranscriptSpecificityNudge:
+    """Reads relative to this SAME user's own past interviews (not a
+    guessed universal "normal" fraction, since how quantitative a "typical"
+    answer is varies enormously by role) -- self-calibrating the same way
+    calibrated_confidence bootstraps from the user's own feedback history."""
+
+    VAGUE = "[Interviewer] How'd it go?\n[You] I think it went pretty well overall, honestly."
+    SPECIFIC = "[You] I grew revenue by 20% over 6 months and cut costs by $5000 in Q3."
+
+    def _seed(self, db, transcript, user_id=1):
+        iid = db.start_interview("Zoom", "a.wav", retention_days=3, user_id=user_id)
+        db.save_transcript(iid, transcript)
+        return iid
+
+    def test_none_when_this_transcript_has_no_candidate_speech(self, tmp_path):
+        db = InterviewDB(tmp_path / "test.db")
+        assert transcript_specificity_nudge(db, 1, "[Interviewer] Hi") is None
+
+    def test_zero_when_not_enough_history_yet(self, tmp_path):
+        db = InterviewDB(tmp_path / "test.db")
+        for _ in range(MIN_SPECIFICITY_SAMPLES - 1):
+            self._seed(db, self.VAGUE)
+        assert transcript_specificity_nudge(db, 1, self.SPECIFIC) == 0.0
+
+    def test_positive_when_more_specific_than_this_users_own_history(self, tmp_path):
+        db = InterviewDB(tmp_path / "test.db")
+        for _ in range(MIN_SPECIFICITY_SAMPLES):
+            self._seed(db, self.VAGUE)
+        assert transcript_specificity_nudge(db, 1, self.SPECIFIC) > 0
+
+    def test_negative_when_less_specific_than_this_users_own_history(self, tmp_path):
+        db = InterviewDB(tmp_path / "test.db")
+        for _ in range(MIN_SPECIFICITY_SAMPLES):
+            self._seed(db, self.SPECIFIC)
+        assert transcript_specificity_nudge(db, 1, self.VAGUE) < 0
+
+    def test_excludes_the_given_interview_id_from_its_own_baseline(self, tmp_path):
+        """Reprocessing an already-stored interview must not compare it
+        against itself -- its transcript is already saved in the DB by the
+        time watcher.py computes this nudge."""
+        db = InterviewDB(tmp_path / "test.db")
+        this_iid = self._seed(db, self.SPECIFIC)
+        for _ in range(MIN_SPECIFICITY_SAMPLES - 1):
+            self._seed(db, self.VAGUE)
+
+        # excluding itself leaves too few OTHER samples -> no nudge yet
+        excluded = transcript_specificity_nudge(db, 1, self.SPECIFIC, exclude_interview_id=this_iid)
+        assert excluded == 0.0
+
+        # not excluding it pads the pool back up, wrongly comparing the
+        # interview against itself
+        included = transcript_specificity_nudge(db, 1, self.SPECIFIC, exclude_interview_id=None)
+        assert included != 0.0
+
+    def test_scoped_per_user(self, tmp_path):
+        db = InterviewDB(tmp_path / "test.db")
+        for _ in range(MIN_SPECIFICITY_SAMPLES):
+            self._seed(db, self.SPECIFIC, user_id=2)
+        # user 1 has no history of their own, even though user 2 does
+        assert transcript_specificity_nudge(db, 1, self.VAGUE) == 0.0
+
+    def test_db_read_failure_falls_back_to_no_history(self, tmp_path):
+        db = MagicMock()
+        db.list_all.side_effect = Exception("boom")
+        assert transcript_specificity_nudge(db, 1, self.SPECIFIC) == 0.0
 
 
 class TestWeightedCompetencyTotal:

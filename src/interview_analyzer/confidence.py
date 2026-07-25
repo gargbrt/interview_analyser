@@ -1,7 +1,7 @@
 """Confidence scoring for each interview's analysis, and turning past
 feedback into corrective notes for future analysis prompts.
 
-Three independent things live here:
+Independent things live here:
 
   - `calibrated_confidence`: a 0-100 score, shown on each report, saying how
     much to trust *this* assessment. Once there's enough of the user's own
@@ -16,18 +16,27 @@ Three independent things live here:
     chance to actually act on past corrections -- the closest thing to
     "learning" available without fine-tuning the model itself.
 
+  - `transcript_specificity_nudge`: a small, self-calibrating signal read
+    directly from the raw transcript text (never from anything the model
+    produced) -- see its own docstring for why this exists: the model's
+    hire_recommendation and competency_scores are NOT independent evidence
+    of each other, since rubric.py's prompt explicitly tells the model to
+    ground the former in the latter, so nudging a hire-scale anchor with a
+    re-aggregation of the same competency scores was closer to self-
+    consistency correction than genuinely combining two separate readings.
+
   - `estimate_selection_probability`: a distinct 0-100 estimate of how
     likely the candidate would be selected/hired -- NOT the same thing as
     `calibrated_confidence` above (that measures trust in the assessment's
     *accuracy*; this measures the assessed *outcome*). Deliberately blends
-    three inputs (the model's own hire-scale call, how the profile weights
-    the scored competencies, and the assessment's own calibrated
-    confidence) so it can never look more precise than the assessment
-    backing it actually is.
+    the model's own hire-scale call (nudged by transcript_specificity_
+    nudge) with the assessment's own calibrated confidence, so it can never
+    look more precise than the assessment backing it actually is.
 """
 from __future__ import annotations
 
 import logging
+import re
 from typing import Optional
 
 from .profiles import AssessmentProfile, GENERIC_PROFILE, competency_emphasis_map
@@ -139,12 +148,129 @@ _EMPHASIS_WEIGHT: dict[str, float] = {
 }
 
 _NEUTRAL_PERCENT = 50
-_MAX_COMPETENCY_NUDGE = 15  # caps how far the competency weighting alone can move the anchor
+_MAX_NUDGE = 15  # caps how far transcript_specificity_nudge alone can move the anchor
 
 # The percent at/above which estimate_selection_probability's binary
 # recommendation reads "Recommended" -- deliberately the same pivot as
 # _NEUTRAL_PERCENT, so "better than neutral" and "recommended" always agree.
 _RECOMMENDED_THRESHOLD = 50
+
+# Below this many past interviews (with a usable transcript) for this
+# user, "the average so far" isn't a meaningful baseline yet -- same
+# reasoning as MIN_FEEDBACK_SAMPLES above, just bootstrapping a different
+# signal (see transcript_specificity_nudge).
+MIN_SPECIFICITY_SAMPLES = 3
+
+# Transcript speaker labels are "[Speaker] text" (see transcriber.py) --
+# "You" is always the candidate's own line: dual-channel recording keeps
+# the mic and system-audio channels separate and labels them directly,
+# not a guess.
+_TRANSCRIPT_LINE_RE = re.compile(r"^\[(?P<speaker>[^\]]+)\]\s*(?P<text>.*)$")
+_CANDIDATE_SPEAKER_LABEL = "You"
+# Any digit -- a percentage, dollar figure, count, or date all contain at
+# least one -- a simple, language-agnostic, and crucially non-LLM-judged
+# proxy for "this answer included a concrete, checkable detail" rather
+# than staying purely qualitative.
+_SPECIFICITY_MARKER_RE = re.compile(r"\d")
+
+
+def _candidate_turns(transcript: str) -> list[str]:
+    """The candidate's own speech, with consecutive same-speaker lines
+    merged into whole turns first -- faster-whisper often splits one
+    continuous utterance across several segments/lines (see dashboard.py's
+    own _group_transcript_by_speaker, duplicated here in miniature rather
+    than imported, since this lower-level module shouldn't depend on the
+    Tk dashboard), so a real answer that happens to start with a one-word
+    acknowledgment ("Mm-hmm. So, for that project...") isn't counted as
+    two separate, mostly-trivial "turns" instead of one real one --
+    reproduced directly: without merging, a real ~1-hour transcript's 279
+    raw lines (mostly one-word backchannel) diluted the specificity
+    fraction to a meaningless ~7%; merged into 133 real turns it reads
+    ~14%, a much more honest reflection of the actual answers given."""
+    turns: list[tuple[str, str]] = []
+    for line in transcript.splitlines():
+        if not line.strip():
+            continue
+        match = _TRANSCRIPT_LINE_RE.match(line)
+        if not match:
+            continue
+        speaker, text = match.group("speaker").strip(), match.group("text").strip()
+        if turns and turns[-1][0] == speaker:
+            turns[-1] = (speaker, f"{turns[-1][1]} {text}".strip())
+        else:
+            turns.append((speaker, text))
+    return [text for speaker, text in turns if speaker == _CANDIDATE_SPEAKER_LABEL and text]
+
+
+def _specificity_fraction(transcript: str) -> Optional[float]:
+    """The fraction of the candidate's own turns (see _candidate_turns)
+    containing at least one concrete, checkable detail -- None if there's
+    no reliable way to isolate candidate-only speech (a mono/no-
+    diarization transcript labels everyone "Speaker", not "You" -- see
+    transcriber.py's fallback path)."""
+    turns = _candidate_turns(transcript)
+    if not turns:
+        return None
+    return sum(1 for t in turns if _SPECIFICITY_MARKER_RE.search(t)) / len(turns)
+
+
+def transcript_specificity_nudge(
+    db, user_id: Optional[int], transcript: str, exclude_interview_id: Optional[int] = None,
+) -> Optional[float]:
+    """estimate_selection_probability's nudge, computed directly from the
+    raw transcript's own text -- genuinely independent of hire_
+    recommendation/competency_scores, since it never touches anything the
+    model produced (unlike the design this replaced, where the prompt
+    explicitly told the model to ground hire_recommendation in the same
+    competency scores the old nudge also came from -- see rubric.py's
+    build_prompt -- making the two nowhere near independent evidence of
+    each other).
+
+    Reads this interview's own _specificity_fraction RELATIVE to this same
+    user's past interviews, not against a guessed universal "normal"
+    fraction -- how quantitative a "typical" answer is varies enormously by
+    role (a Data interview is naturally full of numbers; a Design one
+    rarely is), so there's no single fair neutral point across every
+    profile. Comparing against this user's OWN history sidesteps needing
+    one, and self-calibrates as more interviews accumulate -- same
+    bootstrap spirit as calibrated_confidence above.
+
+    Returns 0.0 (no adjustment, not a guess) when there isn't yet enough
+    history (fewer than MIN_SPECIFICITY_SAMPLES past interviews with a
+    usable transcript) to treat "the average so far" as meaningful.
+    Returns None only when THIS transcript has no isolable candidate
+    speech at all -- the caller should treat that as "no signal", not as
+    a penalty."""
+    fraction = _specificity_fraction(transcript)
+    if fraction is None:
+        return None
+
+    try:
+        past_records = db.list_all(user_id=user_id)
+    except Exception:  # noqa: BLE001
+        logger.warning(
+            "Couldn't read past interviews for the specificity nudge baseline; treating as no history yet.",
+            exc_info=True,
+        )
+        past_records = []
+
+    past_fractions = [
+        past_fraction
+        for record in past_records if record.id != exclude_interview_id and record.transcript
+        for past_fraction in [_specificity_fraction(record.transcript)] if past_fraction is not None
+    ]
+    if len(past_fractions) < MIN_SPECIFICITY_SAMPLES:
+        return 0.0
+
+    baseline = sum(past_fractions) / len(past_fractions)
+    # a floor on the denominator, not a bare division by baseline -- if
+    # this user's past interviews all scored ~0 specificity, a plain
+    # (fraction - baseline) / baseline blows up (or is undefined at
+    # exactly 0), even though "this one actually included real numbers,
+    # unlike any before it" is a perfectly meaningful, clearly positive
+    # signal that shouldn't just collapse to "no adjustment".
+    relative_change = (fraction - baseline) / max(baseline, 0.1)
+    return max(-_MAX_NUDGE, min(_MAX_NUDGE, relative_change * _MAX_NUDGE))
 
 
 def competency_weight(name: str, profile: AssessmentProfile = GENERIC_PROFILE) -> float:
@@ -163,9 +289,12 @@ def weighted_competency_total(
     by how much this profile's context (role/seniority/industry/company --
     see profiles.py) emphasizes it, so a "critical" competency counts far
     more toward the total than a "minor" one. None if there are no usable
-    scores to average. Shared by estimate_selection_probability (which
-    nudges a hire-scale anchor by this) and report.py/infographic.py
-    (which show it directly as an "Overall competency score")."""
+    scores to average. Shown directly in report.py/infographic.py as an
+    "Overall competency score" -- NOT used by estimate_selection_probability
+    below, which nudges its hire-scale anchor with transcript_specificity_
+    nudge instead (these scores aren't independent evidence of the model's
+    own hire_recommendation verdict, since rubric.py's prompt explicitly
+    tells the model to ground that verdict in these same scores)."""
     if not competency_scores:
         return None
     weighted_sum = 0.0
@@ -184,8 +313,7 @@ def weighted_competency_total(
 
 def estimate_selection_probability(
     hire_recommendation: Optional[dict],
-    competency_scores: Optional[list[dict]],
-    profile: AssessmentProfile = GENERIC_PROFILE,
+    nudge: Optional[float] = None,
     confidence_info: Optional[dict] = None,
 ) -> dict:
     """A distinct-from-`calibrated_confidence` estimate of how likely this
@@ -197,32 +325,36 @@ def estimate_selection_probability(
     user request), never in place of it, since collapsing to a single yes/no
     is exactly what the percentage was added to avoid.
 
-    Combines three inputs:
+    A deliberately pure function -- `nudge` is a precomputed float (see
+    transcript_specificity_nudge, which does the actual DB-reading/text-
+    analysis work), not a transcript or competency_scores, so this stays as
+    trivially testable as it always was: no db, no I/O, plain numbers in,
+    plain numbers out.
+
+    Combines two inputs:
       1. hire_recommendation["level"] (the model's own 7-point hire-scale
          call, see rubric.py) anchors a baseline percentage.
-      2. competency_scores, weighted by how much this profile's context
-         (role/seniority/industry/company -- see profiles.py) emphasizes
-         each one (see weighted_competency_total), nudges that baseline up
-         or down.
-      3. confidence_info (from calibrated_confidence) pulls the whole
-         estimate toward a neutral 50% the less trustworthy the underlying
-         assessment is -- a low-confidence assessment must not produce a
-         falsely precise-looking selection probability. This pull only
-         ever moves the number BETWEEN the anchor+nudge baseline and 50%,
-         never past either one -- so a low hire-scale anchor (e.g. "Lean
-         No Hire" = 30%) can never end up at 95+ regardless of competency
-         scores or confidence; only a high anchor itself (Strong Hire/
-         Exceptional) can.
+      2. `nudge`, clamped to +-_MAX_NUDGE, shifts that baseline up or down --
+         genuinely independent of #1, since it isn't computed from anything
+         the model produced (see transcript_specificity_nudge's docstring
+         for why the previous design, nudging with the same competency
+         scores the model was told to ground hire_recommendation in,
+         wasn't really independent evidence at all).
+
+    A third input, confidence_info (from calibrated_confidence), pulls the
+    whole estimate toward a neutral 50% the less trustworthy the underlying
+    assessment is -- a low-confidence assessment must not produce a falsely
+    precise-looking selection probability. This pull only ever moves the
+    number BETWEEN the anchor+nudge baseline and 50%, never past either
+    one -- so a low hire-scale anchor (e.g. "Lean No Hire" = 30%) can never
+    end up at 95+ regardless of the nudge or confidence; only a high anchor
+    itself (Strong Hire/Exceptional) can.
     """
     level = (hire_recommendation or {}).get("level") or ""
     anchor = _HIRE_LEVEL_ANCHOR.get(level, _NEUTRAL_PERCENT)
 
-    nudge = 0.0
-    weighted_avg = weighted_competency_total(competency_scores, profile)
-    if weighted_avg is not None:
-        nudge = max(-_MAX_COMPETENCY_NUDGE, min(_MAX_COMPETENCY_NUDGE, (weighted_avg - _NEUTRAL_PERCENT) * 0.3))
-
-    baseline = max(0, min(100, anchor + nudge))
+    clamped_nudge = max(-_MAX_NUDGE, min(_MAX_NUDGE, nudge)) if nudge is not None else 0.0
+    baseline = max(0, min(100, anchor + clamped_nudge))
 
     confidence_score = (confidence_info or {}).get("score")
     # No usable confidence figure at all -> treat as low-trust (0.5), same
@@ -242,7 +374,8 @@ def estimate_selection_probability(
     pulled_fraction = 1 - confidence_weight
     basis = (
         f"Hire-scale call: \"{level or 'not given'}\" (anchors {anchor}%); "
-        f"competency weighting nudged it by {nudge:+.0f} points to {baseline:.0f}%; "
+        f"answer specificity vs. your own past interviews nudged it by {clamped_nudge:+.0f} points to "
+        f"{baseline:.0f}%; "
         f"{round(confidence_weight * 100)}% assessment confidence kept the estimate close to "
         f"that baseline, pulling only {round(pulled_fraction * 100)}% of the way toward a "
         f"neutral 50%."
