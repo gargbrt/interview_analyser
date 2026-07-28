@@ -515,6 +515,54 @@ class Dashboard:
 
         return outer, inner
 
+    def _make_reflowing_toolbar(self, toolbar, buttons: list) -> Callable[[], None]:
+        """Wraps `buttons` (already created as children of `toolbar`, not
+        yet packed/gridded) onto as many rows as needed so every button
+        stays fully visible when the window is narrower than the sum of
+        all their widths -- instead of a single pack(side="left") row,
+        which just lets the overflow run past the window's edge and become
+        unreachable (see the real bug report this fixes: shrinking the
+        History tab made some toolbar buttons disappear entirely).
+
+        `toolbar` must be gridded/packed with sticky="ew" (or otherwise
+        stretch to fill its parent's width) -- this relies on
+        toolbar.winfo_width() reflecting the actual available width, not
+        just the current total width of its own children, which would be
+        circular.
+
+        Returns the reflow callback so a caller can re-trigger it manually
+        after changing a button's text (e.g. the View transcript/View
+        Analysis toggle) -- a text-only change doesn't fire <Configure> on
+        its own, so without this the row it's already in could stay
+        stale/crowded until the next real window resize."""
+        def _reflow(_event=None):
+            available = toolbar.winfo_width()
+            if available <= 1:
+                return
+            spacing = 6
+            row = col = 0
+            row_width = 0
+            for btn in buttons:
+                req_width = btn.winfo_reqwidth()
+                if col > 0 and row_width + spacing + req_width > available:
+                    row += 1
+                    col = 0
+                    row_width = 0
+                btn.grid(
+                    row=row, column=col, sticky="w",
+                    padx=(0 if col == 0 else spacing, 0), pady=(0, 4),
+                )
+                row_width += (spacing if col > 0 else 0) + req_width
+                col += 1
+
+        toolbar.bind("<Configure>", _reflow)
+        # <Configure> alone won't fire until the window is actually drawn;
+        # this ensures the very first layout (before any resize) is
+        # already correctly wrapped rather than showing everything
+        # unpositioned for one frame.
+        toolbar.after_idle(_reflow)
+        return _reflow
+
     # -- Status tab ---------------------------------------------------------
 
     def _build_status_tab(self, notebook, tk, ttk):
@@ -831,37 +879,38 @@ class Dashboard:
         frame.rowconfigure(2, weight=1)
 
         toolbar = ttk.Frame(frame)
-        toolbar.grid(row=0, column=0, columnspan=2, sticky="w", pady=(0, 4))
-        ttk.Button(toolbar, text="Refresh", command=self._on_refresh_history).pack(side="left")
+        toolbar.grid(row=0, column=0, columnspan=2, sticky="ew", pady=(0, 4))
+        refresh_btn = ttk.Button(toolbar, text="Refresh", command=self._on_refresh_history)
         self._reprocess_btn = ttk.Button(
             toolbar, text="Reprocess (generate report)", command=self._on_reprocess, state="disabled"
         )
-        self._reprocess_btn.pack(side="left", padx=(8, 0))
         self._reprocess_with_profile_btn = ttk.Button(
             toolbar, text="Reprocess with different profile...",
             command=self._on_reprocess_with_profile, state="disabled",
         )
-        self._reprocess_with_profile_btn.pack(side="left", padx=(8, 0))
         self._open_audio_btn = ttk.Button(
             toolbar, text="Play audio", command=self._on_open_audio, state="disabled"
         )
-        self._open_audio_btn.pack(side="left", padx=(8, 0))
         self._view_transcript_btn = ttk.Button(
             toolbar, text="View transcript", command=self._on_view_transcript, state="disabled"
         )
-        self._view_transcript_btn.pack(side="left", padx=(8, 0))
         self._view_infographic_btn = ttk.Button(
             toolbar, text="View infographic", command=self._on_view_infographic, state="disabled"
         )
-        self._view_infographic_btn.pack(side="left", padx=(8, 0))
         self._delete_btn = ttk.Button(
             toolbar, text="Delete", command=self._on_delete, state="disabled"
         )
-        self._delete_btn.pack(side="left", padx=(8, 0))
         self._cancel_btn = ttk.Button(
             toolbar, text="Cancel processing", command=self._on_cancel, state="disabled"
         )
-        self._cancel_btn.pack(side="left", padx=(8, 0))
+        # wraps onto additional rows instead of letting buttons overflow
+        # past the window edge and become unreachable when the window is
+        # narrower than all of them combined (see _make_reflowing_toolbar)
+        self._reflow_history_toolbar = self._make_reflowing_toolbar(toolbar, [
+            refresh_btn, self._reprocess_btn, self._reprocess_with_profile_btn,
+            self._open_audio_btn, self._view_transcript_btn, self._view_infographic_btn,
+            self._delete_btn, self._cancel_btn,
+        ])
 
         progress_row = ttk.Frame(frame)
         progress_row.grid(row=1, column=0, columnspan=2, sticky="w", pady=(0, 6))
@@ -1146,6 +1195,11 @@ class Dashboard:
         can_delete = record is not None and not busy
         self._delete_btn.config(state="normal" if can_delete else "disabled")
         self._cancel_btn.config(state="normal" if is_processing_this else "disabled")
+        # the View transcript/View Analysis toggle above can change that
+        # button's text (and therefore its width) without any window
+        # resize firing -- re-run the reflow so its row doesn't stay
+        # stale/crowded (see _make_reflowing_toolbar's docstring)
+        self._reflow_history_toolbar()
 
     def _on_cancel(self) -> None:
         record = self._selected_record()

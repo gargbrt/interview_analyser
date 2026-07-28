@@ -23,4 +23,14 @@ rem them to a log file instead of silently vanishing if something goes wrong.
 rem "start /B" launches it detached and in the background, so this window
 rem closes immediately instead of staying open for the whole app session.
 if not exist "logs" mkdir "logs"
+
+rem Rotate the previous run's log out of the way before overwriting it --
+rem "> logs\app_launch.log" below truncates on every launch, which used to
+rem silently destroy the one piece of evidence needed to diagnose a crash
+rem (a real native crash was traced only via Windows Event Viewer, after
+rem the app's own log of it had already been wiped by this same restart).
+rem Keeping one prior run's log means "what happened right before the
+rem crash" survives at least until the NEXT restart.
+if exist "logs\app_launch.log" move /y "logs\app_launch.log" "logs\app_launch.log.previous" >nul
+
 start "" /B "%PYTHONW%" -m interview_analyzer.app > "logs\app_launch.log" 2>&1

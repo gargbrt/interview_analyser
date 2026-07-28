@@ -486,7 +486,7 @@ class TestViewInfographicButton:
         dashboard._history_tree.selection.return_value = [str(iid)]
         for attr in (
             "_reprocess_btn", "_reprocess_with_profile_btn", "_open_audio_btn", "_view_transcript_btn",
-            "_view_infographic_btn", "_delete_btn", "_cancel_btn",
+            "_view_infographic_btn", "_delete_btn", "_cancel_btn", "_reflow_history_toolbar",
         ):
             setattr(dashboard, attr, MagicMock())
         dashboard._history_text = MagicMock()
@@ -549,7 +549,7 @@ class TestViewTranscriptToggle:
         dashboard._history_tree.selection.return_value = [str(iid)]
         for attr in (
             "_reprocess_btn", "_reprocess_with_profile_btn", "_open_audio_btn", "_view_transcript_btn",
-            "_view_infographic_btn", "_delete_btn", "_cancel_btn",
+            "_view_infographic_btn", "_delete_btn", "_cancel_btn", "_reflow_history_toolbar",
             "_history_toggle_btn", "_assessment_history_tree", "_assessment_history_preview",
         ):
             setattr(dashboard, attr, MagicMock())
@@ -750,6 +750,7 @@ class TestReprocessWithDifferentProfile:
         for attr in (
             "_reprocess_btn", "_reprocess_with_profile_btn", "_open_audio_btn",
             "_view_transcript_btn", "_view_infographic_btn", "_delete_btn", "_cancel_btn",
+            "_reflow_history_toolbar",
         ):
             setattr(dashboard, attr, MagicMock())
         return dashboard, iid

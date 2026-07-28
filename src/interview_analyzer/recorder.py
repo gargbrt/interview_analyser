@@ -365,15 +365,17 @@ class _WindowsAudioRecorder:
         return self._pause_event.is_set()
 
     def stop(self) -> Optional[pathlib.Path]:
+        """Stops capture and finalizes the WAV file, returning its path.
+
+        Deliberately does NOT touch the underlying PyAudio streams here --
+        see release_streams()'s docstring for why that's split out. This
+        method only does the part that must never be skipped (finalizing
+        the recording actually on disk), so a caller can safely commit the
+        interview as ended and start background processing before
+        attempting the riskier stream teardown."""
         self._stop_event.set()
         if self._thread:
             self._thread.join(timeout=5)
-        if self._stream:
-            self._stream.stop_stream()
-            self._stream.close()
-        if self._mic_stream:
-            self._mic_stream.stop_stream()
-            self._mic_stream.close()
         if self._wav_file:
             self._wav_file.close()
         if self._out_file:
@@ -384,6 +386,35 @@ class _WindowsAudioRecorder:
             self._out_file.close()
         logger.info("Recording stopped -> %s", self._out_path)
         return self._out_path
+
+    def release_streams(self) -> None:
+        """Closes the underlying WASAPI loopback/microphone PyAudio
+        streams -- split out of stop() (call this AFTER stop(), once the
+        caller has already committed the interview as ended and ideally
+        started background processing) because this exact call was
+        reproduced causing a hard, unrecoverable native crash: a real
+        recording stopped cleanly, then the entire pythonw.exe process
+        died about a second later with an access violation (0xc0000005)
+        in ntdll.dll, confirmed via Windows Error Reporting -- while
+        closing these streams. Since that's a native crash, wrapping it
+        in try/except here can't prevent the process from dying if it
+        happens again, but calling this only after the interview is
+        already marked ended and handed to the background thread means
+        that failure mode can no longer erase a finished recording (the
+        WAV file, already finalized by stop(), stays fully reprocessable
+        via reprocess_interview() regardless of what happens here)."""
+        try:
+            if self._stream:
+                self._stream.stop_stream()
+                self._stream.close()
+        except Exception:  # noqa: BLE001
+            logger.warning("Error closing the system-audio stream (non-fatal)", exc_info=True)
+        try:
+            if self._mic_stream:
+                self._mic_stream.stop_stream()
+                self._mic_stream.close()
+        except Exception:  # noqa: BLE001
+            logger.warning("Error closing the microphone stream (non-fatal)", exc_info=True)
 
     def __del__(self):
         try:
@@ -621,15 +652,13 @@ class _MacAudioRecorder:
         return self._pause_event.is_set()
 
     def stop(self) -> Optional[pathlib.Path]:
+        """See the matching comment in _WindowsAudioRecorder.stop() -- same
+        split (finalize the WAV here, close streams in release_streams())
+        for the same reason: keep the recording itself safely on disk
+        before touching anything that could crash during teardown."""
         self._stop_event.set()
         if self._thread:
             self._thread.join(timeout=5)
-        if self._stream:
-            self._stream.stop()
-            self._stream.close()
-        if self._mic_stream:
-            self._mic_stream.stop()
-            self._mic_stream.close()
         if self._wav_file:
             self._wav_file.close()
         if self._out_file:
@@ -637,3 +666,23 @@ class _MacAudioRecorder:
             self._out_file.close()
         logger.info("Recording stopped -> %s", self._out_path)
         return self._out_path
+
+    def release_streams(self) -> None:
+        """See _WindowsAudioRecorder.release_streams()'s docstring -- same
+        contract (call after stop(), once the interview is already
+        committed as ended). No crash has been reproduced on macOS's
+        sounddevice backend specifically, but the same defensive split
+        applies here for interface consistency and because a
+        stream-teardown race isn't inherently platform-specific."""
+        try:
+            if self._stream:
+                self._stream.stop()
+                self._stream.close()
+        except Exception:  # noqa: BLE001
+            logger.warning("Error closing the system-audio stream (non-fatal)", exc_info=True)
+        try:
+            if self._mic_stream:
+                self._mic_stream.stop()
+                self._mic_stream.close()
+        except Exception:  # noqa: BLE001
+            logger.warning("Error closing the microphone stream (non-fatal)", exc_info=True)

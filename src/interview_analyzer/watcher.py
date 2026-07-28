@@ -665,6 +665,22 @@ class MeetingWatcher:
         )
         thread.start()
 
+        # Deliberately AFTER end_interview()/starting background processing,
+        # not before -- release_streams() (closing the underlying WASAPI/
+        # PyAudio streams) was the exact call reproduced crashing the whole
+        # process natively (see its docstring in recorder.py). By this
+        # point the interview is already marked ended and handed off, so a
+        # repeat of that crash can no longer erase a finished recording --
+        # at worst it takes the app down mid-processing, which
+        # reprocess_interview() can cleanly resume from. recorder.py's own
+        # implementation already swallows ordinary (non-native) exceptions
+        # internally, but this call site wraps it too, defensively, so
+        # that guarantee never depends on which recorder backend is active.
+        try:
+            self._recorder.release_streams()
+        except Exception:  # noqa: BLE001
+            logger.warning("Error releasing recorder streams after stop (non-fatal)", exc_info=True)
+
     def _process_in_background(
         self,
         interview_id: int,

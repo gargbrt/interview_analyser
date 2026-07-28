@@ -12,6 +12,7 @@ from __future__ import annotations
 import time
 import wave
 from contextlib import contextmanager
+from typing import Optional
 from unittest.mock import MagicMock, patch
 
 import numpy as np
@@ -34,16 +35,27 @@ class _FakeStream:
     attempt the background thread makes fails immediately and the thread
     exits (see `_record_loop`'s `except` clause), so it never competes
     with the test's own writes.
+
+    Tracks stop_stream()/close() call counts (and can be told to raise on
+    close) so tests can verify stop()/release_streams() each touch the
+    underlying stream at the right time -- see TestStopReleaseStreamsSplit.
     """
+
+    def __init__(self, raise_on_close: Optional[Exception] = None):
+        self.stop_stream_calls = 0
+        self.close_calls = 0
+        self._raise_on_close = raise_on_close
 
     def read(self, n, exception_on_overflow=False):
         raise RuntimeError("fake stream produces no frames; tests drive frames directly")
 
     def stop_stream(self):
-        pass
+        self.stop_stream_calls += 1
 
     def close(self):
-        pass
+        self.close_calls += 1
+        if self._raise_on_close is not None:
+            raise self._raise_on_close
 
 
 class _FakeReadableStream:
@@ -201,6 +213,77 @@ def test_stop_works_while_paused(tmp_path):
     assert result_path == out_path
     with wave.open(str(out_path), "rb") as wf:
         assert wf.getnframes() == 1024
+
+
+class TestStopReleaseStreamsSplit:
+    """stop() and release_streams() are deliberately separate calls (see
+    both docstrings in recorder.py): stop() only finalizes the WAV file on
+    disk; release_streams() closes the underlying WASAPI/PyAudio streams,
+    the exact call reproduced crashing the whole process natively on a
+    real machine. watcher.py now calls release_streams() only AFTER
+    committing the interview as ended and starting background processing
+    -- these tests guard the precondition that split relies on: stop()
+    itself must never touch the streams."""
+
+    def test_stop_does_not_close_the_underlying_streams(self, tmp_path):
+        with _fake_recorder() as rec:
+            rec.start(tmp_path / "call.wav")
+            stream = rec._stream
+            rec.stop()
+
+        assert stream.stop_stream_calls == 0
+        assert stream.close_calls == 0
+
+    def test_release_streams_closes_the_loopback_stream(self, tmp_path):
+        with _fake_recorder() as rec:
+            rec.start(tmp_path / "call.wav")
+            stream = rec._stream
+            rec.stop()
+            rec.release_streams()
+
+        assert stream.stop_stream_calls == 1
+        assert stream.close_calls == 1
+
+    def test_release_streams_closes_the_microphone_stream_too(self, tmp_path):
+        with _fake_recorder(mic_available=True) as rec:
+            rec.start(tmp_path / "call.wav")
+            mic_stream = rec._mic_stream
+            assert mic_stream is not None
+            rec.stop()
+            rec.release_streams()
+
+        assert mic_stream.stop_stream_calls == 1
+        assert mic_stream.close_calls == 1
+
+    def test_release_streams_survives_a_loopback_close_error(self, tmp_path):
+        """Regression coverage for the real crash this split exists to
+        contain: closing the loopback stream can fail (or, on a real
+        machine, crash the process natively) -- release_streams() must not
+        let a raised exception here prevent it from still attempting to
+        close the microphone stream, and must not propagate to the
+        caller."""
+        with _fake_recorder(mic_available=True) as rec:
+            rec.start(tmp_path / "call.wav")
+            rec._stream = _FakeStream(raise_on_close=OSError("stream already invalid"))
+            mic_stream = rec._mic_stream
+            rec.stop()
+            rec.release_streams()  # must not raise
+
+        assert mic_stream.close_calls == 1
+
+    def test_release_streams_survives_a_microphone_close_error(self, tmp_path):
+        with _fake_recorder(mic_available=True) as rec:
+            rec.start(tmp_path / "call.wav")
+            loopback_stream = rec._stream
+            rec._mic_stream = _FakeStream(raise_on_close=OSError("mic stream already invalid"))
+            rec.stop()
+            rec.release_streams()  # must not raise
+
+        assert loopback_stream.close_calls == 1
+
+    def test_release_streams_is_a_noop_without_a_prior_start(self):
+        with _fake_recorder() as rec:
+            rec.release_streams()  # must not raise even if start() was never called
 
 
 def test_elapsed_seconds_tracks_written_frames_not_paused_time(tmp_path):

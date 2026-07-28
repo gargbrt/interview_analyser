@@ -158,6 +158,57 @@ def test_full_pipeline_end_to_end_with_consent_granted(tmp_path):
     assert "Lacks structure" in trends_infographic_path_.read_text(encoding="utf-8")
 
 
+def test_release_streams_crashing_does_not_prevent_ending_or_processing_the_interview(tmp_path):
+    """Regression coverage for a real, reproduced crash: closing the
+    recorder's underlying audio streams (release_streams()) natively
+    crashed the whole process on a live machine (Windows Error Reporting
+    logged an access violation in ntdll.dll ~1s after a recording was
+    stopped), before the interview was ever marked ended or handed to
+    background processing -- the interview was silently lost with no
+    transcript/analysis/report. watcher.py now calls end_interview() and
+    starts background processing BEFORE release_streams(), specifically
+    so a repeat of that failure can't erase a finished recording. This
+    test can't reproduce a real native crash, but it verifies the ordering
+    invariant that fix depends on: even when release_streams() raises,
+    the interview still ends up ended, transcribed, analyzed, and
+    reported."""
+    cfg = _test_config(tmp_path)
+    watcher = MeetingWatcher(cfg, user_id=1)
+
+    with patch("interview_analyzer.watcher.detect_active_meeting", side_effect=[("Zoom", True), None]), \
+         patch("interview_analyzer.watcher.ask_consent", return_value=True), \
+         patch("interview_analyzer.watcher.SystemAudioRecorder") as MockRecorder, \
+         patch("interview_analyzer.watcher.RecordingControlPanel"), \
+         patch("interview_analyzer.watcher.compress_audio") as mock_compress, \
+         patch("interview_analyzer.watcher.transcribe", return_value=FAKE_TRANSCRIPT), \
+         patch("interview_analyzer.watcher.analyze_transcript", return_value=FAKE_ANALYSIS):
+
+        fake_wav = tmp_path / "audio" / "fake.wav"
+        fake_wav.parent.mkdir(parents=True, exist_ok=True)
+        fake_wav.write_bytes(b"RIFF....WAVEfake")
+        MockRecorder.return_value.stop.return_value = fake_wav
+        MockRecorder.return_value.release_streams.side_effect = OSError(
+            "simulated native crash during stream teardown"
+        )
+
+        fake_opus = tmp_path / "audio" / "fake.opus"
+        fake_opus.write_bytes(b"fake compressed audio")
+        mock_compress.return_value = fake_opus
+
+        watcher._tick()
+        interview_id = watcher._current_interview_id
+
+        watcher._tick()  # must not raise, even though release_streams() does
+
+        assert _wait_until(lambda: not watcher.status["processing_jobs"]), \
+            "background processing never finished"
+
+    record = watcher.db.get(interview_id)
+    assert record.ended_at is not None
+    assert record.transcript == FAKE_TRANSCRIPT
+    assert record.report_path is not None
+
+
 def test_full_pipeline_consent_declined_skips_recording(tmp_path):
     cfg = _test_config(tmp_path)
     watcher = MeetingWatcher(cfg, user_id=1)
