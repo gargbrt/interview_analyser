@@ -3,7 +3,7 @@ import sqlite3
 
 import pytest
 
-from interview_analyzer.db import InterviewDB
+from interview_analyzer.db import HIRE_OUTCOMES, InterviewDB
 from interview_analyzer.profiles import GENERIC_PROFILE, AssessmentProfile
 
 
@@ -161,6 +161,50 @@ def test_save_feedback_rejects_out_of_range_scores(tmp_path):
         db.save_feedback(iid, user_id=1, transcript_score=11, analysis_score=None, comment="")
     with pytest.raises(ValueError):
         db.save_feedback(iid, user_id=1, transcript_score=None, analysis_score=-1, comment="")
+
+
+def test_save_feedback_defaults_hire_outcome_to_not_known(tmp_path):
+    db = InterviewDB(tmp_path / "test.db")
+    iid = db.start_interview("Zoom", str(tmp_path / "a.wav"), retention_days=3, user_id=1)
+
+    db.save_feedback(iid, user_id=1, transcript_score=9, analysis_score=3, comment="")
+
+    assert db.get_feedback(iid).hire_outcome is None
+
+
+def test_save_and_get_feedback_with_hire_outcome(tmp_path):
+    db = InterviewDB(tmp_path / "test.db")
+    iid = db.start_interview("Zoom", str(tmp_path / "a.wav"), retention_days=3, user_id=1)
+
+    db.save_feedback(iid, user_id=1, transcript_score=9, analysis_score=8, comment="", hire_outcome="Hired")
+
+    assert db.get_feedback(iid).hire_outcome == "Hired"
+
+
+def test_resubmitting_feedback_updates_the_hire_outcome(tmp_path):
+    db = InterviewDB(tmp_path / "test.db")
+    iid = db.start_interview("Zoom", str(tmp_path / "a.wav"), retention_days=3, user_id=1)
+    db.save_feedback(iid, user_id=1, transcript_score=9, analysis_score=8, comment="", hire_outcome="Hired")
+
+    db.save_feedback(iid, user_id=1, transcript_score=9, analysis_score=8, comment="", hire_outcome="Not Hired")
+
+    assert db.get_feedback(iid).hire_outcome == "Not Hired"
+
+
+def test_save_feedback_rejects_an_invalid_hire_outcome(tmp_path):
+    db = InterviewDB(tmp_path / "test.db")
+    iid = db.start_interview("Zoom", str(tmp_path / "a.wav"), retention_days=3, user_id=1)
+
+    with pytest.raises(ValueError):
+        db.save_feedback(iid, user_id=1, transcript_score=None, analysis_score=None, comment="", hire_outcome="Maybe")
+
+
+def test_hire_outcomes_constant_matches_what_save_feedback_accepts(tmp_path):
+    db = InterviewDB(tmp_path / "test.db")
+    iid = db.start_interview("Zoom", str(tmp_path / "a.wav"), retention_days=3, user_id=1)
+    for outcome in HIRE_OUTCOMES:
+        db.save_feedback(iid, user_id=1, transcript_score=None, analysis_score=None, comment="", hire_outcome=outcome)
+        assert db.get_feedback(iid).hire_outcome == outcome
 
 
 def test_delete_feedback_removes_the_row_without_touching_the_interview(tmp_path):

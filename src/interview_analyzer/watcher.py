@@ -31,6 +31,7 @@ from .confidence import (
     calibrated_confidence,
     calibration_notes as build_calibration_notes,
     estimate_selection_probability,
+    hire_outcome_calibration,
     transcript_specificity_nudge,
 )
 from .consent import ask_consent
@@ -864,6 +865,11 @@ class MeetingWatcher:
                 confidence_info=analysis["confidence_info"],
                 competency_scores=session_summary.get("competency_scores"),
                 profile=profile,
+                # Ground truth, applied last -- see hire_outcome_calibration's
+                # docstring. None (no calibration) until this user has
+                # submitted enough labeled Hired/Not Hired outcomes for
+                # interviews of a similar type.
+                hire_outcome_calibration_info=hire_outcome_calibration(self.db, self.user_id, profile),
             )
         self.db.save_analysis(interview_id, analysis)
         # keeps a snapshot of every completed analysis attempt (the first

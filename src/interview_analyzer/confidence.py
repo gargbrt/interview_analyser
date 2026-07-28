@@ -25,6 +25,14 @@ Independent things live here:
     re-aggregation of the same competency scores was closer to self-
     consistency correction than genuinely combining two separate readings.
 
+  - `hire_outcome_calibration`: ground truth, not a proxy -- this user's
+    own submitted real hired/not-hired outcomes (db.py's FeedbackRecord.
+    hire_outcome) for past interviews of a similar type (matched by role/
+    seniority, backing off to a coarser match when there isn't enough
+    labeled history yet). Produces the two anchors (this user's own
+    average estimate for interviews that turned out Hired vs. Not Hired)
+    that estimate_selection_probability rescales its final number against.
+
   - `estimate_selection_probability`: a distinct 0-100 estimate of how
     likely the candidate would be selected/hired -- NOT the same thing as
     `calibrated_confidence` above (that measures trust in the assessment's
@@ -39,12 +47,15 @@ Independent things live here:
     all -- each went too far) -- then pulls the whole result toward a
     neutral 50% based on the assessment's own calibrated confidence, so it
     can never look more precise than the assessment backing it actually is.
+    Finally, if hire_outcome_calibration found enough labeled history,
+    rescales the result against this user's own real-world track record --
+    the one input here that's ground truth rather than a proxy for it.
 """
 from __future__ import annotations
 
 import logging
 import re
-from typing import Optional
+from typing import Callable, Optional
 
 from .profiles import TIER_ORDER, AssessmentProfile, GENERIC_PROFILE, competency_emphasis_value
 from .rubric import HIRE_RECOMMENDATION_LEVELS
@@ -349,12 +360,132 @@ def weighted_competency_total(
     return weighted_sum / weight_total if weight_total > 0 else None
 
 
+# Below this many total labeled outcomes (Hired + Not Hired combined) in a
+# given match-specificity group, that group's "average estimate per
+# outcome" isn't a meaningful anchor yet -- same bootstrapping reasoning as
+# MIN_FEEDBACK_SAMPLES/MIN_SPECIFICITY_SAMPLES above.
+MIN_HIRE_OUTCOME_SAMPLES = 4
+# The recalibration's own strength (see estimate_selection_probability's
+# handling of hire_outcome_calibration_info) grows with sample size but
+# saturates well short of fully overriding the model's own reasoning --
+# even a large, well-labeled history is one more signal, not the only one.
+_HIRE_OUTCOME_CALIBRATION_SATURATION_SAMPLES = 12
+_MAX_HIRE_OUTCOME_CALIBRATION_WEIGHT = 0.6
+
+
+def _profile_field(profile: Optional[AssessmentProfile], name: str):
+    return getattr(profile, name, None) if profile is not None else None
+
+
+# Backoff order for matching a past interview's profile against the
+# CURRENT one when picking which labeled outcomes to calibrate against --
+# most specific first. Role and seniority are the two dimensions that
+# actually distinguish "interview type" in this app's own vocabulary (e.g.
+# "Senior PM" vs "Entry-level SWE" -- see profiles.py's SENIORITY_EMPHASIS/
+# ROLE_EMPHASIS, which are also built around just these two as the primary
+# axes), so they're tried together before falling back to either alone,
+# then finally no filter at all. Industry/company_type are deliberately
+# NOT part of this hierarchy -- with realistically small numbers of labeled
+# outcomes per user, requiring a 4-way match would almost always fall
+# straight through to "no data," defeating the point of trying to be
+# profile-specific at all.
+_HIRE_OUTCOME_MATCH_LEVELS: list[tuple[str, Callable[[Optional[AssessmentProfile], Optional[AssessmentProfile]], bool]]] = [
+    (
+        "role and seniority",
+        lambda past, current: (
+            _profile_field(current, "role") is not None
+            and _profile_field(current, "seniority") is not None
+            and _profile_field(past, "role") == _profile_field(current, "role")
+            and _profile_field(past, "seniority") == _profile_field(current, "seniority")
+        ),
+    ),
+    (
+        "seniority",
+        lambda past, current: (
+            _profile_field(current, "seniority") is not None
+            and _profile_field(past, "seniority") == _profile_field(current, "seniority")
+        ),
+    ),
+    (
+        "role",
+        lambda past, current: (
+            _profile_field(current, "role") is not None
+            and _profile_field(past, "role") == _profile_field(current, "role")
+        ),
+    ),
+    ("all your interviews", lambda past, current: True),
+]
+
+
+def hire_outcome_calibration(db, user_id: Optional[int], profile: Optional[AssessmentProfile]) -> Optional[dict]:
+    """Ground-truth calibration from this user's own submitted hire/no-hire
+    outcomes (see db.py's FeedbackRecord.hire_outcome -- distinct from
+    analysis_score, which rates whether the ASSESSMENT was accurate, not
+    what actually happened).
+
+    For each of this user's past interviews with a labeled outcome, looks
+    up the selection-probability percent that was actually estimated for
+    it at the time, then groups those (percent, outcome) pairs by how
+    closely that interview's profile matches the CURRENT one --
+    _HIRE_OUTCOME_MATCH_LEVELS, most specific first (role+seniority, then
+    seniority alone, then role alone, then everything). Returns the
+    MOST SPECIFIC level that has at least MIN_HIRE_OUTCOME_SAMPLES total
+    labeled outcomes AND at least one of each ("Hired" and "Not Hired" --
+    two anchors are needed to calibrate against, one alone says nothing
+    about direction). Returns None if no level qualifies (not enough
+    labeled history yet, for interviews like this one or otherwise).
+
+    Return shape: {"hired_anchor": float, "not_hired_anchor": float,
+    "sample_size": int, "specificity": str (a label from
+    _HIRE_OUTCOME_MATCH_LEVELS, for the basis text)}."""
+    try:
+        feedback_rows = [
+            f for f in db.list_feedback(user_id=user_id)
+            if f.hire_outcome in ("Hired", "Not Hired")
+        ]
+    except Exception:  # noqa: BLE001
+        logger.warning("Couldn't read feedback history for hire-outcome calibration.", exc_info=True)
+        return None
+    if not feedback_rows:
+        return None
+
+    samples: list[tuple[float, str, Optional[AssessmentProfile]]] = []
+    for fb in feedback_rows:
+        try:
+            record = db.get(fb.interview_id)
+        except Exception:  # noqa: BLE001
+            continue
+        if record is None:
+            continue
+        analysis = record.analysis
+        if not isinstance(analysis, dict):
+            continue
+        percent = (analysis.get("selection_probability") or {}).get("percent")
+        if not isinstance(percent, (int, float)) or isinstance(percent, bool):
+            continue
+        samples.append((float(percent), fb.hire_outcome, record.profile))
+
+    for label, matches in _HIRE_OUTCOME_MATCH_LEVELS:
+        group = [(pct, outcome) for pct, outcome, past_profile in samples if matches(past_profile, profile)]
+        hired = [pct for pct, outcome in group if outcome == "Hired"]
+        not_hired = [pct for pct, outcome in group if outcome == "Not Hired"]
+        if len(group) >= MIN_HIRE_OUTCOME_SAMPLES and hired and not_hired:
+            return {
+                "hired_anchor": sum(hired) / len(hired),
+                "not_hired_anchor": sum(not_hired) / len(not_hired),
+                "sample_size": len(group),
+                "specificity": label,
+            }
+    return None
+
+
 def estimate_selection_probability(
     hire_recommendation: Optional[dict],
     nudge: Optional[float] = None,
     confidence_info: Optional[dict] = None,
     competency_scores: Optional[list[dict]] = None,
     profile: AssessmentProfile = GENERIC_PROFILE,
+    hire_outcome_calibration_info: Optional[dict] = None,
 ) -> dict:
     """A distinct-from-`calibrated_confidence` estimate of how likely this
     candidate would be selected, expressed as {"percent": int (1-99),
@@ -401,6 +532,18 @@ def estimate_selection_probability(
     so a low hire-scale anchor (e.g. "Lean No Hire" = 30%) can never end up
     at 95+ regardless of the nudge, disagreement correction, or confidence;
     only a high anchor itself (Strong Hire/Exceptional) can.
+
+    A fifth, final input, `hire_outcome_calibration_info` (from
+    hire_outcome_calibration -- see its own docstring), is ground truth:
+    this user's own submitted real-world hired/not-hired outcomes for past
+    interviews of a similar type. Where every other input is a proxy for
+    the outcome, this IS the outcome, so it's applied last, rescaling the
+    already-computed percent using this user's own historical "hired
+    interviews estimated around X%, not-hired ones around Y%" as reference
+    points -- blended in proportional to how many labeled outcomes back it
+    (see _HIRE_OUTCOME_CALIBRATION_SATURATION_SAMPLES), capped at
+    _MAX_HIRE_OUTCOME_CALIBRATION_WEIGHT so even a large labeled history
+    stays one input among several rather than fully overriding the rest.
     """
     level = (hire_recommendation or {}).get("level") or ""
     anchor = _HIRE_LEVEL_ANCHOR.get(level, _NEUTRAL_PERCENT)
@@ -434,6 +577,40 @@ def estimate_selection_probability(
     # the resulting number was a bug -- it wasn't, the wording was just
     # confusing about which direction X% applied to).
     pulled_fraction = 1 - confidence_weight
+
+    # Ground-truth recalibration -- see hire_outcome_calibration_info's
+    # docstring above. Rescales `percent` using this user's own historical
+    # "hired interviews estimated around X%, not-hired ones around Y%" as
+    # the 0/100 reference points, then blends that rescaled value back in
+    # proportional to how much labeled history backs it, rather than
+    # applying it at full strength.
+    calibration_clause = ""
+    if hire_outcome_calibration_info is not None:
+        hired_anchor = hire_outcome_calibration_info.get("hired_anchor")
+        not_hired_anchor = hire_outcome_calibration_info.get("not_hired_anchor")
+        sample_size = hire_outcome_calibration_info.get("sample_size", 0)
+        specificity = hire_outcome_calibration_info.get("specificity", "your labeled interviews")
+        if (
+            isinstance(hired_anchor, (int, float)) and isinstance(not_hired_anchor, (int, float))
+            and hired_anchor > not_hired_anchor
+        ):
+            calibration_weight = (
+                min(1.0, sample_size / _HIRE_OUTCOME_CALIBRATION_SATURATION_SAMPLES)
+                * _MAX_HIRE_OUTCOME_CALIBRATION_WEIGHT
+            )
+            scale = 100.0 / (hired_anchor - not_hired_anchor)
+            rescaled = max(0.0, min(100.0, (percent - not_hired_anchor) * scale))
+            calibrated_float = percent + (rescaled - percent) * calibration_weight
+            new_percent = max(1, min(99, round(calibrated_float)))
+            if new_percent != percent:
+                calibration_clause = (
+                    f" Recalibrated against {specificity} ({sample_size} labeled outcomes -- hired "
+                    f"interviews you've submitted feedback for were estimated around {hired_anchor:.0f}% on "
+                    f"average, not-hired ones around {not_hired_anchor:.0f}%), from {percent}% to "
+                    f"{new_percent}%."
+                )
+            percent = new_percent
+
     disagreement_clause = ""
     if disagreement_correction != 0.0:
         disagreement_clause = (
@@ -448,7 +625,7 @@ def estimate_selection_probability(
         f"{disagreement_clause} "
         f"{round(confidence_weight * 100)}% assessment confidence kept the estimate close to "
         f"that baseline, pulling only {round(pulled_fraction * 100)}% of the way toward a "
-        f"neutral 50%."
+        f"neutral 50%.{calibration_clause}"
     )
     binary_recommendation = "Recommended" if percent >= _RECOMMENDED_THRESHOLD else "Not Recommended"
     return {

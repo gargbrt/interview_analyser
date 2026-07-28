@@ -110,6 +110,15 @@ _INTERVIEWS_MIGRATIONS: list[tuple[str, str]] = [
     ),
 ]
 
+# Same idea as _INTERVIEWS_MIGRATIONS, for the feedback table -- see
+# _migrate_feedback_table.
+_FEEDBACK_MIGRATIONS: list[tuple[str, str]] = [
+    (
+        "hire_outcome",
+        "ALTER TABLE feedback ADD COLUMN hire_outcome TEXT",
+    ),
+]
+
 
 @dataclass
 class InterviewRecord:
@@ -142,6 +151,11 @@ class InterviewRecord:
         return AssessmentProfile.from_dict(json.loads(self.profile_snapshot_json))
 
 
+#: The only two real values hire_outcome can hold besides None ("not yet
+#: known") -- see FeedbackRecord.hire_outcome and save_feedback.
+HIRE_OUTCOMES = ("Hired", "Not Hired")
+
+
 @dataclass
 class FeedbackRecord:
     interview_id: int
@@ -150,6 +164,13 @@ class FeedbackRecord:
     analysis_score: Optional[int]    # 1-10, None = not rated
     comment: Optional[str]
     created_at: str
+    # The REAL outcome of this interview ("Hired"/"Not Hired"), submitted
+    # by the user once they know it -- distinct from analysis_score (which
+    # rates whether the ASSESSMENT was accurate, not what actually
+    # happened). See confidence.py's hire_outcome_calibration, which uses
+    # this as ground truth to recalibrate future selection-probability
+    # estimates. None until the user knows/submits it.
+    hire_outcome: Optional[str] = None
 
 
 @dataclass
@@ -207,6 +228,7 @@ class InterviewDB:
         self._conn.executescript(SCHEMA)
         self._conn.commit()
         self._migrate_interviews_table()
+        self._migrate_feedback_table()
 
     def _migrate_interviews_table(self) -> None:
         """Applies any ALTER TABLE ADD COLUMN migrations the `interviews`
@@ -218,6 +240,16 @@ class InterviewDB:
             row["name"] for row in self._conn.execute("PRAGMA table_info(interviews)").fetchall()
         }
         for column, alter_sql in _INTERVIEWS_MIGRATIONS:
+            if column not in existing_columns:
+                self._conn.execute(alter_sql)
+        self._conn.commit()
+
+    def _migrate_feedback_table(self) -> None:
+        """Same idea as _migrate_interviews_table, for `feedback`."""
+        existing_columns = {
+            row["name"] for row in self._conn.execute("PRAGMA table_info(feedback)").fetchall()
+        }
+        for column, alter_sql in _FEEDBACK_MIGRATIONS:
             if column not in existing_columns:
                 self._conn.execute(alter_sql)
         self._conn.commit()
@@ -386,27 +418,36 @@ class InterviewDB:
         transcript_score: Optional[int],
         analysis_score: Optional[int],
         comment: str = "",
+        hire_outcome: Optional[str] = None,
     ) -> None:
         """Upserts the single feedback row for this interview -- resubmitting
         (e.g. changing your mind, adding a comment later, or clearing a
         rating back to "not rated" by passing None) replaces the previous
         rating rather than accumulating duplicates. Scores are 1-10 or None
         (not rated) -- validated here since this is the one place every
-        write path (UI, tests) funnels through."""
+        write path (UI, tests) funnels through. `hire_outcome` is one of
+        HIRE_OUTCOMES ("Hired"/"Not Hired") or None ("not yet known") --
+        the real-world result, not a rating of the assessment (see
+        FeedbackRecord.hire_outcome)."""
         for score in (transcript_score, analysis_score):
             if score is not None and not (1 <= score <= 10):
                 raise ValueError(f"Feedback scores must be 1-10 or None, got {score!r}.")
+        if hire_outcome is not None and hire_outcome not in HIRE_OUTCOMES:
+            raise ValueError(f"hire_outcome must be one of {HIRE_OUTCOMES} or None, got {hire_outcome!r}.")
         with self._lock:
             self._conn.execute(
                 """
-                INSERT INTO feedback (interview_id, user_id, transcript_correct, analysis_correct, comment, created_at)
-                VALUES (?, ?, ?, ?, ?, ?)
+                INSERT INTO feedback (
+                    interview_id, user_id, transcript_correct, analysis_correct, comment, created_at, hire_outcome
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(interview_id) DO UPDATE SET
                     user_id = excluded.user_id,
                     transcript_correct = excluded.transcript_correct,
                     analysis_correct = excluded.analysis_correct,
                     comment = excluded.comment,
-                    created_at = excluded.created_at
+                    created_at = excluded.created_at,
+                    hire_outcome = excluded.hire_outcome
                 """,
                 (
                     interview_id,
@@ -415,6 +456,7 @@ class InterviewDB:
                     analysis_score,
                     comment,
                     dt.datetime.now().isoformat(),
+                    hire_outcome,
                 ),
             )
             self._conn.commit()
@@ -453,6 +495,10 @@ class InterviewDB:
             analysis_score=row["analysis_correct"],
             comment=row["comment"],
             created_at=row["created_at"],
+            # row["hire_outcome"] via sqlite3.Row keying works even for a
+            # column added by a migration after this row's table was first
+            # created, same as any other column
+            hire_outcome=row["hire_outcome"],
         )
 
     @staticmethod

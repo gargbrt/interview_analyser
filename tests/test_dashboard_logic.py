@@ -111,6 +111,8 @@ def _dashboard_with_selected_interview(tmp_path):
     dashboard._history_tree.selection.return_value = [str(iid)]
     dashboard._fb_transcript_var = MagicMock()
     dashboard._fb_analysis_var = MagicMock()
+    dashboard._fb_hire_outcome_var = MagicMock()
+    dashboard._fb_hire_outcome_var.get.return_value = "Not yet known"
     dashboard._fb_comment_entry = MagicMock()
     dashboard._fb_status_label = MagicMock()
     return dashboard, iid
@@ -128,6 +130,18 @@ class TestFeedbackScoreConversion:
         assert Dashboard._feedback_score_from_var(var) == 7
 
 
+class TestHireOutcomeConversion:
+    def test_not_yet_known_becomes_none(self):
+        var = MagicMock()
+        var.get.return_value = "Not yet known"
+        assert Dashboard._feedback_hire_outcome_from_var(var) is None
+
+    def test_hired_passes_through_unchanged(self):
+        var = MagicMock()
+        var.get.return_value = "Hired"
+        assert Dashboard._feedback_hire_outcome_from_var(var) == "Hired"
+
+
 class TestSubmitFeedback:
     def test_saves_scores_and_comment_for_the_selected_interview(self, tmp_path):
         dashboard, iid = _dashboard_with_selected_interview(tmp_path)
@@ -141,6 +155,15 @@ class TestSubmitFeedback:
         assert fb.transcript_score == 9
         assert fb.analysis_score == 4
         assert fb.comment == "missed a detail"
+
+    def test_saves_the_hire_outcome_for_the_selected_interview(self, tmp_path):
+        dashboard, iid = _dashboard_with_selected_interview(tmp_path)
+        dashboard._fb_comment_entry.get.return_value = ""
+        dashboard._fb_hire_outcome_var.get.return_value = "Hired"
+
+        dashboard._on_submit_feedback()
+
+        assert dashboard.watcher.db.get_feedback(iid).hire_outcome == "Hired"
 
     def test_no_op_when_nothing_selected(self, tmp_path):
         dashboard = Dashboard(_watcher(tmp_path))
@@ -164,6 +187,19 @@ class TestClearFeedbackRatings:
         assert fb.transcript_score is None
         assert fb.analysis_score is None
 
+    def test_does_not_clear_a_previously_submitted_hire_outcome(self, tmp_path):
+        """The hire outcome is a real-world fact, not a quality rating --
+        clearing the 1-10 scores must not also wipe it out."""
+        dashboard, iid = _dashboard_with_selected_interview(tmp_path)
+        dashboard.watcher.db.save_feedback(
+            iid, user_id=1, transcript_score=8, analysis_score=6, comment="notes", hire_outcome="Hired",
+        )
+        dashboard._fb_hire_outcome_var.get.return_value = "Hired"
+
+        dashboard._on_clear_feedback_ratings()
+
+        assert dashboard.watcher.db.get_feedback(iid).hire_outcome == "Hired"
+
 
 class TestDeleteFeedback:
     def test_removes_the_feedback_row_entirely(self, tmp_path):
@@ -174,11 +210,50 @@ class TestDeleteFeedback:
 
         assert dashboard.watcher.db.get_feedback(iid) is None
 
+    def test_resets_the_hire_outcome_selector_too(self, tmp_path):
+        dashboard, iid = _dashboard_with_selected_interview(tmp_path)
+        dashboard.watcher.db.save_feedback(
+            iid, user_id=1, transcript_score=8, analysis_score=6, comment="notes", hire_outcome="Hired",
+        )
+
+        dashboard._on_delete_feedback()
+
+        dashboard._fb_hire_outcome_var.set.assert_called_with("Not yet known")
+
     def test_no_op_when_nothing_selected(self, tmp_path):
         dashboard = Dashboard(_watcher(tmp_path))
         dashboard._history_tree = MagicMock()
         dashboard._history_tree.selection.return_value = []
         dashboard._on_delete_feedback()  # must not raise
+
+
+class TestRefreshFeedbackPanel:
+    def _dashboard_with_frame(self, tmp_path):
+        dashboard, iid = _dashboard_with_selected_interview(tmp_path)
+        dashboard._fb_frame = MagicMock()
+        dashboard._fb_confidence_label = MagicMock()
+        return dashboard, iid
+
+    def test_loads_an_existing_hire_outcome(self, tmp_path):
+        dashboard, iid = self._dashboard_with_frame(tmp_path)
+        dashboard.watcher.db.save_feedback(
+            iid, user_id=1, transcript_score=None, analysis_score=None, comment="", hire_outcome="Not Hired",
+        )
+        dashboard.watcher.db.save_analysis(iid, {"session_summary": {}})
+        record = dashboard.watcher.db.get(iid)
+
+        dashboard._refresh_feedback_panel(record)
+
+        dashboard._fb_hire_outcome_var.set.assert_called_with("Not Hired")
+
+    def test_defaults_to_not_yet_known_with_no_existing_feedback(self, tmp_path):
+        dashboard, iid = self._dashboard_with_frame(tmp_path)
+        dashboard.watcher.db.save_analysis(iid, {"session_summary": {}})
+        record = dashboard.watcher.db.get(iid)
+
+        dashboard._refresh_feedback_panel(record)
+
+        dashboard._fb_hire_outcome_var.set.assert_called_with("Not yet known")
 
 
 class TestOpenWithOsDefault:

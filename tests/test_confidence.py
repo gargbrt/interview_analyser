@@ -8,6 +8,7 @@ from unittest.mock import MagicMock
 
 from interview_analyzer.confidence import (
     MIN_FEEDBACK_SAMPLES,
+    MIN_HIRE_OUTCOME_SAMPLES,
     MIN_SPECIFICITY_SAMPLES,
     NEGATIVE_SCORE_THRESHOLD,
     _candidate_turns,
@@ -17,11 +18,12 @@ from interview_analyzer.confidence import (
     competency_weight,
     estimate_selection_probability,
     format_confidence,
+    hire_outcome_calibration,
     transcript_specificity_nudge,
     weighted_competency_total,
 )
 from interview_analyzer.db import InterviewDB
-from interview_analyzer.profiles import AssessmentProfile
+from interview_analyzer.profiles import GENERIC_PROFILE, AssessmentProfile
 
 
 class TestCalibratedConfidence:
@@ -509,3 +511,247 @@ class TestCompetencyWeight:
             industry="FinTech", company_type="Consulting",
         )
         assert competency_weight("Business Acumen", profile) == 3.0  # exactly "critical"
+
+
+class TestHireOutcomeCalibration:
+    """Ground-truth calibration from the user's own submitted hired/not-
+    hired outcomes (db.py's FeedbackRecord.hire_outcome), scoped to
+    interviews of a similar type (role/seniority) via a most-specific-first
+    backoff -- see _HIRE_OUTCOME_MATCH_LEVELS."""
+
+    def _seed(self, db, profile, percent, hire_outcome, user_id=1):
+        iid = db.start_interview("Zoom", "a.wav", retention_days=3, user_id=user_id)
+        db.save_profile_snapshot(iid, profile)
+        db.save_analysis(iid, {"selection_probability": {"percent": percent}})
+        db.save_feedback(iid, user_id=user_id, transcript_score=None, analysis_score=None, comment="",
+                          hire_outcome=hire_outcome)
+        return iid
+
+    def test_none_with_no_labeled_outcomes_at_all(self, tmp_path):
+        db = InterviewDB(tmp_path / "test.db")
+        assert hire_outcome_calibration(db, 1, GENERIC_PROFILE) is None
+
+    def test_none_below_the_minimum_sample_size_even_with_both_classes(self, tmp_path):
+        db = InterviewDB(tmp_path / "test.db")
+        self._seed(db, GENERIC_PROFILE, 60, "Hired")
+        self._seed(db, GENERIC_PROFILE, 40, "Not Hired")
+        assert MIN_HIRE_OUTCOME_SAMPLES > 2  # sanity check on the constant this test relies on
+        assert hire_outcome_calibration(db, 1, GENERIC_PROFILE) is None
+
+    def test_none_when_only_one_outcome_class_is_represented(self, tmp_path):
+        db = InterviewDB(tmp_path / "test.db")
+        for percent in (60, 62, 64, 66):
+            self._seed(db, GENERIC_PROFILE, percent, "Hired")
+        assert hire_outcome_calibration(db, 1, GENERIC_PROFILE) is None
+
+    def test_computes_anchors_from_global_history_with_no_profile_set(self, tmp_path):
+        db = InterviewDB(tmp_path / "test.db")
+        self._seed(db, GENERIC_PROFILE, 70, "Hired")
+        self._seed(db, GENERIC_PROFILE, 74, "Hired")
+        self._seed(db, GENERIC_PROFILE, 30, "Not Hired")
+        self._seed(db, GENERIC_PROFILE, 34, "Not Hired")
+
+        result = hire_outcome_calibration(db, 1, GENERIC_PROFILE)
+
+        assert result["hired_anchor"] == 72
+        assert result["not_hired_anchor"] == 32
+        assert result["sample_size"] == 4
+        assert result["specificity"] == "all your interviews"
+
+    def test_prefers_the_most_specific_role_and_seniority_match(self, tmp_path):
+        """A profile with the SAME role+seniority as the current one must
+        be used in preference to a larger but less specific pool, even
+        though the broader pool alone would also satisfy the minimum
+        sample size."""
+        db = InterviewDB(tmp_path / "test.db")
+        current = AssessmentProfile(role="Product", seniority="Senior/Lead")
+        matching = AssessmentProfile(role="Product", seniority="Senior/Lead")
+        other_role = AssessmentProfile(role="Data", seniority="Senior/Lead")
+
+        self._seed(db, matching, 70, "Hired")
+        self._seed(db, matching, 74, "Hired")
+        self._seed(db, matching, 30, "Not Hired")
+        self._seed(db, matching, 34, "Not Hired")
+        # a much larger, differently-role'd pool at the same seniority --
+        # must NOT be what gets used, even though it alone qualifies
+        for _ in range(5):
+            self._seed(db, other_role, 95, "Hired")
+            self._seed(db, other_role, 5, "Not Hired")
+
+        result = hire_outcome_calibration(db, 1, current)
+
+        assert result["specificity"] == "role and seniority"
+        assert result["sample_size"] == 4
+        assert result["hired_anchor"] == 72
+        assert result["not_hired_anchor"] == 32
+
+    def test_falls_back_to_seniority_alone_when_the_specific_group_is_too_small(self, tmp_path):
+        db = InterviewDB(tmp_path / "test.db")
+        current = AssessmentProfile(role="Product", seniority="Senior/Lead")
+        same_role_and_seniority = AssessmentProfile(role="Product", seniority="Senior/Lead")
+        same_seniority_only = AssessmentProfile(role="Data", seniority="Senior/Lead")
+
+        # only 2 in the exact role+seniority group -- below the minimum
+        self._seed(db, same_role_and_seniority, 70, "Hired")
+        self._seed(db, same_role_and_seniority, 30, "Not Hired")
+        # 2 more at the same seniority but a different role, bringing the
+        # broader "seniority" group to 4 total
+        self._seed(db, same_seniority_only, 74, "Hired")
+        self._seed(db, same_seniority_only, 34, "Not Hired")
+
+        result = hire_outcome_calibration(db, 1, current)
+
+        assert result["specificity"] == "seniority"
+        assert result["sample_size"] == 4
+
+    def test_falls_back_to_role_alone_when_seniority_never_matches(self, tmp_path):
+        db = InterviewDB(tmp_path / "test.db")
+        current = AssessmentProfile(role="Product", seniority="Senior/Lead")
+        same_role_different_seniority = AssessmentProfile(role="Product", seniority="Entry Level")
+
+        self._seed(db, same_role_different_seniority, 70, "Hired")
+        self._seed(db, same_role_different_seniority, 74, "Hired")
+        self._seed(db, same_role_different_seniority, 30, "Not Hired")
+        self._seed(db, same_role_different_seniority, 34, "Not Hired")
+
+        result = hire_outcome_calibration(db, 1, current)
+
+        assert result["specificity"] == "role"
+        assert result["sample_size"] == 4
+
+    def test_falls_back_to_all_interviews_when_nothing_matches_role_or_seniority(self, tmp_path):
+        db = InterviewDB(tmp_path / "test.db")
+        current = AssessmentProfile(role="Product", seniority="Senior/Lead")
+        unrelated = AssessmentProfile(role="Sales", seniority="Entry Level")
+
+        self._seed(db, unrelated, 70, "Hired")
+        self._seed(db, unrelated, 74, "Hired")
+        self._seed(db, unrelated, 30, "Not Hired")
+        self._seed(db, unrelated, 34, "Not Hired")
+
+        result = hire_outcome_calibration(db, 1, current)
+
+        assert result["specificity"] == "all your interviews"
+        assert result["sample_size"] == 4
+
+    def test_a_generic_current_profile_goes_straight_to_all_interviews(self, tmp_path):
+        """With no role/seniority set on the CURRENT profile, there's
+        nothing meaningful to match against -- skip straight to the
+        broadest group rather than "matching" on None == None."""
+        db = InterviewDB(tmp_path / "test.db")
+        specific = AssessmentProfile(role="Product", seniority="Senior/Lead")
+
+        self._seed(db, specific, 70, "Hired")
+        self._seed(db, specific, 74, "Hired")
+        self._seed(db, specific, 30, "Not Hired")
+        self._seed(db, specific, 34, "Not Hired")
+
+        result = hire_outcome_calibration(db, 1, GENERIC_PROFILE)
+
+        assert result["specificity"] == "all your interviews"
+
+    def test_ignores_labeled_interviews_with_no_stored_percent(self, tmp_path):
+        db = InterviewDB(tmp_path / "test.db")
+        iid = db.start_interview("Zoom", "a.wav", retention_days=3, user_id=1)
+        db.save_analysis(iid, {"session_summary": {}})  # no selection_probability at all
+        db.save_feedback(iid, user_id=1, transcript_score=None, analysis_score=None, comment="",
+                          hire_outcome="Hired")
+        self._seed(db, GENERIC_PROFILE, 70, "Hired")
+        self._seed(db, GENERIC_PROFILE, 74, "Hired")
+        self._seed(db, GENERIC_PROFILE, 30, "Not Hired")
+        self._seed(db, GENERIC_PROFILE, 34, "Not Hired")
+
+        result = hire_outcome_calibration(db, 1, GENERIC_PROFILE)
+
+        # the un-scored interview must not have counted toward sample_size
+        # or skewed hired_anchor
+        assert result["sample_size"] == 4
+        assert result["hired_anchor"] == 72
+
+    def test_scoped_to_the_given_user(self, tmp_path):
+        db = InterviewDB(tmp_path / "test.db")
+        for percent, outcome in ((70, "Hired"), (74, "Hired"), (30, "Not Hired"), (34, "Not Hired")):
+            self._seed(db, GENERIC_PROFILE, percent, outcome, user_id=2)
+
+        assert hire_outcome_calibration(db, 1, GENERIC_PROFILE) is None
+
+
+class TestEstimateSelectionProbabilityHireOutcomeCalibration:
+    """estimate_selection_probability's final, ground-truth recalibration
+    step -- see its own docstring for why this is applied last, after the
+    other (proxy) signals."""
+
+    def test_omitted_behaves_identically_to_before(self):
+        without = estimate_selection_probability({"level": "Strong Hire"}, None, confidence_info={"score": 100})
+        assert without["percent"] == 90
+        assert "Recalibrated" not in without["basis"]
+
+    def test_recalibrates_toward_the_historical_hired_anchor(self):
+        """Real numbers, hand-verified: anchor 90 (Strong Hire, full
+        confidence, no other corrections) rescaled against a history where
+        hired interviews averaged 70% and not-hired ones 30% (a full-weight
+        12-sample group) pushes the estimate up to 96%."""
+        result = estimate_selection_probability(
+            {"level": "Strong Hire"}, None, confidence_info={"score": 100},
+            hire_outcome_calibration_info={
+                "hired_anchor": 70, "not_hired_anchor": 30, "sample_size": 12, "specificity": "role and seniority",
+            },
+        )
+        assert result["percent"] == 96
+        assert "Recalibrated" in result["basis"]
+        assert "role and seniority" in result["basis"]
+
+    def test_calibration_strength_scales_with_sample_size(self):
+        """Half the saturation sample count should pull about half as
+        hard as the full-weight case above."""
+        half_weight = estimate_selection_probability(
+            {"level": "Strong Hire"}, None, confidence_info={"score": 100},
+            hire_outcome_calibration_info={
+                "hired_anchor": 70, "not_hired_anchor": 30, "sample_size": 6, "specificity": "role and seniority",
+            },
+        )
+        full_weight = estimate_selection_probability(
+            {"level": "Strong Hire"}, None, confidence_info={"score": 100},
+            hire_outcome_calibration_info={
+                "hired_anchor": 70, "not_hired_anchor": 30, "sample_size": 12, "specificity": "role and seniority",
+            },
+        )
+        uncalibrated = estimate_selection_probability({"level": "Strong Hire"}, None, confidence_info={"score": 100})
+        assert uncalibrated["percent"] < half_weight["percent"] < full_weight["percent"]
+
+    def test_no_calibration_when_anchors_are_not_directionally_sane(self):
+        """A hired_anchor at or below not_hired_anchor carries no usable
+        direction -- must be ignored rather than applied backwards."""
+        result = estimate_selection_probability(
+            {"level": "Strong Hire"}, None, confidence_info={"score": 100},
+            hire_outcome_calibration_info={
+                "hired_anchor": 40, "not_hired_anchor": 60, "sample_size": 12, "specificity": "role",
+            },
+        )
+        assert result["percent"] == 90
+        assert "Recalibrated" not in result["basis"]
+
+    def test_can_flip_the_binary_recommendation(self):
+        """Regression guard: binary_recommendation must reflect the FINAL,
+        post-calibration percent, not the pre-calibration one."""
+        uncalibrated = estimate_selection_probability({"level": "Lean No Hire"}, None, confidence_info={"score": 100})
+        assert uncalibrated["percent"] == 30
+        assert uncalibrated["binary_recommendation"] == "Not Recommended"
+
+        calibrated = estimate_selection_probability(
+            {"level": "Lean No Hire"}, None, confidence_info={"score": 100},
+            hire_outcome_calibration_info={
+                "hired_anchor": 20, "not_hired_anchor": 10, "sample_size": 12, "specificity": "role and seniority",
+            },
+        )
+        assert calibrated["percent"] == 72
+        assert calibrated["binary_recommendation"] == "Recommended"
+
+    def test_calibrated_percent_stays_within_the_1_to_99_bounds(self):
+        result = estimate_selection_probability(
+            {"level": "Exceptional"}, 15, confidence_info={"score": 100},
+            hire_outcome_calibration_info={
+                "hired_anchor": 55, "not_hired_anchor": 54, "sample_size": 50, "specificity": "role",
+            },
+        )
+        assert 1 <= result["percent"] <= 99

@@ -59,6 +59,11 @@ _TRANSCRIPTION_LANGUAGES = ["auto", "en", "hi", "hinglish"]
 # feedback panel's Comboboxes -- selecting it and saving is how you clear
 # a previously-given score.
 _FEEDBACK_SCORE_VALUES = ["Not rated"] + [str(i) for i in range(1, 11)]
+# Same "index 0 doubles as clear" convention as above, for the hire-outcome
+# Combobox -- "Not yet known" both starts a fresh selection and clears a
+# previously-submitted outcome. Values after it match db.HIRE_OUTCOMES
+# exactly (see _feedback_hire_outcome_from_var).
+_HIRE_OUTCOME_VALUES = ["Not yet known", "Hired", "Not Hired"]
 
 
 def _open_with_os_default(path) -> None:
@@ -345,6 +350,7 @@ class Dashboard:
         self._settings_status = None
         self._fb_transcript_var = None
         self._fb_analysis_var = None
+        self._fb_hire_outcome_var = None
         self._fb_comment_entry = None
         self._fb_frame = None
         self._fb_status_label = None
@@ -1029,6 +1035,19 @@ class Dashboard:
             state="readonly", width=10,
         ).pack(side="left")
 
+        row_outcome = ttk.Frame(panel)
+        row_outcome.pack(fill="x", pady=(0, 4))
+        ttk.Label(row_outcome, text="Actual outcome", width=24).pack(side="left")
+        self._fb_hire_outcome_var = tk.StringVar(value=_HIRE_OUTCOME_VALUES[0])
+        ttk.Combobox(
+            row_outcome, textvariable=self._fb_hire_outcome_var, values=_HIRE_OUTCOME_VALUES,
+            state="readonly", width=14,
+        ).pack(side="left")
+        ttk.Label(
+            row_outcome, text="(once known -- calibrates future estimates for interviews like this one)",
+            foreground="#5b645f",
+        ).pack(side="left", padx=(6, 0))
+
         row3 = ttk.Frame(panel)
         row3.pack(fill="x", pady=(0, 4))
         ttk.Label(row3, text="Comment (optional)", width=24).pack(side="left")
@@ -1057,6 +1076,11 @@ class Dashboard:
         value = var.get()
         return None if value == _FEEDBACK_SCORE_VALUES[0] else int(value)
 
+    @staticmethod
+    def _feedback_hire_outcome_from_var(var) -> Optional[str]:
+        value = var.get()
+        return None if value == _HIRE_OUTCOME_VALUES[0] else value
+
     def _on_submit_feedback(self) -> None:
         record = self._selected_record()
         if record is None:
@@ -1068,6 +1092,7 @@ class Dashboard:
             transcript_score=self._feedback_score_from_var(self._fb_transcript_var),
             analysis_score=self._feedback_score_from_var(self._fb_analysis_var),
             comment=comment,
+            hire_outcome=self._feedback_hire_outcome_from_var(self._fb_hire_outcome_var),
         )
         self._fb_status_label.config(text="Saved -- thanks, this improves future confidence scoring.")
 
@@ -1075,7 +1100,13 @@ class Dashboard:
         """Resets both scores to "Not rated" and the comment to empty, and
         saves that immediately -- the requested "clear the rating and save"
         action. Distinct from Delete feedback below, which removes the row
-        entirely rather than leaving an explicitly-unrated one."""
+        entirely rather than leaving an explicitly-unrated one.
+
+        Deliberately does NOT clear the hire outcome -- that's a real-world
+        fact about what happened, not a quality rating like the scores this
+        button resets, so a user clearing their (possibly wrong) 1-10
+        ratings shouldn't also lose the actual hired/not-hired result
+        they'd already recorded."""
         record = self._selected_record()
         if record is None:
             return
@@ -1085,6 +1116,7 @@ class Dashboard:
         self.watcher.db.save_feedback(
             record.id, user_id=self.watcher.user_id,
             transcript_score=None, analysis_score=None, comment="",
+            hire_outcome=self._feedback_hire_outcome_from_var(self._fb_hire_outcome_var),
         )
         self._fb_status_label.config(text="Ratings cleared.")
 
@@ -1097,6 +1129,7 @@ class Dashboard:
         self.watcher.db.delete_feedback(record.id)
         self._fb_transcript_var.set(_FEEDBACK_SCORE_VALUES[0])
         self._fb_analysis_var.set(_FEEDBACK_SCORE_VALUES[0])
+        self._fb_hire_outcome_var.set(_HIRE_OUTCOME_VALUES[0])
         self._fb_comment_entry.delete(0, "end")
         self._fb_status_label.config(text="Feedback deleted.")
 
@@ -1117,6 +1150,9 @@ class Dashboard:
 
         self._fb_transcript_var.set(_to_display(existing.transcript_score if existing else None))
         self._fb_analysis_var.set(_to_display(existing.analysis_score if existing else None))
+        self._fb_hire_outcome_var.set(
+            existing.hire_outcome if existing and existing.hire_outcome else _HIRE_OUTCOME_VALUES[0]
+        )
         self._fb_comment_entry.delete(0, "end")
         if existing and existing.comment:
             self._fb_comment_entry.insert(0, existing.comment)
