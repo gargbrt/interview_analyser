@@ -9,6 +9,7 @@ separation, stop/cleanup) is real code under test.
 """
 from __future__ import annotations
 
+import threading
 import time
 import wave
 from contextlib import contextmanager
@@ -290,6 +291,59 @@ class TestStopReleaseStreamsSplit:
     def test_release_streams_is_a_noop_without_a_prior_start(self):
         with _fake_recorder() as rec:
             rec.release_streams()  # must not raise even if start() was never called
+
+    def test_release_streams_waits_for_a_still_running_record_thread(self, tmp_path):
+        """Regression coverage for the crash recurring a third time at the
+        identical fault offset even after switching to pa.terminate():
+        the real bug is a race with _record_loop's own thread, not which
+        teardown call is used. If stop()'s own join(timeout=5) times out
+        because the thread's blocking read() is still in flight, that
+        thread must not still be alive when pa.terminate() runs -- so
+        release_streams() joins it again (for up to
+        _RELEASE_STREAMS_JOIN_TIMEOUT_SECONDS) before touching native
+        state."""
+        release_event = threading.Event()
+
+        def _slow_then_exit():
+            release_event.wait(timeout=2)
+
+        with _fake_recorder() as rec:
+            rec.start(tmp_path / "call.wav")
+            pa = rec._pa
+            # simulate stop()'s join(timeout=5) having already timed out
+            # while the record thread was still mid-read
+            rec._thread = threading.Thread(target=_slow_then_exit, daemon=True)
+            rec._thread.start()
+
+            with patch("interview_analyzer.recorder._RELEASE_STREAMS_JOIN_TIMEOUT_SECONDS", 5):
+                release_event.set()  # let it exit well within the patched timeout
+                rec.release_streams()
+
+        assert pa.terminate_calls == 1
+
+    def test_release_streams_skips_terminate_if_the_record_thread_never_exits(self, tmp_path):
+        """The other half of the same regression: if the record thread is
+        STILL alive even after waiting, pa.terminate() must be skipped
+        entirely rather than racing it -- a leaked PyAudio handle until
+        process exit is far safer than a native access violation."""
+        release_event = threading.Event()
+
+        def _blocks_until_released():
+            release_event.wait()
+
+        with _fake_recorder() as rec:
+            rec.start(tmp_path / "call.wav")
+            pa = rec._pa
+            rec._thread = threading.Thread(target=_blocks_until_released, daemon=True)
+            rec._thread.start()
+
+            with patch("interview_analyzer.recorder._RELEASE_STREAMS_JOIN_TIMEOUT_SECONDS", 0.05):
+                rec.release_streams()
+
+            assert pa.terminate_calls == 0
+
+            release_event.set()  # let the thread exit so it doesn't leak past the test
+            rec._thread.join(timeout=2)
 
 
 def test_elapsed_seconds_tracks_written_frames_not_paused_time(tmp_path):

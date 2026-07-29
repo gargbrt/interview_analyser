@@ -51,6 +51,13 @@ from .tray import job_text
 
 logger = logging.getLogger(__name__)
 
+# Indeterminate-progress-bar step interval, in ms, for the Status/History
+# tabs' "something is happening" activity animations. Was 80ms; bumped up
+# since these are purely decorative and can run continuously for the
+# entire length of a recording or a background processing job -- see the
+# matching constant/comment in control_panel.py for the full reasoning.
+_ACTIVITY_STEP_MS = 150
+
 _WHISPER_MODELS = ["tiny", "base", "small", "medium", "large-v3"]
 _TRANSCRIPTION_ENGINES = ["faster-whisper", "groq"]
 _ANALYSIS_ENGINES = ["ollama", "groq_api", "anthropic_api", "openai_api"]
@@ -838,7 +845,7 @@ class Dashboard:
         else:
             bar.config(mode="indeterminate")
             if should_run and not is_running:
-                bar.start(80)
+                bar.start(_ACTIVITY_STEP_MS)
                 setattr(self, running_attr, True)
             elif not should_run and is_running:
                 bar.stop()

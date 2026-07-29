@@ -39,6 +39,13 @@ import numpy as np
 
 logger = logging.getLogger(__name__)
 
+# How long release_streams() waits for a still-running _record_loop thread
+# to actually exit before touching any native PortAudio state -- see
+# release_streams()'s docstring for why this matters. A module constant
+# (rather than inlined) so tests can shrink it to keep a "thread never
+# exits" test fast.
+_RELEASE_STREAMS_JOIN_TIMEOUT_SECONDS = 10
+
 # pyaudiowpatch is Windows-only; imported lazily so the module can still be
 # imported (e.g. for tests) on non-Windows platforms.
 try:
@@ -406,20 +413,41 @@ class _WindowsAudioRecorder:
         regardless of what happens here).
 
         Uses self._pa.terminate() rather than closing each stream
-        individually via stop_stream()/close() -- that per-stream sequence
-        was reproduced STILL crashing the process natively even after
-        being deferred here (i.e. the reordering above reduced the blast
-        radius but didn't eliminate the crash itself). PortAudio's own
-        docs say Pa_Terminate() implicitly closes any streams still open,
-        which is a single, far more heavily-used cleanup path than
-        separately closing a loopback stream and a microphone stream in
-        sequence -- a plausible source of whatever WASAPI-side state race
-        the individual close() calls were hitting. Safe to call once per
-        recording: a fresh PyAudio() instance is created for every new
-        recording (see SystemAudioRecorder in watcher.py's
-        _start_recording), so terminating it here never affects a
-        different, still-active recording."""
+        individually via stop_stream()/close() -- PortAudio's own docs say
+        Pa_Terminate() implicitly closes any streams still open, a single
+        far more heavily-used cleanup path than closing a loopback stream
+        and a microphone stream separately. That alone was NOT sufficient
+        though: the identical crash (same fault offset in ntdll.dll) was
+        reproduced again afterwards, meaning the bug isn't which teardown
+        call is used but a race with _record_loop's OWN thread. stop()
+        joins that thread with only a 5-second timeout so it can return
+        quickly for its caller -- if the thread's blocking stream.read()
+        call is still in flight when that timeout elapses (a slow/hung
+        device tick), the thread stays alive, still calling into the
+        native stream, right as this method calls pa.terminate() on it
+        from a different thread. That's a genuine native-side race
+        regardless of which cleanup path is used, and matches the crash
+        recurring at the exact same address either way. There's no such
+        time pressure here (this runs after the interview is already
+        committed as ended and handed to the background thread), so this
+        waits considerably longer for the thread to actually finish before
+        touching any native state, and skips the teardown entirely (rather
+        than risk it) if the thread still hasn't exited even after that.
+
+        Safe to call once per recording: a fresh PyAudio() instance is
+        created for every new recording (see SystemAudioRecorder in
+        watcher.py's _start_recording), so terminating it here never
+        affects a different, still-active recording."""
         if self._terminated:
+            return
+        if self._thread is not None and self._thread.is_alive():
+            self._thread.join(timeout=_RELEASE_STREAMS_JOIN_TIMEOUT_SECONDS)
+        if self._thread is not None and self._thread.is_alive():
+            logger.warning(
+                "Recording thread for %s is still active; skipping PortAudio "
+                "teardown to avoid a native crash. The audio backend will be "
+                "released when the process exits instead.", self._out_path,
+            )
             return
         self._terminated = True
         try:
