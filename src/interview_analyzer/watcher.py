@@ -948,7 +948,16 @@ class MeetingWatcher:
         assessment profile (see profiles.py) before reprocessing -- lets the
         user redo an analysis under different role/seniority/industry/
         competency settings. Omit it to reprocess against whatever profile
-        (or lack of one) is already attached to this interview."""
+        (or lack of one) is already attached to this interview.
+
+        Audio is only actually REQUIRED here if there's no usable transcript
+        saved yet -- a profile change only affects the analysis step, never
+        transcription (see rubric.py/analyzer.py), and _run_analysis_pipeline
+        already reuses an existing transcript as-is rather than
+        re-transcribing it. Since transcripts (unlike audio) are kept
+        permanently regardless of retention_days, this lets "reprocess with
+        a different profile" keep working on an interview whose audio has
+        long since been auto-deleted."""
         if self._current_interview_id == interview_id:
             raise RuntimeError("This interview is still being recorded.")
         with self._processing_lock:
@@ -957,24 +966,32 @@ class MeetingWatcher:
             raise RuntimeError("This interview is already being processed.")
 
         record = self.db.get(interview_id)
-        if record is None or not record.audio_path:
-            raise ValueError("No audio was recorded for this interview -- nothing to reprocess.")
-        audio_path = pathlib.Path(record.audio_path)
-        if not audio_path.exists():
-            raise ValueError(f"Audio file is missing: {audio_path}")
-        if audio_path.stat().st_size == 0:
-            raise ValueError(
-                "Audio file is empty -- the recording was likely interrupted before "
-                "any audio was saved, so there's nothing to transcribe."
-            )
+        if record is None:
+            raise ValueError("Interview not found.")
+        has_transcript = bool(record.transcript and record.transcript.strip())
+        audio_path = pathlib.Path(record.audio_path) if record.audio_path else None
+        audio_available = audio_path is not None and audio_path.exists() and audio_path.stat().st_size > 0
 
-        if record.ended_at is None:
+        if not has_transcript:
+            if not audio_path:
+                raise ValueError("No audio was recorded for this interview -- nothing to reprocess.")
+            if not audio_path.exists():
+                raise ValueError(f"Audio file is missing: {audio_path}")
+            if audio_path.stat().st_size == 0:
+                raise ValueError(
+                    "Audio file is empty -- the recording was likely interrupted before "
+                    "any audio was saved, so there's nothing to transcribe."
+                )
+
+        if record.ended_at is None and audio_available:
             # The original recording never cleanly finished (e.g. a crash
             # before _stop_and_process's end_interview() call ran), so the
             # History/Trends tabs' duration column shows blank ("--", see
             # dashboard.py's format_duration) and would stay that way
             # forever -- reprocessing alone never sets ended_at. Back-fill
             # a real one from the audio file's own actual duration instead.
+            # Only possible with real audio on disk to measure -- if it's
+            # already gone, ended_at just stays whatever it already was.
             try:
                 duration_seconds = get_audio_duration_seconds(audio_path)
                 started = dt.datetime.fromisoformat(record.started_at)

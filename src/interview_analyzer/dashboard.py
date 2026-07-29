@@ -159,6 +159,30 @@ def has_audio(record) -> bool:
     return path.exists() and path.stat().st_size > 0
 
 
+def has_transcript(record) -> bool:
+    """True if this interview has a real, non-empty saved transcript --
+    unlike audio, transcripts are kept permanently (see retention_days'
+    own docs), so this can stay true long after has_audio() goes false."""
+    return bool(record.transcript and record.transcript.strip())
+
+
+def can_reprocess_with_profile(record) -> bool:
+    """True if this interview's assessment can be redone under a
+    different profile -- from its raw audio, or (once audio has been
+    purged by the retention policy) from its permanently-kept transcript
+    alone. A profile only changes the ANALYSIS step, never transcription
+    (see rubric.py/analyzer.py), so re-transcribing from audio was never
+    actually required here -- reprocess_interview() already reuses an
+    existing transcript as-is rather than re-transcribing it (see
+    _run_analysis_pipeline's docstring). Regression coverage for a real
+    bug: this used to require has_audio() alone, which permanently and
+    needlessly disabled this button for every interview old enough that
+    its audio had already been auto-deleted, even though its transcript
+    (and therefore a fresh, differently-profiled analysis) was still
+    fully available."""
+    return has_audio(record) or has_transcript(record)
+
+
 def can_reprocess(record) -> bool:
     """True if this interview has recoverable audio and no *usable*
     finished report yet -- i.e. the History tab's Reprocess button should
@@ -1243,10 +1267,10 @@ class Dashboard:
         # report and hides itself once one exists -- see can_reprocess),
         # redoing the analysis under different profile settings is a
         # deliberate choice the user can make on an already-successful
-        # interview too -- gated only on real audio still being on disk,
-        # not on whether a report already exists.
-        can_reprocess_with_profile = any(has_audio(r) and not _is_busy(r) for r in records)
-        self._reprocess_with_profile_btn.config(state="normal" if can_reprocess_with_profile else "disabled")
+        # interview too -- gated on audio OR a saved transcript, not on
+        # whether a report already exists (see can_reprocess_with_profile).
+        can_do_reprocess_with_profile = any(can_reprocess_with_profile(r) and not _is_busy(r) for r in records)
+        self._reprocess_with_profile_btn.config(state="normal" if can_do_reprocess_with_profile else "disabled")
 
         # Single-target-only buttons -- viewing/playing a specific thing
         # doesn't generalize to a multi-selection, so these stay disabled
@@ -1424,7 +1448,10 @@ class Dashboard:
         one or many interviews under different role/seniority/industry/
         competency settings without affecting the original recordings."""
         processing_jobs = self.watcher.status.get("processing_jobs") or {}
-        candidates = [r for r in self._selected_records() if has_audio(r) and r.id not in processing_jobs]
+        candidates = [
+            r for r in self._selected_records()
+            if can_reprocess_with_profile(r) and r.id not in processing_jobs
+        ]
         if not candidates:
             return
         interview_ids = [r.id for r in candidates]

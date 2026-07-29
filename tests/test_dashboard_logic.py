@@ -906,6 +906,34 @@ class TestReprocessWithDifferentProfile:
 
         dashboard._reprocess_with_profile_btn.config.assert_called_with(state="disabled")
 
+    def test_button_stays_enabled_once_audio_is_purged_if_a_transcript_was_saved(self, tmp_path):
+        """Regression coverage for a real bug: retention_days auto-deletes
+        raw audio (see has_audio's docstring), but the transcript is kept
+        permanently -- and a profile change only affects the ANALYSIS step,
+        never transcription. This button used to require has_audio() alone,
+        which permanently disabled it for every interview old enough that
+        its audio had already been purged, even with a perfectly reusable
+        transcript still on hand."""
+        dashboard, iid = self._dashboard_with_selected_interview(tmp_path)
+        dashboard.watcher.db.save_transcript(iid, "[Interviewer] Hi\n[You] Hello")
+        dashboard.watcher.db.update_audio_path(iid, str(tmp_path / "does_not_exist.wav"))
+
+        dashboard._update_action_buttons()
+
+        dashboard._reprocess_with_profile_btn.config.assert_called_with(state="normal")
+
+    def test_candidates_include_audio_purged_interviews_with_a_saved_transcript(self, tmp_path):
+        dashboard, iid = self._dashboard_with_selected_interview(tmp_path)
+        dashboard.watcher.db.save_transcript(iid, "[Interviewer] Hi\n[You] Hello")
+        dashboard.watcher.db.update_audio_path(iid, str(tmp_path / "does_not_exist.wav"))
+        chosen = AssessmentProfile(competencies=["Execution"])
+
+        with patch("interview_analyzer.dashboard.threading.Thread", _ImmediateThread), \
+             patch("interview_analyzer.dashboard.confirm_profile", return_value=chosen):
+            dashboard._on_reprocess_with_profile()
+
+        dashboard.watcher.reprocess_interview.assert_called_once_with(iid, profile=chosen)
+
 
 class TestPreviousAssessmentsSection:
     """The History tab's collapsible "Previous assessments" list, backed by

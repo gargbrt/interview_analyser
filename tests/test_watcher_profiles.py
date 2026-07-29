@@ -246,6 +246,36 @@ class TestReprocessWithDifferentProfile:
 
         assert watcher.db.get(iid).profile == original_profile
 
+    def test_reprocesses_from_a_saved_transcript_even_after_audio_was_purged(self, tmp_path):
+        """Regression coverage for a real bug: retention_days auto-deletes
+        raw audio, but the transcript is kept permanently -- and a profile
+        change only affects the ANALYSIS step, never transcription. This
+        used to hard-require a real audio file on disk, permanently
+        blocking "reprocess with a different profile" on every interview
+        old enough that its audio had already been purged."""
+        watcher = MeetingWatcher(_test_config(tmp_path), user_id=1)
+        iid = _seed_interview(watcher, tmp_path)
+        watcher.db.save_transcript(iid, "[Interviewer] Hi\n[You] Hello")
+        watcher.db.update_audio_path(iid, str(tmp_path / "audio" / "long_since_deleted.wav"))
+
+        with patch("interview_analyzer.watcher.transcribe") as mock_transcribe, \
+             patch("interview_analyzer.watcher.analyze_transcript", return_value=FAKE_ANALYSIS_WITH_COMPETENCIES):
+            watcher.reprocess_interview(iid, profile=AssessmentProfile(role="Product"))
+
+        mock_transcribe.assert_not_called()
+        assert watcher.db.get(iid).analysis["session_summary"]["hire_recommendation"]["level"] == "Hire"
+
+    def test_raises_when_both_audio_and_transcript_are_missing(self, tmp_path):
+        watcher = MeetingWatcher(_test_config(tmp_path), user_id=1)
+        iid = _seed_interview(watcher, tmp_path)
+        watcher.db.update_audio_path(iid, str(tmp_path / "audio" / "long_since_deleted.wav"))
+
+        try:
+            watcher.reprocess_interview(iid)
+            assert False, "expected a ValueError"
+        except ValueError as e:
+            assert "Audio file is missing" in str(e)
+
 
 class TestAnalysisHistoryRecorded:
     """Every completed analysis (first run and every reprocess) is
