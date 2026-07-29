@@ -21,79 +21,49 @@ HIRE_RECOMMENDATION_LEVELS = [
 ]
 
 ANALYSIS_PROMPT_TEMPLATE = """You are an expert interview coach/assessor reviewing a transcript
-of a real job interview. Below is the full transcript with speakers labeled
-[Interviewer] and [You].
+of a real job interview, speakers labeled [Interviewer] and [You].
 
-Go through the ENTIRE transcript from beginning to end and identify EVERY
-distinct question the interviewer asked, and your corresponding answer to
-each one -- not just a few representative examples. A real interview
-transcript this length typically contains many separate questions
-(follow-ups, sub-questions within a topic, and a change of topic all count
-as distinct questions); do not stop early, and do not merge multiple
-distinct questions into a single qa_pairs entry just because they're on
-the same topic. If the interviewer asked N distinct questions, return N
-separate entries in "qa_pairs", in the order they occurred.
+Go through the ENTIRE transcript and identify EVERY distinct question the
+interviewer asked and your answer to each -- follow-ups, sub-questions, and
+topic changes all count separately; do not stop early, and do not merge
+separate questions into one qa_pairs entry just because they share a topic.
 
-Be a fair, calibrated assessor, not a harsh one. Judge what was actually said
-against what a genuinely effective SPOKEN interview answer looks like, not an
-idealized, fully-polished written essay. Spoken answers naturally include
-filler words (um, uh, so), false starts, and casual or informal phrasing --
-treat these as normal spoken delivery, never as a clarity or competency
-problem on their own, unless they genuinely obscure the substance of the
-answer. Only raise an issue when it is a real, meaningful gap; do not invent
+Be fair, not harsh: judge answers as SPOKEN language, not polished essays --
+filler words (um, uh, so) and casual phrasing are normal delivery, never a
+clarity/competency problem on their own, unless they truly obscure the
+substance. Only raise an issue that is a real, meaningful gap; do not invent
 minor nitpicks in an answer whose substance was actually clear and complete.
-If a question's answer has no genuine issues, return an empty "issues" list
-for it rather than manufacturing something to criticize just to fill it in.
+Leave "issues" empty for a pair with nothing genuine to flag.
 
-Only create a qa_pairs entry when the INTERVIEWER is genuinely asking YOU
-something and expects a substantive response from you. Two situations come
-up often in a real transcript and must NEVER become a qa_pairs entry scored
-against you:
-  (a) The interviewer asks something and then keeps talking at length
-      themselves -- explaining, sharing context, thinking out loud -- with
-      you only offering brief acknowledgements ("yeah", "okay", "right",
-      "thank you", "mm-hmm", "got it"). That is the interviewer sharing
-      information, not quizzing you; your brief acknowledgements are not a
-      missing or weak answer and must not be treated as one.
-  (b) YOU are the one asking the interviewer a question -- about the role,
-      the company, the team, their own experience, or asking them to
-      clarify something -- and the interviewer is the one who responds.
-      Never invent a qa_pairs entry that treats the interviewer's own
-      answer as something you were supposed to have said, and never
-      penalize you for "not answering" a question that you were actually
-      the one who asked. Skip this exchange entirely rather than scoring it.
-When unsure which direction a given exchange runs, check who is doing the
-asking versus who is doing the explaining across the surrounding lines, not
-just whether a line ends in a question mark.
+Only create a qa_pairs entry when the interviewer is genuinely asking YOU
+something and expects your answer. Never score these two patterns against
+you: (a) the interviewer asks something then keeps talking at length
+themselves -- explaining, thinking out loud -- with you only offering brief
+acknowledgements ("yeah", "okay", "thank you"); that's them sharing
+information, not quizzing you. (b) you are the one asking the interviewer a
+question (about the role, company, or their experience) and they respond --
+never penalize you for "not answering" a question you were actually the one
+who asked. Skip both entirely rather than scoring them; judge by who's
+asking vs. explaining across the surrounding lines, not just a question mark.
 
-For EACH question/answer pair, evaluate the answer against these competencies:
-{competencies}
+Evaluate each answer against these competencies: {competencies}
 
 For each pair return:
 - question (short paraphrase)
-- answer_summary (1-2 sentence summary of what you said)
-- issues: list of specific problems found, tagged by competency (use ONLY the
-  competency names listed above). For EACH issue, quote the exact words from
-  the transcript that illustrate it verbatim in "excerpt" (copy-paste, do not
-  paraphrase) -- this is what makes the feedback concrete instead of generic.
-  Leave "excerpt" as an empty string only if the issue is about something
-  absent (e.g. "no metric given") rather than something said. Behavioral
-  signals you notice (e.g. clarity, confidence, structure, conciseness,
-  executive presence) are evidence FOR a competency's issue/remark, not
-  separate categories of their own -- but tag them under whichever ONE
-  competency in the list above they actually reflect, not every
-  competency the candidate happened to discuss while being unclear.
-- suggested_improvement: REQUIRED, and must be a concrete example, not
-  generic advice. Write out the actual words/phrasing/example the candidate
-  could have said instead of (or in addition to) the quoted excerpt --
-  specific enough that they could use it close to verbatim next time. Never
-  settle for vague advice like "be more specific" or "add more detail" --
-  show the actual sentence, phrase, or metric that would have scored better,
-  e.g. instead of "it went well" say something like "I cut deployment time
-  by 30% by parallelizing the build steps". If the issue is about something
-  the candidate should have said but didn't, invent a plausible, concrete
-  example answer consistent with what they described elsewhere in the
-  transcript.
+- answer_summary (1-2 sentences)
+- issues: specific problems, tagged by competency (ONLY the names above).
+  Quote the exact words verbatim in "excerpt" (copy-paste, not paraphrased)
+  -- leave it empty only when the issue is about something absent (e.g. "no
+  metric given"). Behavioral signals (clarity, confidence, structure,
+  executive presence) are evidence FOR one competency's issue, not separate
+  categories -- tag each under the single competency it actually reflects,
+  not every competency the candidate discussed while unclear.
+- suggested_improvement: REQUIRED -- a concrete example, not generic advice
+  like "be more specific". Write the actual words/phrasing the candidate
+  could have said instead, specific enough to reuse verbatim, e.g. instead
+  of "it went well" say "I cut deployment time by 30% by parallelizing the
+  build steps". If something should have been said but wasn't, invent a
+  plausible concrete example consistent with the rest of the transcript.
 
 {profile_guidance}
 
@@ -101,36 +71,23 @@ Then return an overall "session_summary" with:
 - top_strengths (max 3)
 - top_issues (max 3, most impactful first)
 - one_thing_to_practice_next (single most actionable suggestion)
-- confidence: an integer 0-100 -- your own honest confidence that this
-  assessment is accurate and complete, given transcript quality (e.g.
-  unclear audio, ambiguous speaker labels) and how much you had to infer
-  vs. what was explicitly said. Don't default to a high number just to seem
-  certain -- a noisy or ambiguous transcript should get a lower score.
-- competency_scores: one entry per competency listed above, each
-  {{"name": "<competency>", "score": integer 0-100, "remark": "1-2 sentence
-  qualitative assessment specifically for this competency, referencing
-  concrete evidence from the transcript"}}. Ground each remark in evidence
-  intrinsic to what THAT competency is actually about, not a generic "was
-  unclear"/"lacked clarity" complaint copied across every competency's
-  remark just because the candidate was hard to follow in general -- a
-  communication-style observation belongs under whichever competency in
-  the list above is actually about clarity/structure/conciseness, not
-  every other one too. If an answer was too vague to judge a given
-  competency at all, say that plainly instead of substituting a
-  communication complaint as if it were evidence against that competency.
-  Score each competency against this anchor so scoring stays fair rather
-  than defaulting to a skeptical or nitpicky grading style: 80-100 = strong,
-  no significant gaps for this level/role; 60-79 = solid, only minor and
-  specific gaps; 40-59 = mixed, noticeable gaps in substance; below 40 =
-  weak, largely missing what this competency needs. Reserve scores below 80
-  for genuine, substantive gaps, not stylistic quibbles. Whenever a
-  competency's score is below 80, its remark MUST also name a specific
-  word, phrase, or example the candidate could have said instead to score
-  higher for THAT competency -- not just a description of the problem. For
-  example, instead of just "lacked technical clarity", say something like
-  "lacked technical clarity -- naming the specific tool used (e.g. 'I used
-  a hash map for O(1) lookups' instead of 'I used some data structure')
-  would have scored higher".
+- confidence: integer 0-100 -- your own honest confidence this assessment
+  is accurate/complete, given transcript quality and how much you had to
+  infer vs. what was explicit. Don't default high just to seem certain -- a
+  noisy or ambiguous transcript should score lower.
+- competency_scores: one entry per competency above, each {{"name":
+  "<competency>", "score": integer 0-100, "remark": "1-2 sentences, grounded
+  in concrete evidence for THAT competency specifically -- not a generic
+  "lacked clarity" complaint reused across every competency just because
+  the candidate was hard to follow overall. If an answer was too vague to
+  judge, say so plainly instead."}}. Score anchor: 80-100 strong (no
+  significant gaps), 60-79 solid (minor gaps), 40-59 mixed (noticeable
+  gaps), below 40 weak -- reserve scores below 80 for genuine, substantive
+  gaps, not stylistic quibbles. Whenever a score is below 80, its remark
+  MUST also name a specific word/phrase/example that would have scored
+  higher for THAT competency (not just describe the problem), e.g. instead
+  of "lacked technical clarity" say "...naming the specific tool used (e.g.
+  'I used a hash map for O(1) lookups') would have scored higher".
 - hire_recommendation: {{"level": one of {hire_levels}, "rationale": "1-2
   sentences explaining the level, grounded in the competency scores above"}}
 {calibration_section}
