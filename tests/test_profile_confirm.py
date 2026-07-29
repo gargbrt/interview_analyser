@@ -15,8 +15,27 @@ from __future__ import annotations
 import queue
 from unittest.mock import MagicMock, patch
 
+import pytest
+
 from interview_analyzer.profile_confirm import _DEFAULT_INTRO, _build_popup, _profile_from_selections, confirm_profile
 from interview_analyzer.profiles import CORE_COMPETENCIES, GENERIC_PROFILE, AssessmentProfile
+
+
+@pytest.fixture(scope="module")
+def _shared_tk_root():
+    """One real tk.Tk() root for the whole module, reused via Toplevel()
+    for each test that needs a real window -- see TestBuildPopupIntroText's
+    own docstring for why a second Tk() root in the same process isn't
+    safe to create."""
+    import tkinter as tk
+
+    try:
+        root = tk.Tk()
+    except tk.TclError as e:
+        pytest.skip(f"No usable Tk display in this environment: {e}")
+    root.withdraw()
+    yield root
+    root.destroy()
 
 
 class TestProfileFromSelections:
@@ -97,31 +116,38 @@ class TestBuildPopupIntroText:
     which is exactly what dashboard.py's "Reprocess with different
     profile" flow relies on to make clear the prefilled values reflect the
     interview's *current* analysis (see profile_confirm.confirm_profile's
-    intro_text param)."""
+    intro_text param).
+
+    Shares ONE tk.Tk() root across both tests (module-scoped fixture,
+    below) rather than each test creating its own -- Tcl/Tk doesn't
+    reliably support multiple Tk() root interpreters in a single process
+    (see consent.py's own docstring on this same constraint), and creating
+    a second one was reproduced actually crashing the interpreter on macOS
+    CI (a real incident, not a hypothetical -- see conftest.py's
+    _never_show_a_real_tk_popup_from_a_background_thread for the related
+    background-thread version of this same class of bug). Each test gets
+    its own Toplevel(shared_root) instead, matching the pattern
+    consent.py/profile_confirm.py already use for a shared ui_root."""
 
     def _first_label_text(self, popup) -> str:
         return popup.winfo_children()[0].cget("text")
 
-    def test_uses_the_default_intro_when_none_given(self):
+    def test_uses_the_default_intro_when_none_given(self, _shared_tk_root):
         import tkinter as tk
 
-        root = tk.Tk()
-        root.withdraw()
+        popup = tk.Toplevel(_shared_tk_root)
         try:
-            popup = tk.Toplevel(root)
             _build_popup(popup, GENERIC_PROFILE, queue.Queue())
             assert self._first_label_text(popup) == _DEFAULT_INTRO
         finally:
-            root.destroy()
+            popup.destroy()
 
-    def test_uses_a_custom_intro_when_given(self):
+    def test_uses_a_custom_intro_when_given(self, _shared_tk_root):
         import tkinter as tk
 
-        root = tk.Tk()
-        root.withdraw()
+        popup = tk.Toplevel(_shared_tk_root)
         try:
-            popup = tk.Toplevel(root)
             _build_popup(popup, GENERIC_PROFILE, queue.Queue(), intro_text="Custom reprocess explanation")
             assert self._first_label_text(popup) == "Custom reprocess explanation"
         finally:
-            root.destroy()
+            popup.destroy()
