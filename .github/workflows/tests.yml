@@ -12,6 +12,13 @@ jobs:
     # Windows-only/macOS-only sections and docs/macos_setup.md. fail-fast
     # is off so a failure on one OS doesn't hide results from the other.
     runs-on: ${{ matrix.os }}
+    # A hard backstop against a repeat of a real incident: macOS runs
+    # silently hung for the full default 6-hour job limit (no single test
+    # should ever legitimately take anywhere near that long), burning CI
+    # minutes for hours with no useful log output. 20 minutes is generous
+    # for install + the whole suite (a healthy run finishes in ~1-4
+    # minutes) while still failing fast enough to actually investigate.
+    timeout-minutes: 20
     strategy:
       fail-fast: false
       matrix:
@@ -32,7 +39,12 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt
           pip install -e .
-          pip install pytest
+          pip install pytest pytest-timeout
 
       - name: Run tests
-        run: pytest tests/ -q
+        # --timeout kills and reports any INDIVIDUAL test that runs past
+        # 60s (thread-dumping where it was stuck first) rather than letting
+        # one hung test silently consume the whole job's time budget --
+        # the second layer of the same backstop as timeout-minutes above,
+        # scoped to pinpoint which test rather than just which job.
+        run: pytest tests/ -q --timeout=60 --timeout-method=thread
