@@ -103,6 +103,63 @@ class TestConfirmAndSaveProfile:
 
         assert watcher.db.get(iid).profile is None
 
+    def test_the_confirmed_profile_becomes_the_new_active_default(self, tmp_path):
+        """The whole point: the NEXT recording's confirm dialog is
+        prefilled from _get_active_profile(), so confirming a profile for
+        THIS interview must update that default too, not just this one
+        interview's own snapshot."""
+        watcher = MeetingWatcher(_test_config(tmp_path), user_id=1)
+        iid = _seed_interview(watcher, tmp_path)
+        chosen = AssessmentProfile(competencies=["Execution"], role="Product", seniority="Senior/Lead")
+
+        with patch("interview_analyzer.watcher.confirm_profile", return_value=chosen):
+            watcher._confirm_and_save_profile(iid)
+
+        active = watcher._get_active_profile()
+        assert active.role == "Product"
+        assert active.seniority == "Senior/Lead"
+        assert set(active.competencies) == {"Execution"}
+
+    def test_confirming_again_updates_the_default_rather_than_duplicating_it(self, tmp_path):
+        watcher = MeetingWatcher(_test_config(tmp_path), user_id=1)
+        first_iid = _seed_interview(watcher, tmp_path, name="a.wav")
+        second_iid = _seed_interview(watcher, tmp_path, name="b.wav")
+        first_choice = AssessmentProfile(role="Sales")
+        second_choice = AssessmentProfile(role="Data", seniority="Entry Level")
+
+        with patch("interview_analyzer.watcher.confirm_profile", return_value=first_choice):
+            watcher._confirm_and_save_profile(first_iid)
+        with patch("interview_analyzer.watcher.confirm_profile", return_value=second_choice):
+            watcher._confirm_and_save_profile(second_iid)
+
+        # only ever one reserved "remembered default" template, not one
+        # per confirmation -- confirming again just updates it in place
+        templates = watcher.db.list_profile_templates(user_id=1)
+        assert len(templates) == 1
+        assert watcher._get_active_profile().role == "Data"
+        assert watcher._get_active_profile().seniority == "Entry Level"
+
+    def test_failure_to_remember_the_default_does_not_affect_the_interviews_own_snapshot(self, tmp_path):
+        watcher = MeetingWatcher(_test_config(tmp_path), user_id=1)
+        iid = _seed_interview(watcher, tmp_path)
+        chosen = AssessmentProfile(role="Consultant")
+
+        with patch("interview_analyzer.watcher.confirm_profile", return_value=chosen), \
+             patch.object(watcher.db, "create_profile_template", side_effect=RuntimeError("db locked")):
+            watcher._confirm_and_save_profile(iid)  # must not raise
+
+        # the interview's OWN snapshot still succeeded, even though
+        # remembering it as the future default failed
+        assert watcher.db.get(iid).profile == chosen
+
+    def test_no_prior_confirmation_still_defaults_to_generic(self, tmp_path):
+        """Explicit regression guard for the "default values should be
+        kept as generic for all fields" requirement -- a fresh install (or
+        a user who has never confirmed a profile) must still see the
+        generic fallback, not some other hardcoded default."""
+        watcher = MeetingWatcher(_test_config(tmp_path), user_id=1)
+        assert watcher._get_active_profile() == GENERIC_PROFILE
+
 
 class TestStartRecordingConfirmsProfileInBackground:
     def test_start_recording_spins_off_profile_confirmation_without_blocking(self, tmp_path):

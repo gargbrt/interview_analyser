@@ -47,6 +47,14 @@ from .transcriber import TranscriptionCancelled, get_audio_duration_seconds, tra
 
 logger = logging.getLogger(__name__)
 
+# Reserved, auto-managed profile template name -- see _confirm_and_save_profile,
+# which upserts whatever profile the user just confirmed under this name and
+# marks it active, so the NEXT recording's confirm dialog is prefilled from
+# it instead of resetting to whatever was last set (or generic) every time.
+# Shows up in the Settings tab's template picker like any other saved
+# template (nothing hides it there), since there's no reason to.
+_LAST_CONFIRMED_PROFILE_TEMPLATE_NAME = "Last confirmed"
+
 try:
     import win32con  # type: ignore
     import win32gui  # type: ignore
@@ -625,6 +633,28 @@ class MeetingWatcher:
             logger.warning(
                 "Couldn't confirm/save an assessment profile for interview #%s; it will "
                 "fall back to the generic profile.", interview_id, exc_info=True,
+            )
+            return
+        self._remember_as_default_profile(confirmed)
+
+    def _remember_as_default_profile(self, profile: AssessmentProfile) -> None:
+        """Makes `profile` the new active default (see _get_active_profile),
+        so the NEXT recording's confirm dialog is prefilled from whatever
+        was just confirmed for THIS one, rather than resetting to whatever
+        was active before (or generic) every single time. Upserts a single
+        reserved template (_LAST_CONFIRMED_PROFILE_TEMPLATE_NAME) rather
+        than creating a new one per interview, and marks it active --
+        separate try/except from the interview's own snapshot save above,
+        so a failure here (this is a nice-to-have) doesn't get blamed on
+        losing that snapshot, which already succeeded by this point."""
+        try:
+            template_id = self.db.create_profile_template(
+                self.user_id, _LAST_CONFIRMED_PROFILE_TEMPLATE_NAME, profile,
+            )
+            self.db.set_active_profile_template(template_id, user_id=self.user_id)
+        except Exception:  # noqa: BLE001
+            logger.warning(
+                "Couldn't remember the confirmed profile as the default for next time.", exc_info=True,
             )
 
     def _stop_and_process(self) -> None:
