@@ -34,6 +34,17 @@ distinct questions into a single qa_pairs entry just because they're on
 the same topic. If the interviewer asked N distinct questions, return N
 separate entries in "qa_pairs", in the order they occurred.
 
+Be a fair, calibrated assessor, not a harsh one. Judge what was actually said
+against what a genuinely effective SPOKEN interview answer looks like, not an
+idealized, fully-polished written essay. Spoken answers naturally include
+filler words (um, uh, so), false starts, and casual or informal phrasing --
+treat these as normal spoken delivery, never as a clarity or competency
+problem on their own, unless they genuinely obscure the substance of the
+answer. Only raise an issue when it is a real, meaningful gap; do not invent
+minor nitpicks in an answer whose substance was actually clear and complete.
+If a question's answer has no genuine issues, return an empty "issues" list
+for it rather than manufacturing something to criticize just to fill it in.
+
 For EACH question/answer pair, evaluate the answer against these competencies:
 {competencies}
 
@@ -51,8 +62,17 @@ For each pair return:
   separate categories of their own -- but tag them under whichever ONE
   competency in the list above they actually reflect, not every
   competency the candidate happened to discuss while being unclear.
-- suggested_improvement: a concise, concrete rewrite or specific advice,
-  ideally showing how the quoted excerpt could be rephrased
+- suggested_improvement: REQUIRED, and must be a concrete example, not
+  generic advice. Write out the actual words/phrasing/example the candidate
+  could have said instead of (or in addition to) the quoted excerpt --
+  specific enough that they could use it close to verbatim next time. Never
+  settle for vague advice like "be more specific" or "add more detail" --
+  show the actual sentence, phrase, or metric that would have scored better,
+  e.g. instead of "it went well" say something like "I cut deployment time
+  by 30% by parallelizing the build steps". If the issue is about something
+  the candidate should have said but didn't, invent a plausible, concrete
+  example answer consistent with what they described elsewhere in the
+  transcript.
 
 {profile_guidance}
 
@@ -77,6 +97,19 @@ Then return an overall "session_summary" with:
   every other one too. If an answer was too vague to judge a given
   competency at all, say that plainly instead of substituting a
   communication complaint as if it were evidence against that competency.
+  Score each competency against this anchor so scoring stays fair rather
+  than defaulting to a skeptical or nitpicky grading style: 80-100 = strong,
+  no significant gaps for this level/role; 60-79 = solid, only minor and
+  specific gaps; 40-59 = mixed, noticeable gaps in substance; below 40 =
+  weak, largely missing what this competency needs. Reserve scores below 80
+  for genuine, substantive gaps, not stylistic quibbles. Whenever a
+  competency's score is below 80, its remark MUST also name a specific
+  word, phrase, or example the candidate could have said instead to score
+  higher for THAT competency -- not just a description of the problem. For
+  example, instead of just "lacked technical clarity", say something like
+  "lacked technical clarity -- naming the specific tool used (e.g. 'I used
+  a hash map for O(1) lookups' instead of 'I used some data structure')
+  would have scored higher".
 - hire_recommendation: {{"level": one of {hire_levels}, "rationale": "1-2
   sentences explaining the level, grounded in the competency scores above"}}
 {calibration_section}

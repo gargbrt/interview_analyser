@@ -73,6 +73,40 @@ def test_prompt_pushes_for_thorough_extraction_of_every_question():
     assert "do not stop early" in prompt.lower()
 
 
+def test_prompt_warns_against_over_strict_nitpicking():
+    """Regression coverage for real user feedback ("clear answers are also
+    marked as lacking clarity", "this seems to be very strict analysis") --
+    the prompt now explicitly tells the model not to invent issues in
+    answers that were actually clear, and that filler words/casual spoken
+    phrasing are not themselves a clarity problem."""
+    prompt = build_prompt("[Interviewer] Hi\n[You] Hello")
+    lower = prompt.lower()
+    assert "not invent" in lower or "do not invent" in lower
+    assert "filler words" in lower
+    assert "empty" in lower and "issues" in lower
+
+
+def test_prompt_requires_concrete_alternative_wording_for_suggested_improvement():
+    """Regression coverage for real user feedback ("analysis should share
+    what words/phrasing should have been used instead to score better") --
+    suggested_improvement must no longer be satisfiable with vague advice."""
+    prompt = build_prompt("[Interviewer] Hi\n[You] Hello")
+    lower = " ".join(prompt.lower().split())
+    assert "required" in lower
+    assert "be more specific" in lower
+    assert "not generic advice" in lower or "never settle for vague advice" in lower
+
+
+def test_prompt_requires_concrete_alternative_wording_for_low_competency_scores():
+    """Same real feedback, extended to the per-competency remark -- a
+    generic complaint like "lacked technical clarity" with no guidance on
+    how to fix it is no longer sufficient once a competency scores below 80."""
+    prompt = build_prompt("[Interviewer] Hi\n[You] Hello")
+    lower = prompt.lower()
+    assert "below 80" in lower
+    assert "must also name a specific" in lower
+
+
 class TestSplitTranscriptForChunkedAnalysis:
     def test_short_transcript_is_a_single_chunk(self):
         transcript = "[Interviewer] Hi\n[You] Hello"
