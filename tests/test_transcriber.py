@@ -18,9 +18,12 @@ from interview_analyzer.transcriber import (
     TranscriptionCancelled,
     _channel_count,
     _filter_mic_bleed,
+    _filter_prompt_echo,
     _groq_transcribe_array_chunked,
     _groq_transcribe_file,
     _looks_like_mic_bleed,
+    _looks_like_prompt_echo,
+    _prompt_echo_words,
     _transcribe_via_groq,
     get_audio_duration_seconds,
     load_whisper_model,
@@ -759,3 +762,73 @@ class TestMicBleedFiltering:
         ]
 
         assert _filter_mic_bleed(labeled) == labeled
+
+
+class TestPromptEchoFiltering:
+    """Regression coverage for a real bug found on an actual interview: a
+    quiet/unclear segment came back as "Transcribe exactly what is said,
+    but it's not a good thing." -- a hallucinated echo of the
+    initial_prompt config setting active at the time (a longer, more
+    instruction-phrased version of the current one), not anything actually
+    said."""
+
+    # The initial_prompt actually active when the real hallucination below
+    # was captured -- kept here (not the current, shortened config.yaml
+    # value) so this regression test still exercises the exact reported
+    # case regardless of future prompt wording changes.
+    ORIGINAL_PROMPT = (
+        "This is an unscripted, informal spoken interview in English, possibly "
+        "with an Indian accent. Transcribe exactly what is said, including filler words "
+        "like um, uh, so, actually, basically, and casual phrasing."
+    )
+    HALLUCINATION = "Transcribe exactly what is said, but it's not a good thing."
+
+    def test_looks_like_prompt_echo_true_for_the_real_reported_hallucination(self):
+        assert _looks_like_prompt_echo(self.HALLUCINATION, _prompt_echo_words(self.ORIGINAL_PROMPT)) is True
+
+    def test_looks_like_prompt_echo_false_for_an_ordinary_answer(self):
+        assert _looks_like_prompt_echo(
+            "So basically I led a team of five engineers and we shipped it in three months.",
+            _prompt_echo_words(self.ORIGINAL_PROMPT),
+        ) is False
+
+    def test_looks_like_prompt_echo_false_for_an_answer_reusing_a_few_of_the_same_words(self):
+        """Avoids false-positiving just because a real answer happens to
+        reuse a handful of the prompt's individual words (informal,
+        casual) without actually echoing its wording."""
+        assert _looks_like_prompt_echo(
+            "It was an informal spoken interview and I felt very casual about it honestly.",
+            _prompt_echo_words(self.ORIGINAL_PROMPT),
+        ) is False
+
+    def test_looks_like_prompt_echo_false_for_short_text(self):
+        assert _looks_like_prompt_echo("Transcribe exactly", _prompt_echo_words(self.ORIGINAL_PROMPT)) is False
+
+    def test_looks_like_prompt_echo_false_with_no_prompt(self):
+        assert _looks_like_prompt_echo(self.HALLUCINATION, []) is False
+
+    def test_filter_prompt_echo_drops_the_hallucinated_segment(self):
+        labeled = [
+            (0.0, 3.0, "Interviewer", "Tell me about a time you disagreed with a teammate."),
+            (10.0, 12.0, "Interviewer", self.HALLUCINATION),
+            (12.5, 20.0, "You", "Sure, there was a project where we disagreed on the approach."),
+        ]
+
+        result = _filter_prompt_echo(labeled, self.ORIGINAL_PROMPT)
+
+        assert result == [
+            (0.0, 3.0, "Interviewer", "Tell me about a time you disagreed with a teammate."),
+            (12.5, 20.0, "You", "Sure, there was a project where we disagreed on the approach."),
+        ]
+
+    def test_filter_prompt_echo_keeps_everything_when_prompt_is_unset(self):
+        labeled = [(10.0, 12.0, "Interviewer", self.HALLUCINATION)]
+        assert _filter_prompt_echo(labeled, None) == labeled
+        assert _filter_prompt_echo(labeled, "") == labeled
+
+    def test_filter_prompt_echo_keeps_genuine_speech(self):
+        labeled = [
+            (0.0, 3.0, "Interviewer", "What's your biggest strength?"),
+            (3.5, 10.0, "You", "I'd say my ability to stay calm under pressure."),
+        ]
+        assert _filter_prompt_echo(labeled, self.ORIGINAL_PROMPT) == labeled

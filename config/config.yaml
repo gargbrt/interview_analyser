@@ -208,9 +208,18 @@ transcription:
   # speech (filler words, casual phrasing) that Whisper otherwise tends to
   # "clean up" into a different, less accurate sentence. See
   # docs/language_support.md. Set to "" to disable.
-  initial_prompt: "This is an unscripted, informal spoken interview in English, possibly
-    with an Indian accent. Transcribe exactly what is said, including filler words
-    like um, uh, so, actually, basically, and casual phrasing."
+  #
+  # Deliberately SHORT and descriptive, not an instruction -- a real
+  # transcript once contained the hallucinated line "Transcribe exactly
+  # what is said, but it's not a good thing.", a garbled echo of an
+  # earlier, longer version of this exact prompt. Whisper's initial_prompt
+  # is a decoding-context hint, not a command; a long, imperative-sounding
+  # prompt ("Transcribe exactly what is said, including...") raises the
+  # odds that on a quiet/unclear segment the model "continues" from the
+  # prompt's own words instead of genuinely transcribing nothing. Keeping
+  # this to a short, purely descriptive phrase (no instructions) reduces
+  # that risk without losing the accent/informality context that helps.
+  initial_prompt: "Informal spoken interview, Indian English accent, casual phrasing with filler words like um, uh, so."
 
 # --- Analysis ---
 # "engine" selects which AnalysisEngine to use (see src/interview_analyzer/engines.py).

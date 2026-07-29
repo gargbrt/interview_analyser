@@ -25,6 +25,7 @@ import difflib
 import logging
 import os
 import pathlib
+import re
 import tempfile
 import threading
 from types import SimpleNamespace
@@ -97,6 +98,74 @@ def _filter_mic_bleed(labeled: list[tuple[float, float, str, str]]) -> list[tupl
             if nearby_text and _looks_like_mic_bleed(t, nearby_text):
                 continue
         filtered.append((s, e, spk, t))
+    return filtered
+
+
+# How many CONSECUTIVE words a segment must share with initial_prompt to be
+# treated as a hallucinated echo of it rather than real speech -- see
+# _looks_like_prompt_echo. Calibrated against the real incident this
+# guards against: the exact reported hallucination ("Transcribe exactly
+# what is said, but it's not a good thing.") shares a 5-word run verbatim
+# with the initial_prompt that was active at the time, while two
+# plausible ordinary answers that happen to reuse some of the SAME
+# individual words (e.g. "informal", "casual") share no such run at all.
+_PROMPT_ECHO_MIN_MATCHING_WORDS = 5
+
+
+def _prompt_echo_words(text: str) -> list[str]:
+    return re.findall(r"[a-z0-9']+", text.lower())
+
+
+def _looks_like_prompt_echo(text: str, prompt_words: list[str]) -> bool:
+    """True if `text` shares a run of _PROMPT_ECHO_MIN_MATCHING_WORDS
+    consecutive words with initial_prompt (the decoding-context hint --
+    see config.yaml) -- Whisper's initial_prompt biases what it decodes,
+    and on a quiet/unclear segment it can "continue" from the prompt's own
+    wording instead of genuinely transcribing silence or noise, rather
+    than being an instruction it merely follows (see the real, reproduced
+    incident quoted in _PROMPT_ECHO_MIN_MATCHING_WORDS's docstring).
+
+    Checked as an exact consecutive-word run rather than difflib's overall
+    character-coverage ratio (the same technique _looks_like_mic_bleed
+    uses for a different kind of contamination) -- calibrated against real
+    examples, character coverage didn't cleanly separate the actual
+    hallucination from an ordinary sentence that happens to reuse a few of
+    the prompt's individual words, especially once the prompt itself is
+    short. An exact 5-word run is specific enough that genuine speech
+    matching it by coincidence is vanishingly unlikely."""
+    if not prompt_words:
+        return False
+    text_words = _prompt_echo_words(text)
+    if len(text_words) < _PROMPT_ECHO_MIN_MATCHING_WORDS:
+        return False
+    padded_prompt = " " + " ".join(prompt_words) + " "
+    for i in range(len(text_words) - _PROMPT_ECHO_MIN_MATCHING_WORDS + 1):
+        window = " ".join(text_words[i:i + _PROMPT_ECHO_MIN_MATCHING_WORDS])
+        if f" {window} " in padded_prompt:
+            return True
+    return False
+
+
+def _filter_prompt_echo(
+    labeled: list[tuple[float, float, str, str]], prompt: Optional[str],
+) -> list[tuple[float, float, str, str]]:
+    """Drops segments that look like a hallucinated echo of initial_prompt
+    (see _looks_like_prompt_echo) -- applied once, in transcribe(), after
+    either engine produces its segments, since the hallucination risk
+    comes from the prompt itself, not from which engine decoded it.
+    A no-op when initial_prompt is unset (nothing to compare against)."""
+    if not prompt:
+        return labeled
+    prompt_words = _prompt_echo_words(prompt)
+    filtered = []
+    for s, e, spk, text in labeled:
+        if _looks_like_prompt_echo(text, prompt_words):
+            logger.warning(
+                "Dropped a transcript segment that looks like a hallucinated echo of "
+                "initial_prompt rather than real speech: %r", text,
+            )
+            continue
+        filtered.append((s, e, spk, text))
     return filtered
 
 
@@ -202,6 +271,8 @@ def transcribe(
         labeled = _transcribe_via_groq(audio_path, cfg, on_progress, cancel_event)
     else:
         labeled = _transcribe_local(audio_path, cfg, on_progress, cancel_event, model)
+
+    labeled = _filter_prompt_echo(labeled, tcfg.get("initial_prompt"))
 
     if tcfg.get("language", "auto") == "hinglish":
         labeled = [(s, e, spk, _to_latin_if_available(text)) for s, e, spk, text in labeled]
