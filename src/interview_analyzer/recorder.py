@@ -149,6 +149,7 @@ class _WindowsAudioRecorder:
         self._output_channels = channels
         self._frames_written = 0  # only counts frames actually written (i.e. not while paused)
         self._recording_failed = False
+        self._terminated = False  # guards against calling self._pa.terminate() twice -- see release_streams()
 
     def _get_loopback_device(self):
         wasapi_info = self._pa.get_host_api_info_by_type(pyaudio.paWASAPI)
@@ -388,35 +389,48 @@ class _WindowsAudioRecorder:
         return self._out_path
 
     def release_streams(self) -> None:
-        """Closes the underlying WASAPI loopback/microphone PyAudio
+        """Releases the underlying WASAPI loopback/microphone PyAudio
         streams -- split out of stop() (call this AFTER stop(), once the
         caller has already committed the interview as ended and ideally
-        started background processing) because this exact call was
-        reproduced causing a hard, unrecoverable native crash: a real
-        recording stopped cleanly, then the entire pythonw.exe process
-        died about a second later with an access violation (0xc0000005)
-        in ntdll.dll, confirmed via Windows Error Reporting -- while
-        closing these streams. Since that's a native crash, wrapping it
-        in try/except here can't prevent the process from dying if it
-        happens again, but calling this only after the interview is
-        already marked ended and handed to the background thread means
-        that failure mode can no longer erase a finished recording (the
-        WAV file, already finalized by stop(), stays fully reprocessable
-        via reprocess_interview() regardless of what happens here)."""
+        started background processing), because this step was reproduced
+        causing a hard, unrecoverable native crash: a real recording
+        stopped cleanly, then the entire pythonw.exe process died about a
+        second later with an access violation (0xc0000005) in ntdll.dll,
+        confirmed via Windows Error Reporting -- while closing these
+        streams. Since that's a native crash, wrapping it in try/except
+        here can't prevent the process from dying if it happens again, but
+        calling this only after the interview is already marked ended and
+        handed to the background thread means that failure mode can no
+        longer erase a finished recording (the WAV file, already finalized
+        by stop(), stays fully reprocessable via reprocess_interview()
+        regardless of what happens here).
+
+        Uses self._pa.terminate() rather than closing each stream
+        individually via stop_stream()/close() -- that per-stream sequence
+        was reproduced STILL crashing the process natively even after
+        being deferred here (i.e. the reordering above reduced the blast
+        radius but didn't eliminate the crash itself). PortAudio's own
+        docs say Pa_Terminate() implicitly closes any streams still open,
+        which is a single, far more heavily-used cleanup path than
+        separately closing a loopback stream and a microphone stream in
+        sequence -- a plausible source of whatever WASAPI-side state race
+        the individual close() calls were hitting. Safe to call once per
+        recording: a fresh PyAudio() instance is created for every new
+        recording (see SystemAudioRecorder in watcher.py's
+        _start_recording), so terminating it here never affects a
+        different, still-active recording."""
+        if self._terminated:
+            return
+        self._terminated = True
         try:
-            if self._stream:
-                self._stream.stop_stream()
-                self._stream.close()
+            self._pa.terminate()
         except Exception:  # noqa: BLE001
-            logger.warning("Error closing the system-audio stream (non-fatal)", exc_info=True)
-        try:
-            if self._mic_stream:
-                self._mic_stream.stop_stream()
-                self._mic_stream.close()
-        except Exception:  # noqa: BLE001
-            logger.warning("Error closing the microphone stream (non-fatal)", exc_info=True)
+            logger.warning("Error terminating the audio backend (non-fatal)", exc_info=True)
 
     def __del__(self):
+        if self._terminated:
+            return
+        self._terminated = True
         try:
             self._pa.terminate()
         except Exception:  # noqa: BLE001

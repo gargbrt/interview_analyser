@@ -84,7 +84,8 @@ class _FakePyAudio:
     paWASAPI = 13
 
     def __init__(self):
-        pass
+        self.terminate_calls = 0
+        self._raise_on_terminate: Optional[Exception] = None
 
     def get_host_api_info_by_type(self, _api):
         return {"defaultOutputDevice": 0}
@@ -108,7 +109,9 @@ class _FakePyAudio:
         return _FakeStream()
 
     def terminate(self):
-        pass
+        self.terminate_calls += 1
+        if self._raise_on_terminate is not None:
+            raise self._raise_on_terminate
 
 
 @contextmanager
@@ -218,68 +221,71 @@ def test_stop_works_while_paused(tmp_path):
 class TestStopReleaseStreamsSplit:
     """stop() and release_streams() are deliberately separate calls (see
     both docstrings in recorder.py): stop() only finalizes the WAV file on
-    disk; release_streams() closes the underlying WASAPI/PyAudio streams,
-    the exact call reproduced crashing the whole process natively on a
-    real machine. watcher.py now calls release_streams() only AFTER
-    committing the interview as ended and starting background processing
-    -- these tests guard the precondition that split relies on: stop()
-    itself must never touch the streams."""
+    disk; release_streams() releases the underlying WASAPI/PyAudio
+    streams, the exact step reproduced crashing the whole process
+    natively on a real machine -- TWICE: first via individual
+    stream.stop_stream()/close() calls, then (after those were moved to
+    run only after the interview was already committed as ended) the
+    crash recurred at the exact same fault offset, meaning the crash was
+    in the close() sequence itself, not just its timing. release_streams()
+    now uses pa.terminate() instead -- PortAudio's docs say this
+    implicitly closes any streams still open, a single far more
+    heavily-used cleanup path than closing a loopback stream and a
+    microphone stream separately. watcher.py still calls release_streams()
+    only AFTER committing the interview as ended and starting background
+    processing, as a second layer of defense in case this doesn't
+    eliminate the crash outright."""
 
-    def test_stop_does_not_close_the_underlying_streams(self, tmp_path):
+    def test_stop_does_not_terminate_the_audio_backend(self, tmp_path):
         with _fake_recorder() as rec:
             rec.start(tmp_path / "call.wav")
-            stream = rec._stream
+            pa = rec._pa
             rec.stop()
 
-        assert stream.stop_stream_calls == 0
-        assert stream.close_calls == 0
+        assert pa.terminate_calls == 0
 
-    def test_release_streams_closes_the_loopback_stream(self, tmp_path):
+    def test_release_streams_terminates_the_audio_backend(self, tmp_path):
         with _fake_recorder() as rec:
             rec.start(tmp_path / "call.wav")
-            stream = rec._stream
+            pa = rec._pa
             rec.stop()
             rec.release_streams()
 
-        assert stream.stop_stream_calls == 1
-        assert stream.close_calls == 1
+        assert pa.terminate_calls == 1
 
-    def test_release_streams_closes_the_microphone_stream_too(self, tmp_path):
-        with _fake_recorder(mic_available=True) as rec:
+    def test_release_streams_survives_a_terminate_error(self, tmp_path):
+        """Regression coverage for the real crash this exists to contain:
+        release_streams() must not propagate an exception from terminate()
+        to the caller."""
+        with _fake_recorder() as rec:
             rec.start(tmp_path / "call.wav")
-            mic_stream = rec._mic_stream
-            assert mic_stream is not None
+            rec._pa._raise_on_terminate = OSError("audio backend already gone")
+            rec.stop()
+            rec.release_streams()  # must not raise
+
+    def test_release_streams_only_terminates_once_even_if_called_twice(self, tmp_path):
+        with _fake_recorder() as rec:
+            rec.start(tmp_path / "call.wav")
+            pa = rec._pa
             rec.stop()
             rec.release_streams()
+            rec.release_streams()
 
-        assert mic_stream.stop_stream_calls == 1
-        assert mic_stream.close_calls == 1
+        assert pa.terminate_calls == 1
 
-    def test_release_streams_survives_a_loopback_close_error(self, tmp_path):
-        """Regression coverage for the real crash this split exists to
-        contain: closing the loopback stream can fail (or, on a real
-        machine, crash the process natively) -- release_streams() must not
-        let a raised exception here prevent it from still attempting to
-        close the microphone stream, and must not propagate to the
-        caller."""
-        with _fake_recorder(mic_available=True) as rec:
+    def test_del_does_not_terminate_again_after_release_streams_already_did(self, tmp_path):
+        """__del__'s own terminate() call is a fallback for a recorder
+        that's garbage-collected without release_streams() ever having
+        been called (e.g. a crash before it) -- it must not redundantly
+        terminate an already-released audio backend."""
+        with _fake_recorder() as rec:
             rec.start(tmp_path / "call.wav")
-            rec._stream = _FakeStream(raise_on_close=OSError("stream already invalid"))
-            mic_stream = rec._mic_stream
+            pa = rec._pa
             rec.stop()
-            rec.release_streams()  # must not raise
+            rec.release_streams()
+            rec.__del__()
 
-        assert mic_stream.close_calls == 1
-
-    def test_release_streams_survives_a_microphone_close_error(self, tmp_path):
-        with _fake_recorder(mic_available=True) as rec:
-            rec.start(tmp_path / "call.wav")
-            loopback_stream = rec._stream
-            rec._mic_stream = _FakeStream(raise_on_close=OSError("mic stream already invalid"))
-            rec.stop()
-            rec.release_streams()  # must not raise
-
-        assert loopback_stream.close_calls == 1
+        assert pa.terminate_calls == 1
 
     def test_release_streams_is_a_noop_without_a_prior_start(self):
         with _fake_recorder() as rec:
