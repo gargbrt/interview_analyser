@@ -45,6 +45,27 @@ minor nitpicks in an answer whose substance was actually clear and complete.
 If a question's answer has no genuine issues, return an empty "issues" list
 for it rather than manufacturing something to criticize just to fill it in.
 
+Only create a qa_pairs entry when the INTERVIEWER is genuinely asking YOU
+something and expects a substantive response from you. Two situations come
+up often in a real transcript and must NEVER become a qa_pairs entry scored
+against you:
+  (a) The interviewer asks something and then keeps talking at length
+      themselves -- explaining, sharing context, thinking out loud -- with
+      you only offering brief acknowledgements ("yeah", "okay", "right",
+      "thank you", "mm-hmm", "got it"). That is the interviewer sharing
+      information, not quizzing you; your brief acknowledgements are not a
+      missing or weak answer and must not be treated as one.
+  (b) YOU are the one asking the interviewer a question -- about the role,
+      the company, the team, their own experience, or asking them to
+      clarify something -- and the interviewer is the one who responds.
+      Never invent a qa_pairs entry that treats the interviewer's own
+      answer as something you were supposed to have said, and never
+      penalize you for "not answering" a question that you were actually
+      the one who asked. Skip this exchange entirely rather than scoring it.
+When unsure which direction a given exchange runs, check who is doing the
+asking versus who is doing the explaining across the surrounding lines, not
+just whether a line ends in a question mark.
+
 For EACH question/answer pair, evaluate the answer against these competencies:
 {competencies}
 

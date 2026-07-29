@@ -97,6 +97,30 @@ def test_prompt_requires_concrete_alternative_wording_for_suggested_improvement(
     assert "not generic advice" in lower or "never settle for vague advice" in lower
 
 
+def test_prompt_excludes_reversed_direction_questions_from_scoring():
+    """Regression coverage for a real, reproduced bug: on a real transcript,
+    the candidate asking the interviewer a question (e.g. "And how about
+    your experience at Atlas and building this?") got turned into a
+    qa_pairs entry scored AGAINST the candidate for "not answering" --
+    when the interviewer was the one who was supposed to answer. This
+    directly dragged down every competency score in that real report. The
+    prompt now explicitly tells the model not to do this."""
+    prompt = build_prompt("[Interviewer] Hi\n[You] Hello")
+    lower = " ".join(prompt.lower().split())
+    assert "you are the one asking the interviewer a question" in lower
+    assert "never penalize you for" in lower and "not answering" in lower
+
+
+def test_prompt_excludes_interviewer_monologues_from_scoring():
+    """Same real bug, other half: the interviewer asking something and then
+    monologuing at length (with the candidate only saying "yeah"/"okay")
+    was also turned into a scored "you didn't answer" entry."""
+    prompt = build_prompt("[Interviewer] Hi\n[You] Hello")
+    lower = " ".join(prompt.lower().split())
+    assert "keeps talking at length themselves" in lower
+    assert "brief acknowledgements" in lower
+
+
 def test_prompt_requires_concrete_alternative_wording_for_low_competency_scores():
     """Same real feedback, extended to the per-competency remark -- a
     generic complaint like "lacked technical clarity" with no guidance on
