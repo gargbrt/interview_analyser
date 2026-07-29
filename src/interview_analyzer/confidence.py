@@ -63,8 +63,33 @@ from .rubric import HIRE_RECOMMENDATION_LEVELS
 logger = logging.getLogger(__name__)
 
 # Below this many rated interviews, the user's own track record is too thin
-# to be a more meaningful signal than the model's own self-assessment.
+# for feedback to have ANY say at all -- below this, it's purely the
+# model's own self-assessment.
 MIN_FEEDBACK_SAMPLES = 3
+
+# Above MIN_FEEDBACK_SAMPLES, feedback's influence on the final score grows
+# SMOOTHLY with how much of it exists, rather than switching from "100%
+# trust the model's self-report" to "100% trust the feedback average" the
+# instant the count crosses MIN_FEEDBACK_SAMPLES. Reproduced as a real,
+# confusing incident: a model-reported 70% became a feedback-based 45% the
+# moment a 3rd rating came in -- an abrupt cliff the user has no way to
+# anticipate, and one bad early rating (from when the app was rougher)
+# got as much permanent say as every later one, forever. Saturates at
+# FEEDBACK_TRUST_SATURATION_SAMPLES (a real track record IS more
+# meaningful than the model's own self-assessment once there's enough of
+# it), but MAX_FEEDBACK_TRUST_WEIGHT stops short of 100% even then, so the
+# model's own per-interview signal is never fully silenced.
+FEEDBACK_TRUST_SATURATION_SAMPLES = 15
+MAX_FEEDBACK_TRUST_WEIGHT = 0.9
+
+# How much each step further back in time discounts a rating in the
+# feedback average -- 1.0 would be a plain unweighted average (a rating
+# from months ago counts exactly as much as one from today, forever).
+# Gentle by design (0.85, not something aggressive) so ordinary week-to-
+# week noise doesn't swing the score, while genuine improvement (or
+# decline) in more recent ratings still shows up instead of being
+# permanently capped by one old outlier.
+FEEDBACK_RECENCY_DECAY = 0.85
 
 # Feedback is a 1-10 quality score (10 = highest, see db.py); a score at or
 # below this is "negative" enough to be worth feeding back into future
@@ -75,8 +100,14 @@ NEGATIVE_SCORE_THRESHOLD = 4
 def calibrated_confidence(db, user_id: Optional[int], model_reported: Optional[float]) -> dict:
     """Returns {"score": int|None, "source": "feedback"|"model"|"unavailable",
     "sample_size": int}. `score` is None only when there's neither usable
-    feedback history nor a model-reported figure to fall back to."""
+    feedback history nor a model-reported figure to fall back to.
+
+    `source: "feedback"` means feedback had SOME say (sample_size >=
+    MIN_FEEDBACK_SAMPLES), not that it's the only input -- see
+    FEEDBACK_TRUST_SATURATION_SAMPLES above for why it's blended with
+    model_reported rather than replacing it outright."""
     try:
+        # already created_at ASC (oldest first) -- see db.py's list_feedback
         feedback = db.list_feedback(user_id=user_id)
         rated = [f for f in feedback if f.analysis_score is not None]
     except Exception:  # noqa: BLE001
@@ -87,9 +118,27 @@ def calibrated_confidence(db, user_id: Optional[int], model_reported: Optional[f
         rated = None
 
     if rated is not None and len(rated) >= MIN_FEEDBACK_SAMPLES:
-        # average 1-10 score, normalized to a 0-100 scale
-        avg_score = sum(f.analysis_score for f in rated) / len(rated)
-        return {"score": round(avg_score / 10 * 100), "source": "feedback", "sample_size": len(rated)}
+        n = len(rated)
+        # newest entry gets weight 1.0; each one further back is
+        # discounted by another factor of FEEDBACK_RECENCY_DECAY
+        weights = [FEEDBACK_RECENCY_DECAY ** (n - 1 - i) for i in range(n)]
+        weighted_avg = sum(f.analysis_score * w for f, w in zip(rated, weights)) / sum(weights)
+        feedback_score = weighted_avg / 10 * 100  # 0-100 scale
+
+        model_score: Optional[float] = None
+        if model_reported is not None:
+            try:
+                model_score = max(0.0, min(100.0, float(model_reported)))
+            except (TypeError, ValueError):
+                model_score = None
+
+        if model_score is None:
+            # nothing to blend with -- feedback is all there is
+            blended = feedback_score
+        else:
+            feedback_trust = min(1.0, n / FEEDBACK_TRUST_SATURATION_SAMPLES) * MAX_FEEDBACK_TRUST_WEIGHT
+            blended = feedback_score * feedback_trust + model_score * (1 - feedback_trust)
+        return {"score": round(blended), "source": "feedback", "sample_size": n}
 
     if model_reported is not None:
         try:
@@ -109,7 +158,7 @@ def format_confidence(confidence_info: Optional[dict]) -> str:
     source = confidence_info.get("source")
     n = confidence_info.get("sample_size", 0)
     if source == "feedback":
-        return f"{score}% (calibrated from your last {n} feedback ratings)"
+        return f"{score}% (blends your last {n} feedback ratings with the model's own self-assessment)"
     if source == "model":
         return f"{score}% (model's own self-assessment -- rate this report to start calibrating from your feedback instead)"
     return f"{score}%"

@@ -38,7 +38,15 @@ class TestCalibratedConfidence:
         assert result["score"] is None
         assert result["source"] == "unavailable"
 
-    def test_uses_average_feedback_score_once_enough_samples_exist(self, tmp_path):
+    def test_blends_feedback_with_the_model_score_once_enough_samples_exist(self, tmp_path):
+        """Regression coverage for a real, confusing incident: this used to
+        be a hard cutover (100% trust the model below MIN_FEEDBACK_SAMPLES,
+        100% trust a plain feedback average at/above it) -- a model-
+        reported 70% became a feedback-based 45% the instant a 3rd rating
+        came in. Now it's a smooth blend: at exactly MIN_FEEDBACK_SAMPLES,
+        feedback has only a little say (this test's math, hand-verified:
+        recency-weighted average of 10/8/3 -> ~66.2%, blended with model=99
+        at ~18% feedback trust -> 93%), not full override."""
         db = InterviewDB(tmp_path / "test.db")
         iid_a = db.start_interview("Zoom", str(tmp_path / "a.wav"), retention_days=3, user_id=1)
         iid_b = db.start_interview("Zoom", str(tmp_path / "b.wav"), retention_days=3, user_id=1)
@@ -49,8 +57,54 @@ class TestCalibratedConfidence:
 
         assert MIN_FEEDBACK_SAMPLES == 3  # this test assumes exactly the threshold
         result = calibrated_confidence(db, user_id=1, model_reported=99)
-        # average analysis_score = (10+8+3)/3 = 7.0 -> 70%
-        assert result == {"score": 70, "source": "feedback", "sample_size": 3}
+        assert result == {"score": 93, "source": "feedback", "sample_size": 3}
+
+    def test_feedback_trust_grows_with_more_samples(self, tmp_path):
+        """The more labeled feedback there is, the closer the blended
+        score should land to the pure feedback average and the further
+        from the model's own (here, much higher) self-report."""
+        db = InterviewDB(tmp_path / "test.db")
+
+        def _seed(n, score=3):
+            for i in range(n):
+                iid = db.start_interview("Zoom", str(tmp_path / f"{n}_{i}.wav"), retention_days=3, user_id=1)
+                db.save_feedback(iid, user_id=1, transcript_score=10, analysis_score=score, comment="")
+
+        _seed(3)
+        few_samples = calibrated_confidence(db, user_id=1, model_reported=99)["score"]
+
+        db2 = InterviewDB(tmp_path / "test2.db")
+        for i in range(20):
+            iid = db2.start_interview("Zoom", str(tmp_path / f"many_{i}.wav"), retention_days=3, user_id=1)
+            db2.save_feedback(iid, user_id=1, transcript_score=10, analysis_score=3, comment="")
+        many_samples = calibrated_confidence(db2, user_id=1, model_reported=99)["score"]
+
+        assert many_samples < few_samples  # more low ratings pull it down further
+        # even with a large, consistently-low history, the model's own
+        # signal is never fully silenced (MAX_FEEDBACK_TRUST_WEIGHT < 1.0)
+        assert many_samples > 30
+
+    def test_recent_ratings_count_more_than_old_ones(self, tmp_path):
+        """A single old outlier rating must not have equal, permanent say
+        forever -- more recent ratings should be able to pull the score
+        back up (or down) from it."""
+        db_old_bad = InterviewDB(tmp_path / "old_bad.db")
+        for score in (1, 8, 8, 8, 8):  # one bad rating long ago, consistently good since
+            iid = db_old_bad.start_interview("Zoom", str(tmp_path / f"a{score}.wav"), retention_days=3, user_id=1)
+            db_old_bad.save_feedback(iid, user_id=1, transcript_score=10, analysis_score=score, comment="")
+        improving = calibrated_confidence(db_old_bad, user_id=1, model_reported=None)["score"]
+
+        db_recent_bad = InterviewDB(tmp_path / "recent_bad.db")
+        for score in (8, 8, 8, 8, 1):  # consistently good, then one bad rating just now
+            iid = db_recent_bad.start_interview("Zoom", str(tmp_path / f"b{score}.wav"), retention_days=3, user_id=1)
+            db_recent_bad.save_feedback(iid, user_id=1, transcript_score=10, analysis_score=score, comment="")
+        declining = calibrated_confidence(db_recent_bad, user_id=1, model_reported=None)["score"]
+
+        # same five ratings (one 1, four 8s) in both cases -- a plain
+        # unweighted average would score them identically; recency
+        # weighting must not, since a bad rating THIS week means something
+        # different from one long since superseded by good ones
+        assert improving > declining
 
     def test_ignores_ratings_that_only_cover_transcript_not_analysis(self, tmp_path):
         """analysis_score is the signal for analysis confidence -- someone

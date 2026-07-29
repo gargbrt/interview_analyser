@@ -27,18 +27,26 @@ Both are on the same panel as Submit feedback.
 ## What your feedback is used for
 
 1. **Confidence scoring.** Each report shows a *"Confidence in this
-   assessment"* line. Once you've rated at least 3 analyses, that score is
-   derived from your own average analysis-quality score (normalized to a
-   percentage — e.g. an average of 7/10 shows as 70%) rather than the
-   model's own guess — a track record beats a self-assessment. Before that
-   (or if the feedback history can't be read for any reason), it falls
-   back to the model's own self-reported confidence, which every built-in
-   analysis run now asks for as part of its JSON output (see `rubric.py`'s
-   `confidence` field).
+   assessment"* line. Below 3 rated analyses (or if the feedback history
+   can't be read for any reason), it's purely the model's own self-
+   reported confidence, which every built-in analysis run asks for as
+   part of its JSON output (see `rubric.py`'s `confidence` field).
+
+   Once you've rated at least 3 analyses, your own track record starts
+   having a say too — but as a **blend**, not a hard switch: with only a
+   few ratings, the model's own self-assessment still carries most of the
+   weight; the more you've rated, the more your own average takes over
+   (capped short of 100%, so the model's per-interview self-assessment is
+   never fully silenced even with a long history). Within your own
+   average, more recent ratings count more than older ones, so a single
+   bad rating from weeks ago doesn't permanently cap the score once things
+   have genuinely improved since. This avoids an earlier, confusing
+   behavior where crossing the 3-rating threshold could cause a sudden,
+   large jump in the displayed confidence.
 
    | Shown as                                          | Meaning |
    |----------------------------------------------------|---------|
-   | `82% (calibrated from your last 12 feedback ratings)` | Your own track record |
+   | `82% (blends your last 12 feedback ratings with the model's own self-assessment)` | Enough ratings to have a real (if not exclusive) say |
    | `74% (model's own self-assessment — rate this report to start calibrating from your feedback instead)` | Not enough feedback yet |
    | `not available`                                     | Neither is available (e.g. an older analysis engine that doesn't report confidence, and no feedback yet) |
 
