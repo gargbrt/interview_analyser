@@ -11,6 +11,7 @@ from interview_analyzer.config_loader import Config
 from interview_analyzer.db import InterviewRecord
 from interview_analyzer.infographic import (
     _gauge_point,
+    _score_to_color,
     _seniority_comparison_caption_html,
     _seniority_comparisons,
     infographic_path,
@@ -903,6 +904,64 @@ class TestTrendSparklines:
         # worst-first convention (same as the averages list) puts the
         # decliner ahead of the improver
         assert trend_section.index("Execution") < trend_section.index("Leadership")
+
+    def test_a_mid_series_dip_colors_that_segment_red_or_amber_not_just_the_endpoint(self, tmp_path):
+        """Regression coverage for a real request: previously the whole
+        line/area used ONE flat color chosen only from the LATEST score, so
+        a real dip in the middle of an otherwise-improving trend (e.g.
+        40 -> 20 -> 65) was invisible in the chart itself -- only the
+        overall delta number showed it improved. Each point now gets its
+        own color from the same red/amber/green scale, via a gradient, so
+        the dip shows up as a visibly red/amber segment right where it
+        happened."""
+        cfg = _cfg(tmp_path)
+        records = [
+            _record(tmp_path, id=1, started_at="2026-06-01T10:00:00",
+                    analysis_json=self._analysis({"Leadership": 40})),
+            _record(tmp_path, id=2, started_at="2026-06-08T10:00:00",
+                    analysis_json=self._analysis({"Leadership": 20})),  # the dip
+            _record(tmp_path, id=3, started_at="2026-06-15T10:00:00",
+                    analysis_json=self._analysis({"Leadership": 65})),
+        ]
+
+        content = write_trends_infographic(records, cfg, user_id=1).read_text(encoding="utf-8")
+
+        dip_color = _score_to_color(20)
+        final_color = _score_to_color(65)
+        assert dip_color != final_color
+        # the dip's own (poor) score color must appear as a gradient stop --
+        # not just the final score's color used for the whole chart
+        assert f'stop-color="{dip_color}"' in content
+        assert f'stop-color="{final_color}"' in content
+
+    def test_area_fill_and_line_use_the_same_per_point_gradient(self, tmp_path):
+        cfg = _cfg(tmp_path)
+        records = [
+            _record(tmp_path, id=1, started_at="2026-06-01T10:00:00",
+                    analysis_json=self._analysis({"Leadership": 40})),
+            _record(tmp_path, id=2, started_at="2026-06-15T10:00:00",
+                    analysis_json=self._analysis({"Leadership": 65})),
+        ]
+
+        content = write_trends_infographic(records, cfg, user_id=1).read_text(encoding="utf-8")
+
+        assert "<linearGradient" in content
+        assert re.search(r'<polygon[^>]*fill:url\(#trend-grad-leadership\)', content)
+        assert re.search(r'<polyline[^>]*stroke:url\(#trend-grad-leadership\)', content)
+
+    def test_footer_scores_are_colored_by_their_own_value(self, tmp_path):
+        cfg = _cfg(tmp_path)
+        records = [
+            _record(tmp_path, id=1, started_at="2026-06-01T10:00:00",
+                    analysis_json=self._analysis({"Leadership": 20})),
+            _record(tmp_path, id=2, started_at="2026-06-15T10:00:00",
+                    analysis_json=self._analysis({"Leadership": 90})),
+        ]
+
+        content = write_trends_infographic(records, cfg, user_id=1).read_text(encoding="utf-8")
+
+        assert f'style="color:{_score_to_color(20)};"' in content
+        assert f'style="color:{_score_to_color(90)};"' in content
 
     def test_no_trend_section_when_nothing_has_two_data_points(self, tmp_path):
         cfg = _cfg(tmp_path)

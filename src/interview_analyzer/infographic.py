@@ -725,10 +725,13 @@ def _competency_trend_card_svg(name: str, series: list[tuple[str, float]]) -> st
     competency scored in 2+ interviews (see _render_trends, which filters
     before calling this) -- a single point can't show a trend.
 
-    Line/dot color follows the same continuous red-to-green
-    _score_to_color gradient the competency bars elsewhere on this page
-    already use for the latest score, so a card reads consistently with
-    the rest of the page at a glance."""
+    The line/area/dots are colored with a left-to-right gradient built
+    from each individual point's OWN score (via the same continuous
+    red-to-green _score_to_color scale the competency bars elsewhere on
+    this page already use), not a single flat color for the whole card --
+    a dip in the middle of an otherwise-improving trend shows up as a
+    visibly red/amber segment right where it happens, instead of being
+    hidden behind a color chosen only from the latest score."""
     n = len(series)
     first_date, first_score = series[0]
     last_date, last_score = series[-1]
@@ -740,12 +743,24 @@ def _competency_trend_card_svg(name: str, series: list[tuple[str, float]]) -> st
         (i * step, pad + (chart_h - 2 * pad) * (1 - max(0, min(100, score)) / 100))
         for i, (_date, score) in enumerate(series)
     ]
-    line_color = _score_to_color(last_score)
+    point_colors = [_score_to_color(score) for _date, score in series]
     polyline_points = " ".join(f"{x:.1f},{y:.1f}" for x, y in points)
     area_points = f"0,{chart_h} {polyline_points} {chart_w},{chart_h}"
     dots_svg = "".join(
-        f'<circle cx="{x:.1f}" cy="{y:.1f}" r="{3 if i in (0, n - 1) else 2}" style="fill:{line_color};"/>'
+        f'<circle cx="{x:.1f}" cy="{y:.1f}" r="{3 if i in (0, n - 1) else 2}" style="fill:{point_colors[i]};"/>'
         for i, (x, y) in enumerate(points)
+    )
+
+    gradient_id = f"trend-grad-{_slugify(name)}"
+    if n > 1:
+        stops_svg = "".join(
+            f'<stop offset="{100 * i / (n - 1):.1f}%" stop-color="{point_colors[i]}"/>' for i in range(n)
+        )
+    else:
+        stops_svg = f'<stop offset="0%" stop-color="{point_colors[0]}"/>'
+    gradient_svg = (
+        f'<linearGradient id="{gradient_id}" x1="0" x2="{chart_w}" y1="0" y2="0" '
+        f'gradientUnits="userSpaceOnUse">{stops_svg}</linearGradient>'
     )
 
     if delta > 0:
@@ -762,14 +777,15 @@ def _competency_trend_card_svg(name: str, series: list[tuple[str, float]]) -> st
 </div>
 <svg width="{chart_w}" height="{chart_h}" viewBox="0 0 {chart_w} {chart_h}" role="img"
      aria-label="{_e(name)} score trend: {first_score:.0f} on {first_date} to {last_score:.0f} on {last_date}, across {n} interviews">
-<polygon points="{area_points}" style="fill:{line_color};" opacity="0.08"/>
-<polyline points="{polyline_points}" fill="none" style="stroke:{line_color};" stroke-width="2"
+<defs>{gradient_svg}</defs>
+<polygon points="{area_points}" style="fill:url(#{gradient_id});" opacity="0.16"/>
+<polyline points="{polyline_points}" fill="none" style="stroke:url(#{gradient_id});" stroke-width="2"
           stroke-linecap="round" stroke-linejoin="round"/>
 {dots_svg}
 </svg>
 <div class="trend-card-foot">
-<span>{_e(first_date)}: {first_score:.0f}</span>
-<span>{_e(last_date)}: {last_score:.0f}</span>
+<span style="color:{point_colors[0]};">{_e(first_date)}: {first_score:.0f}</span>
+<span style="color:{point_colors[-1]};">{_e(last_date)}: {last_score:.0f}</span>
 </div>
 </div>"""
 
