@@ -30,14 +30,18 @@ VALID_ANALYSIS = {
 
 class _ImmediateThread:
     """Stands in for threading.Thread so background work started by the
-    Ollama status/start/stop handlers below runs synchronously and
+    Ollama status/start/stop handlers (and reprocessing, which itself
+    chains a second real threading.Thread call inside the first -- see
+    Dashboard._run_reprocess_sequence) runs synchronously and
     deterministically within the test instead of racing the assertions."""
 
     def __init__(self, target=None, args=(), kwargs=None, daemon=None):
         self._target = target
+        self._args = args
+        self._kwargs = kwargs or {}
 
     def start(self):
-        self._target()
+        self._target(*self._args, **self._kwargs)
 
 
 def _watcher(tmp_path, user_id=1):
@@ -1006,4 +1010,139 @@ class TestPreviousAssessmentsSection:
         with patch("interview_analyzer.dashboard.render_into_text_widget") as mock_render:
             dashboard._on_select_history_entry()  # must not raise
 
-        mock_render.assert_not_called()
+
+class TestMultiSelectBulkActions:
+    """The History tab's tree is selectmode="extended" (see
+    _build_history_tab) so the user can ctrl/shift-click several rows and
+    act on all of them at once -- Reprocess, Reprocess with a different
+    profile, Delete, and Cancel processing all fan out across the whole
+    selection; View transcript/infographic and Play audio stay single-
+    target only (see _selected_record's docstring)."""
+
+    def _dashboard_with_interviews(self, tmp_path, count=3):
+        watcher = _watcher(tmp_path)
+        iids = []
+        for i in range(count):
+            audio_path = tmp_path / f"a{i}.wav"
+            audio_path.write_bytes(b"RIFF....WAVEreal audio bytes")  # can_reprocess needs real, non-empty audio
+            iid = watcher.db.start_interview("Zoom", str(audio_path), retention_days=3, user_id=1)
+            watcher.db.end_interview(iid)
+            iids.append(iid)
+        watcher.status = {"processing_jobs": {}}
+
+        dashboard = Dashboard(watcher)
+        dashboard._history_tree = MagicMock()
+        dashboard._history_tree.selection.return_value = [str(i) for i in iids]
+        for attr in (
+            "_reprocess_btn", "_reprocess_with_profile_btn", "_open_audio_btn",
+            "_view_transcript_btn", "_view_infographic_btn", "_delete_btn", "_cancel_btn",
+            "_reflow_history_toolbar",
+        ):
+            setattr(dashboard, attr, MagicMock())
+        return dashboard, iids
+
+    def test_selected_records_returns_all_in_tree_order(self, tmp_path):
+        dashboard, iids = self._dashboard_with_interviews(tmp_path)
+        assert [r.id for r in dashboard._selected_records()] == iids
+
+    def test_selected_record_is_none_when_multiple_are_selected(self, tmp_path):
+        dashboard, _iids = self._dashboard_with_interviews(tmp_path)
+        assert dashboard._selected_record() is None
+
+    def test_reprocess_and_delete_enable_with_multiple_selected(self, tmp_path):
+        dashboard, _iids = self._dashboard_with_interviews(tmp_path)
+
+        dashboard._update_action_buttons()
+
+        dashboard._reprocess_btn.config.assert_called_with(state="normal")
+        dashboard._reprocess_with_profile_btn.config.assert_called_with(state="normal")
+        dashboard._delete_btn.config.assert_called_with(state="normal")
+
+    def test_single_target_buttons_disable_with_multiple_selected(self, tmp_path):
+        dashboard, _iids = self._dashboard_with_interviews(tmp_path)
+
+        dashboard._update_action_buttons()
+
+        dashboard._open_audio_btn.config.assert_called_with(state="disabled")
+        dashboard._view_transcript_btn.config.assert_called_with(text="View transcript", state="disabled")
+        dashboard._view_infographic_btn.config.assert_called_with(state="disabled")
+
+    def test_reprocess_processes_every_eligible_selected_interview(self, tmp_path):
+        dashboard, iids = self._dashboard_with_interviews(tmp_path)
+
+        with patch("interview_analyzer.dashboard.threading.Thread", _ImmediateThread):
+            dashboard._on_reprocess()
+
+        assert dashboard.watcher.reprocess_interview.call_count == len(iids)
+        called_ids = {c.args[0] for c in dashboard.watcher.reprocess_interview.call_args_list}
+        assert called_ids == set(iids)
+
+    def test_reprocess_skips_a_selected_interview_that_is_already_processing(self, tmp_path):
+        dashboard, iids = self._dashboard_with_interviews(tmp_path)
+        dashboard.watcher.status = {"processing_jobs": {iids[0]: {}}}
+
+        with patch("interview_analyzer.dashboard.threading.Thread", _ImmediateThread):
+            dashboard._on_reprocess()
+
+        called_ids = {c.args[0] for c in dashboard.watcher.reprocess_interview.call_args_list}
+        assert iids[0] not in called_ids
+        assert called_ids == set(iids[1:])
+
+    def test_reprocess_with_profile_shows_one_dialog_and_applies_it_to_all(self, tmp_path):
+        dashboard, iids = self._dashboard_with_interviews(tmp_path)
+        chosen = AssessmentProfile(competencies=["Execution"], role="Data")
+
+        with patch("interview_analyzer.dashboard.threading.Thread", _ImmediateThread), \
+             patch("interview_analyzer.dashboard.confirm_profile", return_value=chosen) as mock_confirm:
+            dashboard._on_reprocess_with_profile()
+
+        mock_confirm.assert_called_once()  # exactly one dialog, not one per interview
+        assert "3 selected interviews" in mock_confirm.call_args.kwargs["intro_text"]
+        assert dashboard.watcher.reprocess_interview.call_count == len(iids)
+        for call in dashboard.watcher.reprocess_interview.call_args_list:
+            assert call.kwargs["profile"] == chosen
+
+    def test_delete_shows_one_confirmation_and_removes_all_selected(self, tmp_path):
+        dashboard, iids = self._dashboard_with_interviews(tmp_path)
+        dashboard._history_text = MagicMock()
+        dashboard._fb_frame = MagicMock()
+
+        with patch("tkinter.messagebox.askyesno", return_value=True) as mock_confirm:
+            dashboard._on_delete()
+
+        mock_confirm.assert_called_once()  # exactly one confirmation, not one per interview
+        for iid in iids:
+            assert dashboard.watcher.db.get(iid) is None
+
+    def test_delete_declined_removes_nothing(self, tmp_path):
+        dashboard, iids = self._dashboard_with_interviews(tmp_path)
+
+        with patch("tkinter.messagebox.askyesno", return_value=False):
+            dashboard._on_delete()
+
+        for iid in iids:
+            assert dashboard.watcher.db.get(iid) is not None
+
+    def test_cancel_only_stops_selected_interviews_that_are_processing(self, tmp_path):
+        dashboard, iids = self._dashboard_with_interviews(tmp_path)
+        dashboard.watcher.status = {"processing_jobs": {iids[0]: {}, iids[2]: {}}}
+
+        dashboard._on_cancel()
+
+        cancelled_ids = {c.args[0] for c in dashboard.watcher.cancel_processing.call_args_list}
+        assert cancelled_ids == {iids[0], iids[2]}
+
+    def test_history_select_shows_a_summary_for_multiple_selected(self, tmp_path):
+        dashboard, _iids = self._dashboard_with_interviews(tmp_path)
+        dashboard._history_text = MagicMock()
+        dashboard._fb_frame = MagicMock()
+        dashboard._assessment_history_tree = MagicMock()
+        dashboard._assessment_history_tree.get_children.return_value = []
+        dashboard._assessment_history_preview = MagicMock()
+        dashboard._history_toggle_btn = MagicMock()
+
+        with patch("interview_analyzer.dashboard.render_into_text_widget") as mock_render:
+            dashboard._on_history_select()
+
+        mock_render.assert_called_once()
+        assert "3 interviews selected" in mock_render.call_args.args[1]

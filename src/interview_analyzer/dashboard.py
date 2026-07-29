@@ -931,7 +931,12 @@ class Dashboard:
         tree_frame.rowconfigure(0, weight=1)
 
         columns = ("started", "duration", "app", "status")
-        tree = ttk.Treeview(tree_frame, columns=columns, show="headings", selectmode="browse")
+        # "extended" (not "browse") -- lets the user ctrl/shift-click to
+        # select multiple rows for bulk actions (Reprocess, Delete, etc.,
+        # see _selected_records()/_on_reprocess/_on_delete). Single-target
+        # actions (View transcript/infographic, Play audio) stay gated to
+        # exactly one selection via _selected_record().
+        tree = ttk.Treeview(tree_frame, columns=columns, show="headings", selectmode="extended")
         tree.heading("started", text="Started")
         tree.heading("duration", text="Duration")
         tree.heading("app", text="App")
@@ -1179,28 +1184,53 @@ class Dashboard:
                     status_cell,
                 ),
             )
-        if selected and self._history_tree.exists(selected[0]):
-            self._history_tree.selection_set(selected[0])
+        still_present = [iid for iid in selected if self._history_tree.exists(iid)]
+        if still_present:
+            self._history_tree.selection_set(still_present)
         self._update_action_buttons()
 
     def _on_refresh_history(self) -> None:
         self._refresh_history()
         self._wake_ollama_async()
 
+    def _selected_records(self) -> list:
+        """Every currently-selected interview, in tree order -- feeds the
+        bulk actions (Reprocess, Reprocess with different profile, Delete,
+        Cancel processing). Skips an id that no longer resolves to a real
+        record (e.g. deleted out from under a stale selection) rather than
+        raising."""
+        records = []
+        for iid in self._history_tree.selection():
+            record = self.watcher.db.get(int(iid))
+            if record is not None:
+                records.append(record)
+        return records
+
     def _selected_record(self):
-        selection = self._history_tree.selection()
-        if not selection:
-            return None
-        return self.watcher.db.get(int(selection[0]))
+        """The single selected interview, or None -- including when
+        MULTIPLE rows are selected, so a caller written for "the one
+        selected interview" (View transcript/infographic, Play audio, the
+        feedback panel) safely no-ops/disables itself under a multi-select
+        instead of silently acting on just the first one."""
+        records = self._selected_records()
+        return records[0] if len(records) == 1 else None
 
     def _update_action_buttons(self) -> None:
-        record = self._selected_record()
+        records = self._selected_records()
+        record = records[0] if len(records) == 1 else None
         status = self.watcher.status
-        is_recording_this = record is not None and status.get("interview_id") == record.id
-        is_processing_this = record is not None and record.id in (status.get("processing_jobs") or {})
-        busy = is_recording_this or is_processing_this
+        processing_jobs = status.get("processing_jobs") or {}
+        recording_id = status.get("interview_id")
 
-        can_do_reprocess = record is not None and can_reprocess(record) and not busy
+        def _is_busy(r) -> bool:
+            return r.id == recording_id or r.id in processing_jobs
+
+        # Bulk-capable buttons (Reprocess, Reprocess with different
+        # profile, Delete, Cancel) enable whenever AT LEAST ONE selected
+        # interview is eligible -- the action itself (see _on_reprocess et
+        # al.) then just skips whichever selected interviews aren't, same
+        # as a single selection already silently required eligibility.
+        can_do_reprocess = any(can_reprocess(r) and not _is_busy(r) for r in records)
         self._reprocess_btn.config(state="normal" if can_do_reprocess else "disabled")
         # Unlike plain Reprocess (which only exists to recover a *missing*
         # report and hides itself once one exists -- see can_reprocess),
@@ -1208,8 +1238,12 @@ class Dashboard:
         # deliberate choice the user can make on an already-successful
         # interview too -- gated only on real audio still being on disk,
         # not on whether a report already exists.
-        can_reprocess_with_profile = record is not None and has_audio(record) and not busy
+        can_reprocess_with_profile = any(has_audio(r) and not _is_busy(r) for r in records)
         self._reprocess_with_profile_btn.config(state="normal" if can_reprocess_with_profile else "disabled")
+
+        # Single-target-only buttons -- viewing/playing a specific thing
+        # doesn't generalize to a multi-selection, so these stay disabled
+        # (record is None) whenever more than one row is selected.
         can_play = record is not None and has_audio(record)
         self._open_audio_btn.config(state="normal" if can_play else "disabled")
         if self._history_view_mode == "transcript":
@@ -1228,9 +1262,11 @@ class Dashboard:
             and not record.analysis.get("no_speech_detected")
         )
         self._view_infographic_btn.config(state="normal" if can_view_infographic else "disabled")
-        can_delete = record is not None and not busy
+
+        can_delete = any(not _is_busy(r) for r in records)
         self._delete_btn.config(state="normal" if can_delete else "disabled")
-        self._cancel_btn.config(state="normal" if is_processing_this else "disabled")
+        can_cancel = any(r.id in processing_jobs for r in records)
+        self._cancel_btn.config(state="normal" if can_cancel else "disabled")
         # the View transcript/View Analysis toggle above can change that
         # button's text (and therefore its width) without any window
         # resize firing -- re-run the reflow so its row doesn't stay
@@ -1238,19 +1274,31 @@ class Dashboard:
         self._reflow_history_toolbar()
 
     def _on_cancel(self) -> None:
-        record = self._selected_record()
-        if record is None:
-            return
-        self.watcher.cancel_processing(record.id)
+        processing_jobs = self.watcher.status.get("processing_jobs") or {}
+        for record in self._selected_records():
+            if record.id in processing_jobs:
+                self.watcher.cancel_processing(record.id)
 
     def _on_history_select(self) -> None:
         self._history_view_mode = "report"
         record = self._selected_record()
+        selected_count = len(self._selected_records())
         self._update_action_buttons()
         self._history_text.config(state="normal")
         jobs = self.watcher.status.get("processing_jobs", {})
         show_feedback = False
-        if record is None:
+        if selected_count > 1:
+            # multiple interviews selected -- there's no single report to
+            # show, so point at the bulk toolbar actions instead of just
+            # leaving the pane blank (which used to be indistinguishable
+            # from "nothing selected at all")
+            render_into_text_widget(
+                self._history_text,
+                f"# {selected_count} interviews selected\n\n"
+                "Use the toolbar buttons above (Reprocess, Delete, etc.) to act on all of them "
+                "at once, or select just one to view its report/transcript.",
+            )
+        elif record is None:
             self._history_text.delete("1.0", "end")
         elif record.id in jobs:
             render_into_text_widget(
@@ -1346,39 +1394,53 @@ class Dashboard:
         self._assessment_history_preview.config(state="disabled")
 
     def _on_reprocess(self) -> None:
-        record = self._selected_record()
-        if record is None or not can_reprocess(record):
+        """Reprocesses every selected interview that's eligible
+        (can_reprocess() and not already busy) -- a single selection is
+        just the n=1 case of this same bulk path."""
+        processing_jobs = self.watcher.status.get("processing_jobs") or {}
+        interview_ids = [
+            r.id for r in self._selected_records()
+            if can_reprocess(r) and r.id not in processing_jobs
+        ]
+        if not interview_ids:
             return
-        if record.id in (self.watcher.status.get("processing_jobs") or {}):
-            return  # already busy (button should be disabled already; this is a defensive belt-and-braces check)
         self._reprocess_btn.config(state="disabled")
         self._reprocess_with_profile_btn.config(state="disabled")
-        self._run_reprocess_in_background(record.id)
+        self._run_reprocess_sequence(interview_ids)
 
     def _on_reprocess_with_profile(self) -> None:
         """Like _on_reprocess, but first shows the same confirm/edit
-        profile dialog used at recording time (profile_confirm.py),
-        prefilled from this interview's current stored profile -- lets the
-        user redo the analysis under different role/seniority/industry/
-        competency settings without affecting the original recording."""
-        record = self._selected_record()
-        if record is None or not has_audio(record):
+        profile dialog used at recording time (profile_confirm.py) ONCE,
+        prefilled from the first eligible selected interview's current
+        profile, then applies whatever profile is confirmed to EVERY
+        eligible selected interview -- lets the user redo the analysis for
+        one or many interviews under different role/seniority/industry/
+        competency settings without affecting the original recordings."""
+        processing_jobs = self.watcher.status.get("processing_jobs") or {}
+        candidates = [r for r in self._selected_records() if has_audio(r) and r.id not in processing_jobs]
+        if not candidates:
             return
-        if record.id in (self.watcher.status.get("processing_jobs") or {}):
-            return
-        interview_id = record.id
-        current_profile = record.profile or GENERIC_PROFILE
-        if record.profile is not None:
-            intro_text = (
-                "This interview's current analysis was run with the profile below.\n"
-                "Adjust anything and confirm to redo the assessment with different settings\n"
-                "-- only the assessment is redone, the transcript stays exactly as-is."
-            )
+        interview_ids = [r.id for r in candidates]
+        current_profile = candidates[0].profile or GENERIC_PROFILE
+        if len(candidates) == 1:
+            if candidates[0].profile is not None:
+                intro_text = (
+                    "This interview's current analysis was run with the profile below.\n"
+                    "Adjust anything and confirm to redo the assessment with different settings\n"
+                    "-- only the assessment is redone, the transcript stays exactly as-is."
+                )
+            else:
+                intro_text = (
+                    "This interview has no saved profile yet (it predates this feature, or none "
+                    "was set).\nPick settings below and confirm to redo the assessment with them\n"
+                    "-- only the assessment is redone, the transcript stays exactly as-is."
+                )
         else:
             intro_text = (
-                "This interview has no saved profile yet (it predates this feature, or none "
-                "was set).\nPick settings below and confirm to redo the assessment with them\n"
-                "-- only the assessment is redone, the transcript stays exactly as-is."
+                f"Redo the assessment for all {len(candidates)} selected interviews with the profile "
+                "below (prefilled from the first selected interview's current profile).\n"
+                "Adjust anything and confirm to apply it to ALL of them -- only each assessment is "
+                "redone, transcripts stay exactly as-is."
             )
         self._reprocess_btn.config(state="disabled")
         self._reprocess_with_profile_btn.config(state="disabled")
@@ -1390,12 +1452,23 @@ class Dashboard:
             # would deadlock if called directly from a button's own
             # click handler (the same thread that needs to run the dialog).
             chosen_profile = confirm_profile(current_profile, ui_root=self._root, intro_text=intro_text)
-            self._run_reprocess(interview_id, profile=chosen_profile)
+            self._run_reprocess_sequence(interview_ids, profile=chosen_profile)
 
         threading.Thread(target=_confirm_then_reprocess, daemon=True).start()
 
-    def _run_reprocess_in_background(self, interview_id: int, profile: Optional[AssessmentProfile] = None) -> None:
-        threading.Thread(target=self._run_reprocess, args=(interview_id, profile), daemon=True).start()
+    def _run_reprocess_sequence(self, interview_ids: list, profile: Optional[AssessmentProfile] = None) -> None:
+        """Reprocesses each of `interview_ids` in turn, one after another,
+        all on ONE background thread -- deliberately not one thread per
+        interview even though reprocess_interview supports running several
+        different interviews concurrently (see its docstring), since
+        firing off many simultaneous local transcription/LLM calls at once
+        would contend for the same limited CPU/GPU/Ollama resources
+        instead of actually finishing any of them faster."""
+        threading.Thread(target=self._run_reprocess_each, args=(interview_ids, profile), daemon=True).start()
+
+    def _run_reprocess_each(self, interview_ids: list, profile: Optional[AssessmentProfile] = None) -> None:
+        for interview_id in interview_ids:
+            self._run_reprocess(interview_id, profile=profile)
 
     def _run_reprocess(self, interview_id: int, profile: Optional[AssessmentProfile] = None) -> None:
         """Shared body for reprocessing (with or without a profile
@@ -1517,28 +1590,38 @@ class Dashboard:
             text_widget.insert("end", paragraph_text + "\n\n", (body_tag,))
 
     def _on_delete(self) -> None:
-        record = self._selected_record()
-        if record is None:
+        processing_jobs = self.watcher.status.get("processing_jobs") or {}
+        records = [r for r in self._selected_records() if r.id not in processing_jobs]
+        if not records:
             return
-        if record.id in (self.watcher.status.get("processing_jobs") or {}):
-            return  # still being processed -- shouldn't happen since the button is disabled then, but be safe
         import tkinter.messagebox as messagebox
 
-        confirmed = messagebox.askyesno(
-            "Delete interview",
-            f"Delete the {format_started(record)} interview ({record.source_app or 'unknown app'})?\n\n"
-            "This also removes its audio and report files from disk, and can't be undone.",
-            parent=self._root,
-        )
+        if len(records) == 1:
+            record = records[0]
+            prompt = (
+                f"Delete the {format_started(record)} interview ({record.source_app or 'unknown app'})?\n\n"
+                "This also removes its audio and report files from disk, and can't be undone."
+            )
+        else:
+            listing = "\n".join(
+                f"  • {format_started(r)} ({r.source_app or 'unknown app'})" for r in records
+            )
+            prompt = (
+                f"Delete these {len(records)} interviews?\n\n{listing}\n\n"
+                "This also removes their audio and report files from disk, and can't be undone."
+            )
+        confirmed = messagebox.askyesno("Delete interview" if len(records) == 1 else "Delete interviews",
+                                         prompt, parent=self._root)
         if not confirmed:
             return
-        for path_str in (record.audio_path, record.report_path):
-            if path_str:
-                try:
-                    pathlib.Path(path_str).unlink(missing_ok=True)
-                except OSError:
-                    logger.warning("Couldn't delete file %s for interview #%s", path_str, record.id)
-        self.watcher.db.delete_interview(record.id)
+        for record in records:
+            for path_str in (record.audio_path, record.report_path):
+                if path_str:
+                    try:
+                        pathlib.Path(path_str).unlink(missing_ok=True)
+                    except OSError:
+                        logger.warning("Couldn't delete file %s for interview #%s", path_str, record.id)
+            self.watcher.db.delete_interview(record.id)
         self._refresh_history()
         self._history_text.config(state="normal")
         self._history_text.delete("1.0", "end")
