@@ -4,6 +4,7 @@ from interview_analyzer.config_loader import Config
 from interview_analyzer.db import InterviewRecord
 from interview_analyzer.profiles import AssessmentProfile
 from interview_analyzer.report import (
+    aggregate_trends,
     render_interview_report_markdown,
     trends_report_path,
     write_interview_report,
@@ -21,11 +22,11 @@ def _config(tmp_path) -> Config:
     })
 
 
-def _record(id_, source_app, analysis, report_path=None) -> InterviewRecord:
+def _record(id_, source_app, analysis, report_path=None, started_at="2026-07-10T10:00:00") -> InterviewRecord:
     return InterviewRecord(
         id=id_,
         user_id=1,
-        started_at="2026-07-10T10:00:00",
+        started_at=started_at,
         ended_at="2026-07-10T10:30:00",
         source_app=source_app,
         audio_path=None,
@@ -316,6 +317,61 @@ def test_write_trends_report_includes_competency_averages_weakest_first(tmp_path
     execution_pos = content.index("Execution")
     assert leadership_pos < execution_pos  # weaker average (50) listed before stronger (90)
     assert "across 2 interview(s)" in content  # Leadership scored in both
+
+
+class TestAggregateTrendsCompetencySeries:
+    """The chronological per-competency (date, score) series
+    infographic.py's trend sparklines plot -- see aggregate_trends'
+    docstring for why this relies on `records` already being in
+    chronological order."""
+
+    def test_builds_a_chronological_series_per_competency(self, tmp_path):
+        analysis_a = {
+            "qa_pairs": [], "session_summary": {
+                "top_strengths": [], "top_issues": [], "one_thing_to_practice_next": "",
+                "competency_scores": [{"name": "Leadership", "score": 40, "remark": ""}],
+            },
+        }
+        analysis_b = {
+            "qa_pairs": [], "session_summary": {
+                "top_strengths": [], "top_issues": [], "one_thing_to_practice_next": "",
+                "competency_scores": [{"name": "Leadership", "score": 65, "remark": ""}],
+            },
+        }
+        records = [
+            _record(1, "Zoom", analysis_a, started_at="2026-07-01T10:00:00"),
+            _record(2, "Teams", analysis_b, started_at="2026-07-15T10:00:00"),
+        ]
+
+        agg = aggregate_trends(records)
+
+        assert agg["competency_series"]["Leadership"] == [("2026-07-01", 40), ("2026-07-15", 65)]
+
+    def test_competencies_scored_in_only_some_interviews_only_get_those_entries(self, tmp_path):
+        analysis_a = {
+            "qa_pairs": [], "session_summary": {
+                "top_strengths": [], "top_issues": [], "one_thing_to_practice_next": "",
+                "competency_scores": [{"name": "Leadership", "score": 40, "remark": ""}],
+            },
+        }
+        analysis_b = {
+            "qa_pairs": [], "session_summary": {
+                "top_strengths": [], "top_issues": [], "one_thing_to_practice_next": "",
+                "competency_scores": [{"name": "Execution", "score": 70, "remark": ""}],
+            },
+        }
+        records = [
+            _record(1, "Zoom", analysis_a, started_at="2026-07-01T10:00:00"),
+            _record(2, "Teams", analysis_b, started_at="2026-07-15T10:00:00"),
+        ]
+
+        agg = aggregate_trends(records)
+
+        assert len(agg["competency_series"]["Leadership"]) == 1
+        assert len(agg["competency_series"]["Execution"]) == 1
+
+    def test_empty_when_no_analyzed_interviews(self, tmp_path):
+        assert aggregate_trends([])["competency_series"] == {}
 
 
 class TestInterviewReportProfileFields:

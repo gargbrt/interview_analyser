@@ -5,6 +5,7 @@ Trends tab."""
 from __future__ import annotations
 
 import json
+import re
 
 from interview_analyzer.config_loader import Config
 from interview_analyzer.db import InterviewRecord
@@ -807,3 +808,119 @@ class TestTrendsInfographic:
         content = write_trends_infographic(records, cfg, user_id=1).read_text(encoding="utf-8")
 
         assert "Competency averages" not in content
+
+
+class TestTrendSparklines:
+    """The "Progress over time" section: a small-multiples grid of
+    per-competency sparkline cards, added so a candidate can see whether
+    they're actually improving in each area across interviews, not just
+    their current average -- see _competency_trend_card_svg."""
+
+    def _analysis(self, scores: dict):
+        return json.dumps({
+            "qa_pairs": [], "session_summary": {
+                "top_strengths": [], "top_issues": [], "one_thing_to_practice_next": "",
+                "competency_scores": [{"name": n, "score": s, "remark": ""} for n, s in scores.items()],
+            },
+        })
+
+    def test_renders_a_card_for_a_competency_scored_across_two_or_more_interviews(self, tmp_path):
+        cfg = _cfg(tmp_path)
+        records = [
+            _record(tmp_path, id=1, started_at="2026-06-01T10:00:00",
+                    analysis_json=self._analysis({"Leadership": 40})),
+            _record(tmp_path, id=2, started_at="2026-06-15T10:00:00",
+                    analysis_json=self._analysis({"Leadership": 65})),
+        ]
+
+        content = write_trends_infographic(records, cfg, user_id=1).read_text(encoding="utf-8")
+
+        assert "Progress over time" in content
+        assert '<div class="trend-card">' in content
+        assert "Leadership" in content
+        assert "2026-06-01" in content
+        assert "2026-06-15" in content
+
+    def test_omits_a_competency_scored_in_only_one_interview(self, tmp_path):
+        cfg = _cfg(tmp_path)
+        records = [
+            _record(tmp_path, id=1, analysis_json=self._analysis({"Leadership": 40, "Execution": 70})),
+            _record(tmp_path, id=2, analysis_json=self._analysis({"Execution": 68})),
+        ]
+
+        content = write_trends_infographic(records, cfg, user_id=1).read_text(encoding="utf-8")
+
+        # Execution has 2 data points and gets a card; Leadership has only 1
+        assert '<div class="trend-card">' in content
+        leadership_card = re.search(r'trend-card-name">Leadership<', content)
+        assert leadership_card is None
+
+    def test_shows_an_upward_delta_for_an_improving_competency(self, tmp_path):
+        cfg = _cfg(tmp_path)
+        records = [
+            _record(tmp_path, id=1, started_at="2026-06-01T10:00:00",
+                    analysis_json=self._analysis({"Leadership": 40})),
+            _record(tmp_path, id=2, started_at="2026-06-15T10:00:00",
+                    analysis_json=self._analysis({"Leadership": 65})),
+        ]
+
+        content = write_trends_infographic(records, cfg, user_id=1).read_text(encoding="utf-8")
+
+        assert "color:var(--good);" in content
+        assert "&#9650; 25" in content  # ▲ +25
+
+    def test_shows_a_downward_delta_for_a_declining_competency(self, tmp_path):
+        cfg = _cfg(tmp_path)
+        records = [
+            _record(tmp_path, id=1, started_at="2026-06-01T10:00:00",
+                    analysis_json=self._analysis({"Leadership": 70})),
+            _record(tmp_path, id=2, started_at="2026-06-15T10:00:00",
+                    analysis_json=self._analysis({"Leadership": 55})),
+        ]
+
+        content = write_trends_infographic(records, cfg, user_id=1).read_text(encoding="utf-8")
+
+        assert "color:var(--bad);" in content
+        assert "&#9660; 15" in content  # ▼ -15
+
+    def test_most_declined_competency_listed_first(self, tmp_path):
+        cfg = _cfg(tmp_path)
+        records = [
+            _record(tmp_path, id=1, started_at="2026-06-01T10:00:00",
+                    analysis_json=self._analysis({"Leadership": 40, "Execution": 70})),
+            _record(tmp_path, id=2, started_at="2026-06-15T10:00:00",
+                    analysis_json=self._analysis({"Leadership": 65, "Execution": 60})),
+        ]
+
+        content = write_trends_infographic(records, cfg, user_id=1).read_text(encoding="utf-8")
+        # scope to the trend-grid section itself -- both names also appear
+        # earlier, in the "Competency averages" list, which is sorted by
+        # average SCORE, not by trend delta, so searching the whole page
+        # would compare the wrong occurrence.
+        trend_section = content[content.index('<div class="trend-grid">'):]
+
+        # Execution declined (70->60), Leadership improved (40->65) --
+        # worst-first convention (same as the averages list) puts the
+        # decliner ahead of the improver
+        assert trend_section.index("Execution") < trend_section.index("Leadership")
+
+    def test_no_trend_section_when_nothing_has_two_data_points(self, tmp_path):
+        cfg = _cfg(tmp_path)
+        records = [_record(tmp_path, id=1, analysis_json=self._analysis({"Leadership": 40}))]
+
+        content = write_trends_infographic(records, cfg, user_id=1).read_text(encoding="utf-8")
+
+        assert "Progress over time" in content
+        # "trend-card" alone also matches the static CSS class definition
+        # (always present in the <style> block) -- check for an actual
+        # rendered card element, not just the class name existing anywhere.
+        assert '<div class="trend-card">' not in content
+        assert "will appear here once a competency has been scored" in content
+
+    def test_no_progress_heading_at_all_with_zero_competency_scores(self, tmp_path):
+        cfg = _cfg(tmp_path)
+        records = [_record(tmp_path, id=1)]  # VALID_ANALYSIS has no competency_scores
+
+        content = write_trends_infographic(records, cfg, user_id=1).read_text(encoding="utf-8")
+
+        assert "Progress over time" not in content

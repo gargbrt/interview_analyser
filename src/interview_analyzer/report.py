@@ -301,12 +301,17 @@ def trends_report_path(cfg: Config, user_id: Optional[int] = None) -> pathlib.Pa
 
 
 def aggregate_trends(records: list[InterviewRecord]) -> dict:
-    """Counts recurring issues/strengths across every analyzed interview in
-    `records` -- shared by write_trends_report (markdown) and
-    infographic.py's write_trends_infographic (HTML bar charts), so the two
-    can never disagree about what "most frequent" means. Records with no
-    usable analysis (parse_error, no_speech_detected, or none at all) are
-    skipped, same as an individual report would treat them."""
+    """Counts recurring issues/strengths, and tracks each competency's score
+    over time, across every analyzed interview in `records` -- shared by
+    write_trends_report (markdown) and infographic.py's
+    write_trends_infographic (HTML bar charts + per-competency trend
+    sparklines), so the two can never disagree about what "most frequent"
+    (or "trending up/down") means. Records with no usable analysis
+    (parse_error, no_speech_detected, or none at all) are skipped, same as
+    an individual report would treat them. Requires `records` already in
+    chronological order (db.py's list_all() returns started_at ASC) --
+    this function doesn't re-sort, so competency_series below is only
+    chronological if its input was."""
     issue_counter: collections.Counter[str] = collections.Counter()
     strength_counter: collections.Counter[str] = collections.Counter()
     # {competency name: [score, score, ...]} across every interview that
@@ -314,6 +319,13 @@ def aggregate_trends(records: list[InterviewRecord]) -> dict:
     # write_trends_report's "Competency averages" section and
     # infographic.py's matching bar chart).
     competency_scores: dict[str, list[float]] = collections.defaultdict(list)
+    # {competency name: [(date, score), ...]}, in the same chronological
+    # order as `records` (list_all() already returns started_at ASC) --
+    # the per-competency time series infographic.py's trend sparklines
+    # plot. Kept separate from competency_scores above rather than zipping
+    # dates back in later, since not every interview scores every
+    # competency (a differently-configured profile might skip some).
+    competency_series: dict[str, list[tuple[str, float]]] = collections.defaultdict(list)
     analyzed_count = 0
 
     for record in records:
@@ -337,11 +349,13 @@ def aggregate_trends(records: list[InterviewRecord]) -> dict:
             score = entry.get("score")
             if name and isinstance(score, (int, float)) and not isinstance(score, bool):
                 competency_scores[name].append(score)
+                competency_series[name].append((record.started_at.split("T")[0], score))
 
     return {
         "issue_counter": issue_counter,
         "strength_counter": strength_counter,
         "competency_scores": dict(competency_scores),
+        "competency_series": dict(competency_series),
         "analyzed_count": analyzed_count,
     }
 

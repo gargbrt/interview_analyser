@@ -717,6 +717,63 @@ def trends_infographic_path(cfg: Config, user_id: Optional[int] = None) -> pathl
     return md_path.with_name(f"{md_path.stem}_infographic.html")
 
 
+def _competency_trend_card_svg(name: str, series: list[tuple[str, float]]) -> str:
+    """A compact sparkline card for one competency's score history over
+    time -- small multiples (one focused mini-chart per competency)
+    instead of a single chart with all of them overlaid, which would be
+    unreadable with a dozen crossing lines. Only meaningful for a
+    competency scored in 2+ interviews (see _render_trends, which filters
+    before calling this) -- a single point can't show a trend.
+
+    Line/dot color follows the same continuous red-to-green
+    _score_to_color gradient the competency bars elsewhere on this page
+    already use for the latest score, so a card reads consistently with
+    the rest of the page at a glance."""
+    n = len(series)
+    first_date, first_score = series[0]
+    last_date, last_score = series[-1]
+    delta = last_score - first_score
+
+    chart_w, chart_h, pad = 176, 52, 6
+    step = chart_w / (n - 1) if n > 1 else 0
+    points = [
+        (i * step, pad + (chart_h - 2 * pad) * (1 - max(0, min(100, score)) / 100))
+        for i, (_date, score) in enumerate(series)
+    ]
+    line_color = _score_to_color(last_score)
+    polyline_points = " ".join(f"{x:.1f},{y:.1f}" for x, y in points)
+    area_points = f"0,{chart_h} {polyline_points} {chart_w},{chart_h}"
+    dots_svg = "".join(
+        f'<circle cx="{x:.1f}" cy="{y:.1f}" r="{3 if i in (0, n - 1) else 2}" style="fill:{line_color};"/>'
+        for i, (x, y) in enumerate(points)
+    )
+
+    if delta > 0:
+        delta_symbol, delta_var = "&#9650;", "var(--good)"  # ▲
+    elif delta < 0:
+        delta_symbol, delta_var = "&#9660;", "var(--bad)"  # ▼
+    else:
+        delta_symbol, delta_var = "&#8594;", "var(--ink-faint)"  # →
+
+    return f"""<div class="trend-card">
+<div class="trend-card-head">
+<span class="trend-card-name">{_e(name)}</span>
+<span class="trend-card-delta" style="color:{delta_var};">{delta_symbol} {abs(delta):.0f}</span>
+</div>
+<svg width="{chart_w}" height="{chart_h}" viewBox="0 0 {chart_w} {chart_h}" role="img"
+     aria-label="{_e(name)} score trend: {first_score:.0f} on {first_date} to {last_score:.0f} on {last_date}, across {n} interviews">
+<polygon points="{area_points}" style="fill:{line_color};" opacity="0.08"/>
+<polyline points="{polyline_points}" fill="none" style="stroke:{line_color};" stroke-width="2"
+          stroke-linecap="round" stroke-linejoin="round"/>
+{dots_svg}
+</svg>
+<div class="trend-card-foot">
+<span>{_e(first_date)}: {first_score:.0f}</span>
+<span>{_e(last_date)}: {last_score:.0f}</span>
+</div>
+</div>"""
+
+
 def _bar_rows_html(items: list[tuple[str, int]], color: str, tint: str) -> str:
     if not items:
         return '<p class="empty-note">None flagged yet.</p>'
@@ -751,6 +808,7 @@ def _render_trends(records: list[InterviewRecord]) -> str:
         agg["issue_counter"], agg["strength_counter"], agg["analyzed_count"],
     )
     competency_scores = agg["competency_scores"]
+    competency_series = agg["competency_series"]
     updated = dt.datetime.now().strftime("%Y-%m-%d %H:%M")
     title = "Interview trends"
 
@@ -782,6 +840,31 @@ def _render_trends(records: list[InterviewRecord]) -> str:
   <div class="competency-list">{"".join(_competency_row_html(e) for e in competency_entries)}</div>"""
             if competency_entries else ""
         )
+
+        # Only a competency scored across 2+ interviews can show a trend at
+        # all -- one with a single data point stays in the averages list
+        # above but has nothing to plot here. Most-declined first, same
+        # "worst thing first" convention as the averages list and the
+        # issues panel above, so this reads consistently with the rest of
+        # the page rather than introducing a different sort order.
+        trending = sorted(
+            (
+                (name, series) for name, series in competency_series.items() if len(series) >= 2
+            ),
+            key=lambda item: item[1][-1][1] - item[1][0][1],
+        )
+        trend_block = ""
+        if trending:
+            trend_cards = "".join(_competency_trend_card_svg(name, series) for name, series in trending)
+            trend_block = f"""<p class="qa-heading">Progress over time</p>
+  <div class="trend-grid">{trend_cards}</div>"""
+        elif competency_entries:
+            trend_block = (
+                '<p class="qa-heading">Progress over time</p>'
+                '<p class="empty-note">Trend charts will appear here once a competency has been scored '
+                "across 2 or more interviews.</p>"
+            )
+
         body = f"""<div class="columns">
     <div class="panel issues">
       <h2><span class="dot"></span>Most frequent issues</h2>
@@ -794,6 +877,8 @@ def _render_trends(records: list[InterviewRecord]) -> str:
   </div>
 
   {competency_block}
+
+  {trend_block}
 
   <p class="qa-heading">All interviews</p>
   <ul class="interview-list">{interview_rows}</ul>"""
@@ -847,6 +932,13 @@ body {{ background: var(--ground); margin: 0; }}
 .competency-name {{ font-size: 13.5px; font-weight: 600; }}
 .competency-score {{ font-family: var(--font-mono); font-size: 12px; color: var(--ink-soft); }}
 .competency-remark {{ font-size: 13px; color: var(--ink-soft); line-height: 1.5; margin: .5rem 0 0; }}
+.trend-grid {{ display: grid; grid-template-columns: repeat(auto-fill, minmax(190px, 1fr)); gap: .75rem; margin-bottom: 2rem; }}
+.trend-card {{ background: var(--panel); border: 1px solid var(--line); border-radius: 12px; padding: .75rem .9rem; }}
+.trend-card-head {{ display: flex; justify-content: space-between; align-items: baseline; margin-bottom: .3rem; }}
+.trend-card-name {{ font-size: 12.5px; font-weight: 600; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }}
+.trend-card-delta {{ font-family: var(--font-mono); font-size: 11px; font-weight: 700; white-space: nowrap; padding-left: .5rem; }}
+.trend-card svg {{ display: block; width: 100%; height: auto; }}
+.trend-card-foot {{ display: flex; justify-content: space-between; font-family: var(--font-mono); font-size: 10.5px; color: var(--ink-faint); margin-top: .3rem; }}
 .interview-list {{ list-style: none; margin: 0; padding: 0; background: var(--panel); border: 1px solid var(--line); border-radius: 12px; overflow: hidden; }}
 .interview-list li {{ display: grid; grid-template-columns: 100px minmax(0,1fr) minmax(0,1fr); gap: .75rem; padding: .6rem 1rem; font-size: 12.5px; border-bottom: 1px solid var(--line); }}
 .interview-list li:last-child {{ border-bottom: none; }}
