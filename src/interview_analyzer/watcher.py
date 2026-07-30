@@ -38,6 +38,7 @@ from .consent import ask_consent
 from .control_panel import RecordingControlPanel
 from .db import InterviewDB
 from .live_transcribe import LiveTranscriptionWorker
+from . import model_catalog
 from .profile_confirm import confirm_profile
 from .profiles import AssessmentProfile, GENERIC_PROFILE
 from .recorder import SystemAudioRecorder
@@ -46,6 +47,11 @@ from .report import write_interview_report, write_trends_report
 from .transcriber import TranscriptionCancelled, get_audio_duration_seconds, transcribe
 
 logger = logging.getLogger(__name__)
+
+# How often _maybe_refresh_model_catalog re-checks when there's no Groq key
+# saved yet (model_catalog.should_check's own 15-day interval only applies
+# once a key exists and a real attempt was recorded -- see its docstring).
+_MODEL_CATALOG_RETRY_COOLDOWN_SECONDS = 3600
 
 # Reserved, auto-managed profile template name -- see _confirm_and_save_profile,
 # which upserts whatever profile the user just confirmed under this name and
@@ -328,6 +334,16 @@ class MeetingWatcher:
         # recording/processing-job transition -- the tray icon and
         # dashboard use this to refresh instead of polling internal state
         self._on_state_change = on_state_change
+        # background thread for the periodic Groq model-catalog refresh
+        # (see model_catalog.py) -- _maybe_refresh_model_catalog guards
+        # against starting a second one while one's already in flight.
+        self._model_catalog_refresh_thread: Optional[threading.Thread] = None
+        # in-memory only (resets on restart) -- bounds how often we retry
+        # when there's no Groq key saved yet, since model_catalog's own
+        # persisted last_checked is deliberately NOT bumped in that case
+        # (see refresh_model_catalog's docstring), which would otherwise
+        # mean re-attempting on every single poll tick forever.
+        self._model_catalog_last_attempt_at: float = 0.0
 
     def set_ui_root(self, ui_root: Optional[object]) -> None:
         """Register (or clear, with None) the shared dashboard Tk root that
@@ -450,7 +466,32 @@ class MeetingWatcher:
                 run_cleanup(self.db)
             except Exception:  # noqa: BLE001
                 logger.exception("Retention cleanup failed; continuing")
+            try:
+                self._maybe_refresh_model_catalog()
+            except Exception:  # noqa: BLE001
+                logger.exception("Model catalog refresh check failed; continuing")
             time.sleep(self.cfg.poll_interval_seconds)
+
+    def _maybe_refresh_model_catalog(self) -> None:
+        """Kicks off a background Groq model-catalog refresh (see
+        model_catalog.py) when one is actually due -- covers both "every
+        CHECK_INTERVAL_DAYS days" and "the very first tick after a fresh
+        install", since a brand new install has no state file yet and
+        model_catalog.should_check() treats that the same as overdue.
+        Cheap to call every tick: the real network call only happens on a
+        background thread, and only when nothing's already in flight."""
+        if self._model_catalog_refresh_thread is not None and self._model_catalog_refresh_thread.is_alive():
+            return
+        now = time.time()
+        if now - self._model_catalog_last_attempt_at < _MODEL_CATALOG_RETRY_COOLDOWN_SECONDS:
+            return
+        if not model_catalog.should_check(self.cfg):
+            return
+        self._model_catalog_last_attempt_at = now
+        self._model_catalog_refresh_thread = threading.Thread(
+            target=model_catalog.refresh_model_catalog, args=(self.cfg,), daemon=True,
+        )
+        self._model_catalog_refresh_thread.start()
 
     def _is_declined_and_not_expired(self, app_name: str) -> bool:
         declined_at = self._declined_this_session.get(app_name)

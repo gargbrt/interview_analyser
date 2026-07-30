@@ -25,6 +25,7 @@ from . import api_keys
 from .confidence import format_confidence
 from .infographic import write_interview_infographic, write_trends_infographic
 from .language_packs import LANGUAGE_PACKS, PackActionDialog, is_pack_installed
+from . import model_catalog
 from .model_setup import (
     MODEL_CATALOG,
     ModelInstallDialog,
@@ -388,6 +389,7 @@ class Dashboard:
         self._fb_confidence_label = None
         self._model_name_entry = None
         self._model_status_label = None
+        self._analysis_engine_combo = None
         self._api_key_provider = None
         self._api_key_entry = None
         self._api_key_status_label = None
@@ -1822,19 +1824,24 @@ class Dashboard:
             foreground="#6b6b6b",
         ).grid(row=r, column=1, sticky="w"); r += 1
 
-        e = ttk.Combobox(form, values=_ANALYSIS_ENGINES, state="readonly", width=12)
-        e.set(current.get("analysis.engine", "ollama"))
-        _row(r, "Analysis engine", "analysis.engine", e); r += 1
+        engine_combo = ttk.Combobox(form, values=_ANALYSIS_ENGINES, state="readonly", width=12)
+        engine_combo.set(current.get("analysis.engine", "ollama"))
+        _row(r, "Analysis engine", "analysis.engine", engine_combo); r += 1
+        self._analysis_engine_combo = engine_combo
+        engine_combo.bind("<<ComboboxSelected>>", lambda _e: self._on_analysis_engine_changed())
 
         model_row = ttk.Frame(form)
-        # editable (not readonly) so a model outside the curated catalog can
-        # still be typed in directly -- the catalog is a convenience list,
-        # not the only thing this app can run
-        e = ttk.Combobox(model_row, values=list(MODEL_CATALOG.keys()), width=18)
+        # editable (not readonly) so a model outside the curated/fetched
+        # catalog can still be typed in directly -- the catalog is a
+        # convenience list, not the only thing this app can run
+        e = ttk.Combobox(model_row, values=self._model_catalog_values(engine_combo.get()), width=18)
         e.set(current.get("analysis.llm_model", ""))
         e.pack(side="left")
         self._model_name_entry = e
         ttk.Button(model_row, text="Install model...", command=self._on_install_model).pack(
+            side="left", padx=(8, 0)
+        )
+        ttk.Button(model_row, text="Refresh model list", command=self._on_refresh_model_catalog).pack(
             side="left", padx=(8, 0)
         )
         ttk.Label(form, text="Model name").grid(row=r, column=0, sticky="w", pady=4, padx=(0, 12))
@@ -2143,7 +2150,62 @@ class Dashboard:
         if not model_name:
             self._model_status_label.config(text="")
             return
+        engine = self._analysis_engine_combo.get() if self._analysis_engine_combo is not None else "ollama"
+        if engine != "ollama":
+            # size_label's "download size" framing only makes sense for a
+            # local Ollama model -- a cloud model like Groq's has no local
+            # download at all, so showing it here would be actively wrong,
+            # not just irrelevant.
+            self._model_status_label.config(text="")
+            return
         self._model_status_label.config(text=size_label(model_name))
+
+    def _model_catalog_values(self, engine: str) -> list[str]:
+        """Which model names populate the Model name dropdown for the
+        given analysis engine -- Groq's own (periodically refreshed, see
+        model_catalog.py) catalog for "groq_api", else the existing
+        hand-curated Ollama catalog (model_setup.py's MODEL_CATALOG),
+        which is unaffected by this feature."""
+        if engine == "groq_api":
+            return model_catalog.load_cached_models(self.watcher.cfg)
+        return list(MODEL_CATALOG.keys())
+
+    def _on_analysis_engine_changed(self) -> None:
+        """Repopulates the Model name dropdown's suggestions when the
+        Analysis engine dropdown changes, so switching to groq_api shows
+        Groq's own models instead of leftover Ollama catalog entries (and
+        vice versa) -- the current typed-in value is left as-is either
+        way, only the dropdown's suggestion list changes."""
+        if self._model_name_entry is None or self._analysis_engine_combo is None:
+            return
+        self._model_name_entry.config(values=self._model_catalog_values(self._analysis_engine_combo.get()))
+
+    def _on_refresh_model_catalog(self) -> None:
+        """Manual, on-demand version of the periodic background check in
+        watcher.py's _maybe_refresh_model_catalog -- lets a user with a
+        freshly-saved Groq key see its models immediately rather than
+        waiting for the next scheduled check."""
+        if self._model_status_label is not None:
+            self._model_status_label.config(text="Checking Groq for the latest models...")
+
+        def _do_refresh():
+            models = model_catalog.refresh_model_catalog(self.watcher.cfg)
+            if self._root is not None:
+                self._root.after(0, lambda: self._after_model_catalog_refresh(models))
+
+        threading.Thread(target=_do_refresh, daemon=True).start()
+
+    def _after_model_catalog_refresh(self, models: Optional[list[str]]) -> None:
+        if self._analysis_engine_combo is not None and self._analysis_engine_combo.get() == "groq_api":
+            self._on_analysis_engine_changed()
+        if self._model_status_label is None:
+            return
+        if models:
+            self._model_status_label.config(text=f"Refreshed -- {len(models)} model(s) available from Groq.")
+        else:
+            self._model_status_label.config(
+                text="Couldn't refresh (no Groq key saved yet, or the request failed)."
+            )
 
     def _on_install_model(self) -> None:
         from tkinter import messagebox

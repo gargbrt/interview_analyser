@@ -935,6 +935,87 @@ class TestReprocessWithDifferentProfile:
         dashboard.watcher.reprocess_interview.assert_called_once_with(iid, profile=chosen)
 
 
+class TestModelCatalogDropdown:
+    """The Settings tab's Model name dropdown -- populated from Groq's
+    periodically-refreshed catalog (model_catalog.py) when analysis.engine
+    is "groq_api", and from the existing hand-curated Ollama catalog
+    otherwise."""
+
+    def test_groq_engine_uses_the_cached_groq_catalog(self, tmp_path):
+        watcher = _watcher(tmp_path)
+        watcher.cfg.raw.setdefault("storage", {})["db_path"] = str(tmp_path / "interviews.db")
+        dashboard = Dashboard(watcher)
+        with patch(
+            "interview_analyzer.dashboard.model_catalog.load_cached_models",
+            return_value=["llama-3.3-70b-versatile", "gpt-oss-20b"],
+        ):
+            values = dashboard._model_catalog_values("groq_api")
+
+        assert values == ["llama-3.3-70b-versatile", "gpt-oss-20b"]
+
+    def test_ollama_engine_uses_the_hand_curated_catalog(self, tmp_path):
+        dashboard = Dashboard(_watcher(tmp_path))
+
+        values = dashboard._model_catalog_values("ollama")
+
+        assert "llama3.1:8b" in values
+
+    def test_changing_the_engine_repopulates_the_model_dropdown(self, tmp_path):
+        dashboard = Dashboard(_watcher(tmp_path))
+        dashboard._model_name_entry = MagicMock()
+        dashboard._analysis_engine_combo = MagicMock()
+        dashboard._analysis_engine_combo.get.return_value = "groq_api"
+
+        with patch(
+            "interview_analyzer.dashboard.model_catalog.load_cached_models",
+            return_value=["llama-3.3-70b-versatile"],
+        ):
+            dashboard._on_analysis_engine_changed()
+
+        dashboard._model_name_entry.config.assert_called_once_with(values=["llama-3.3-70b-versatile"])
+
+    def test_refresh_button_repopulates_on_success(self, tmp_path):
+        dashboard = Dashboard(_watcher(tmp_path))
+        dashboard._model_name_entry = MagicMock()
+        dashboard._analysis_engine_combo = MagicMock()
+        dashboard._analysis_engine_combo.get.return_value = "groq_api"
+        dashboard._model_status_label = MagicMock()
+
+        dashboard._after_model_catalog_refresh(["llama-3.3-70b-versatile", "gpt-oss-20b"])
+
+        dashboard._model_name_entry.config.assert_called_once()
+        dashboard._model_status_label.config.assert_called_with(
+            text="Refreshed -- 2 model(s) available from Groq."
+        )
+
+    def test_refresh_button_reports_failure(self, tmp_path):
+        dashboard = Dashboard(_watcher(tmp_path))
+        dashboard._model_name_entry = MagicMock()
+        dashboard._analysis_engine_combo = MagicMock()
+        dashboard._analysis_engine_combo.get.return_value = "groq_api"
+        dashboard._model_status_label = MagicMock()
+
+        dashboard._after_model_catalog_refresh(None)
+
+        assert "Couldn't refresh" in dashboard._model_status_label.config.call_args.kwargs["text"]
+
+    def test_status_label_is_blank_for_a_groq_model_instead_of_a_download_size(self, tmp_path):
+        """Regression coverage: size_label's "download size" framing only
+        makes sense for a local Ollama model -- showing it for a Groq
+        model (which has no local download at all) would be actively
+        wrong, not just irrelevant."""
+        dashboard = Dashboard(_watcher(tmp_path))
+        dashboard._model_status_label = MagicMock()
+        dashboard._model_name_entry = MagicMock()
+        dashboard._model_name_entry.get.return_value = "llama-3.3-70b-versatile"
+        dashboard._analysis_engine_combo = MagicMock()
+        dashboard._analysis_engine_combo.get.return_value = "groq_api"
+
+        dashboard._refresh_model_status_label()
+
+        dashboard._model_status_label.config.assert_called_with(text="")
+
+
 class TestPreviousAssessmentsSection:
     """The History tab's collapsible "Previous assessments" list, backed by
     db.list_analysis_history (see db.py's analysis_history table)."""
