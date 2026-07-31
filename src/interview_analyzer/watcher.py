@@ -473,23 +473,25 @@ class MeetingWatcher:
             time.sleep(self.cfg.poll_interval_seconds)
 
     def _maybe_refresh_model_catalog(self) -> None:
-        """Kicks off a background Groq model-catalog refresh (see
-        model_catalog.py) when one is actually due -- covers both "every
-        CHECK_INTERVAL_DAYS days" and "the very first tick after a fresh
-        install", since a brand new install has no state file yet and
-        model_catalog.should_check() treats that the same as overdue.
-        Cheap to call every tick: the real network call only happens on a
-        background thread, and only when nothing's already in flight."""
+        """Kicks off a background model-catalog refresh (see
+        model_catalog.py) for every engine (Groq, Anthropic, OpenAI -- see
+        ENGINES_WITH_REMOTE_CATALOGS) that's actually due -- covers both
+        "every CHECK_INTERVAL_DAYS days, per engine" and "the very first
+        tick after a fresh install", since a brand new install has no
+        state file yet and model_catalog.should_check() treats that the
+        same as overdue. Cheap to call every tick: the real network calls
+        only happen on a background thread, and only when nothing's
+        already in flight."""
         if self._model_catalog_refresh_thread is not None and self._model_catalog_refresh_thread.is_alive():
             return
         now = time.time()
         if now - self._model_catalog_last_attempt_at < _MODEL_CATALOG_RETRY_COOLDOWN_SECONDS:
             return
-        if not model_catalog.should_check(self.cfg):
+        if not model_catalog.any_check_due(self.cfg):
             return
         self._model_catalog_last_attempt_at = now
         self._model_catalog_refresh_thread = threading.Thread(
-            target=model_catalog.refresh_model_catalog, args=(self.cfg,), daemon=True,
+            target=model_catalog.refresh_due_catalogs, args=(self.cfg,), daemon=True,
         )
         self._model_catalog_refresh_thread.start()
 

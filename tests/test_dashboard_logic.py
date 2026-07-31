@@ -8,6 +8,7 @@ from __future__ import annotations
 from unittest.mock import MagicMock, patch
 
 import json
+import pytest
 
 from interview_analyzer.config_loader import Config
 from interview_analyzer.dashboard import (
@@ -936,22 +937,25 @@ class TestReprocessWithDifferentProfile:
 
 
 class TestModelCatalogDropdown:
-    """The Settings tab's Model name dropdown -- populated from Groq's
-    periodically-refreshed catalog (model_catalog.py) when analysis.engine
-    is "groq_api", and from the existing hand-curated Ollama catalog
-    otherwise."""
+    """The Settings tab's Model name dropdown -- populated from each cloud
+    engine's periodically-refreshed catalog (model_catalog.py) for Groq/
+    Anthropic/OpenAI, and from the existing hand-curated catalog for
+    Ollama, which has no equivalent remote API (see model_catalog.py's
+    module docstring)."""
 
-    def test_groq_engine_uses_the_cached_groq_catalog(self, tmp_path):
+    @pytest.mark.parametrize("engine", ["groq_api", "anthropic_api", "openai_api"])
+    def test_remote_engines_use_their_own_cached_catalog(self, tmp_path, engine):
         watcher = _watcher(tmp_path)
         watcher.cfg.raw.setdefault("storage", {})["db_path"] = str(tmp_path / "interviews.db")
         dashboard = Dashboard(watcher)
         with patch(
             "interview_analyzer.dashboard.model_catalog.load_cached_models",
-            return_value=["llama-3.3-70b-versatile", "gpt-oss-20b"],
-        ):
-            values = dashboard._model_catalog_values("groq_api")
+            return_value=["model-a", "model-b"],
+        ) as mock_load:
+            values = dashboard._model_catalog_values(engine)
 
-        assert values == ["llama-3.3-70b-versatile", "gpt-oss-20b"]
+        assert values == ["model-a", "model-b"]
+        mock_load.assert_called_once_with(watcher.cfg, engine)
 
     def test_ollama_engine_uses_the_hand_curated_catalog(self, tmp_path):
         dashboard = Dashboard(_watcher(tmp_path))
@@ -974,6 +978,21 @@ class TestModelCatalogDropdown:
 
         dashboard._model_name_entry.config.assert_called_once_with(values=["llama-3.3-70b-versatile"])
 
+    def test_refresh_button_refreshes_the_currently_selected_engine(self, tmp_path):
+        dashboard = Dashboard(_watcher(tmp_path))
+        dashboard._model_name_entry = MagicMock()
+        dashboard._analysis_engine_combo = MagicMock()
+        dashboard._analysis_engine_combo.get.return_value = "openai_api"
+        dashboard._model_status_label = MagicMock()
+
+        with patch(
+            "interview_analyzer.dashboard.model_catalog.refresh_one", return_value=["gpt-4o-mini"]
+        ) as mock_refresh, \
+             patch("interview_analyzer.dashboard.threading.Thread", _ImmediateThread):
+            dashboard._on_refresh_model_catalog()
+
+        mock_refresh.assert_called_once_with(dashboard.watcher.cfg, "openai_api")
+
     def test_refresh_button_repopulates_on_success(self, tmp_path):
         dashboard = Dashboard(_watcher(tmp_path))
         dashboard._model_name_entry = MagicMock()
@@ -981,7 +1000,7 @@ class TestModelCatalogDropdown:
         dashboard._analysis_engine_combo.get.return_value = "groq_api"
         dashboard._model_status_label = MagicMock()
 
-        dashboard._after_model_catalog_refresh(["llama-3.3-70b-versatile", "gpt-oss-20b"])
+        dashboard._after_model_catalog_refresh("groq_api", ["llama-3.3-70b-versatile", "gpt-oss-20b"])
 
         dashboard._model_name_entry.config.assert_called_once()
         dashboard._model_status_label.config.assert_called_with(
@@ -995,9 +1014,26 @@ class TestModelCatalogDropdown:
         dashboard._analysis_engine_combo.get.return_value = "groq_api"
         dashboard._model_status_label = MagicMock()
 
-        dashboard._after_model_catalog_refresh(None)
+        dashboard._after_model_catalog_refresh("groq_api", None)
 
         assert "Couldn't refresh" in dashboard._model_status_label.config.call_args.kwargs["text"]
+
+    def test_refresh_button_is_a_no_op_for_ollama(self, tmp_path):
+        """Ollama has no remote catalog to refresh -- clicking the button
+        while it's selected must not attempt a network call, just explain
+        why (see model_catalog.py's module docstring)."""
+        dashboard = Dashboard(_watcher(tmp_path))
+        dashboard._model_name_entry = MagicMock()
+        dashboard._analysis_engine_combo = MagicMock()
+        dashboard._analysis_engine_combo.get.return_value = "ollama"
+        dashboard._model_status_label = MagicMock()
+
+        with patch("interview_analyzer.dashboard.model_catalog.refresh_one") as mock_refresh:
+            dashboard._on_refresh_model_catalog()
+
+        mock_refresh.assert_not_called()
+        assert "not available" in dashboard._model_status_label.config.call_args.kwargs["text"].lower() \
+            or "isn't available" in dashboard._model_status_label.config.call_args.kwargs["text"].lower()
 
     def test_status_label_is_blank_for_a_groq_model_instead_of_a_download_size(self, tmp_path):
         """Regression coverage: size_label's "download size" framing only

@@ -1,8 +1,8 @@
 """Tests for MeetingWatcher._maybe_refresh_model_catalog -- the gating
-logic that decides when the background Groq model-catalog check (see
-model_catalog.py) actually fires from the poll loop. The real network call
-is never exercised here; only whether/when a background thread gets
-started."""
+logic that decides when the background model-catalog check (see
+model_catalog.py, covering Groq/Anthropic/OpenAI) actually fires from the
+poll loop. The real network call is never exercised here; only whether/when
+a background thread gets started."""
 from __future__ import annotations
 
 import time
@@ -50,17 +50,17 @@ class _FakeThread:
 class TestMaybeRefreshModelCatalog:
     def test_starts_a_background_refresh_when_due(self, tmp_path):
         watcher = MeetingWatcher(_test_config(tmp_path), user_id=1)
-        with patch("interview_analyzer.watcher.model_catalog.should_check", return_value=True), \
+        with patch("interview_analyzer.watcher.model_catalog.any_check_due", return_value=True), \
              patch("interview_analyzer.watcher.threading.Thread", _FakeThread):
             watcher._maybe_refresh_model_catalog()
 
         assert watcher._model_catalog_refresh_thread is not None
-        assert watcher._model_catalog_refresh_thread.target.__name__ == "refresh_model_catalog"
+        assert watcher._model_catalog_refresh_thread.target.__name__ == "refresh_due_catalogs"
         assert watcher._model_catalog_refresh_thread.args == (watcher.cfg,)
 
     def test_does_nothing_when_not_due(self, tmp_path):
         watcher = MeetingWatcher(_test_config(tmp_path), user_id=1)
-        with patch("interview_analyzer.watcher.model_catalog.should_check", return_value=False), \
+        with patch("interview_analyzer.watcher.model_catalog.any_check_due", return_value=False), \
              patch("interview_analyzer.watcher.threading.Thread", _FakeThread):
             watcher._maybe_refresh_model_catalog()
 
@@ -72,7 +72,7 @@ class TestMaybeRefreshModelCatalog:
         in_flight.is_alive.return_value = True
         watcher._model_catalog_refresh_thread = in_flight
 
-        with patch("interview_analyzer.watcher.model_catalog.should_check", return_value=True), \
+        with patch("interview_analyzer.watcher.model_catalog.any_check_due", return_value=True), \
              patch("interview_analyzer.watcher.threading.Thread", _FakeThread):
             watcher._maybe_refresh_model_catalog()
 
@@ -84,21 +84,21 @@ class TestMaybeRefreshModelCatalog:
         finished.is_alive.return_value = False
         watcher._model_catalog_refresh_thread = finished
 
-        with patch("interview_analyzer.watcher.model_catalog.should_check", return_value=True), \
+        with patch("interview_analyzer.watcher.model_catalog.any_check_due", return_value=True), \
              patch("interview_analyzer.watcher.threading.Thread", _FakeThread):
             watcher._maybe_refresh_model_catalog()
 
         assert watcher._model_catalog_refresh_thread is not finished
 
     def test_respects_the_retry_cooldown_between_attempts(self, tmp_path):
-        """Without this, a persistently-missing Groq key (should_check()
-        stays True forever, since a skipped attempt never bumps
-        last_checked -- see refresh_model_catalog's docstring) would spawn
-        a new thread on every single poll tick."""
+        """Without this, a persistently-missing key for every engine
+        (any_check_due() stays True forever, since a skipped attempt never
+        bumps last_checked -- see refresh_one's docstring) would spawn a
+        new thread on every single poll tick."""
         watcher = MeetingWatcher(_test_config(tmp_path), user_id=1)
         watcher._model_catalog_last_attempt_at = time.time()  # "just attempted"
 
-        with patch("interview_analyzer.watcher.model_catalog.should_check", return_value=True), \
+        with patch("interview_analyzer.watcher.model_catalog.any_check_due", return_value=True), \
              patch("interview_analyzer.watcher.threading.Thread", _FakeThread):
             watcher._maybe_refresh_model_catalog()
 
@@ -108,7 +108,7 @@ class TestMaybeRefreshModelCatalog:
         watcher = MeetingWatcher(_test_config(tmp_path), user_id=1)
         watcher._model_catalog_last_attempt_at = time.time() - 9999  # long ago
 
-        with patch("interview_analyzer.watcher.model_catalog.should_check", return_value=True), \
+        with patch("interview_analyzer.watcher.model_catalog.any_check_due", return_value=True), \
              patch("interview_analyzer.watcher.threading.Thread", _FakeThread):
             watcher._maybe_refresh_model_catalog()
 

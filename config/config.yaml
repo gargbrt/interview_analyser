@@ -256,12 +256,15 @@ analysis:
   #                   if you get a 404 "not found" error, check
   #                   console.groq.com/docs/models for the current list.)
   #                   The Settings tab's Model name dropdown no longer relies
-  #                   on this staying current by hand for "groq_api": the app
-  #                   checks Groq's own model list in the background (right
-  #                   after install, then every 15 days -- see
-  #                   model_catalog.py) and keeps the dropdown's suggestions
-  #                   up to date automatically. A "Refresh model list" button
-  #                   next to it also checks on demand.
+  #                   on any cloud engine's catalog staying current by hand:
+  #                   for "groq_api"/"anthropic_api"/"openai_api", the app
+  #                   checks that provider's own model list in the background
+  #                   (right after install, then every 15 days per engine --
+  #                   see model_catalog.py) and keeps the dropdown's
+  #                   suggestions up to date automatically. A "Refresh model
+  #                   list" button next to it also checks on demand. Ollama's
+  #                   list above stays hand-curated -- it has no equivalent
+  #                   remote catalog API.
   llm_model: "llama-3.3-70b-versatile"
   ollama_host: "http://localhost:11434"
   # Only used when engine is "groq_api", "anthropic_api", or "openai_api".

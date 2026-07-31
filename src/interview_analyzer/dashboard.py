@@ -62,6 +62,7 @@ _ACTIVITY_STEP_MS = 150
 _WHISPER_MODELS = ["tiny", "base", "small", "medium", "large-v3"]
 _TRANSCRIPTION_ENGINES = ["faster-whisper", "groq"]
 _ANALYSIS_ENGINES = ["ollama", "groq_api", "anthropic_api", "openai_api"]
+_ENGINE_DISPLAY_NAMES = {"groq_api": "Groq", "anthropic_api": "Anthropic", "openai_api": "OpenAI"}
 _TRANSCRIPTION_LANGUAGES = ["auto", "en", "hi", "hinglish"]
 # "Not rated" (index 0) doubles as the clear-a-rating value for the
 # feedback panel's Comboboxes -- selecting it and saving is how you clear
@@ -2162,20 +2163,20 @@ class Dashboard:
 
     def _model_catalog_values(self, engine: str) -> list[str]:
         """Which model names populate the Model name dropdown for the
-        given analysis engine -- Groq's own (periodically refreshed, see
-        model_catalog.py) catalog for "groq_api", else the existing
-        hand-curated Ollama catalog (model_setup.py's MODEL_CATALOG),
-        which is unaffected by this feature."""
-        if engine == "groq_api":
-            return model_catalog.load_cached_models(self.watcher.cfg)
+        given analysis engine -- that engine's own periodically-refreshed
+        catalog (see model_catalog.py) for Groq/Anthropic/OpenAI, else the
+        existing hand-curated Ollama catalog (model_setup.py's
+        MODEL_CATALOG), which is unaffected by this feature."""
+        if engine in model_catalog.ENGINES_WITH_REMOTE_CATALOGS:
+            return model_catalog.load_cached_models(self.watcher.cfg, engine)
         return list(MODEL_CATALOG.keys())
 
     def _on_analysis_engine_changed(self) -> None:
         """Repopulates the Model name dropdown's suggestions when the
-        Analysis engine dropdown changes, so switching to groq_api shows
-        Groq's own models instead of leftover Ollama catalog entries (and
-        vice versa) -- the current typed-in value is left as-is either
-        way, only the dropdown's suggestion list changes."""
+        Analysis engine dropdown changes, so switching engines shows that
+        engine's own models instead of leftover entries from whichever was
+        selected before -- the current typed-in value is left as-is
+        either way, only the dropdown's suggestion list changes."""
         if self._model_name_entry is None or self._analysis_engine_combo is None:
             return
         self._model_name_entry.config(values=self._model_catalog_values(self._analysis_engine_combo.get()))
@@ -2183,28 +2184,42 @@ class Dashboard:
     def _on_refresh_model_catalog(self) -> None:
         """Manual, on-demand version of the periodic background check in
         watcher.py's _maybe_refresh_model_catalog -- lets a user with a
-        freshly-saved Groq key see its models immediately rather than
-        waiting for the next scheduled check."""
+        freshly-saved cloud key see its models immediately rather than
+        waiting for the next scheduled check. Only refreshes the engine
+        currently selected in the Analysis engine dropdown -- Ollama has
+        no remote catalog to refresh (see model_catalog.py's docstring)."""
+        engine = self._analysis_engine_combo.get() if self._analysis_engine_combo is not None else "ollama"
+        if engine not in model_catalog.ENGINES_WITH_REMOTE_CATALOGS:
+            if self._model_status_label is not None:
+                self._model_status_label.config(
+                    text="Refresh isn't available for Ollama -- its model list is curated locally, "
+                         "not fetched remotely."
+                )
+            return
+        display_name = _ENGINE_DISPLAY_NAMES.get(engine, engine)
         if self._model_status_label is not None:
-            self._model_status_label.config(text="Checking Groq for the latest models...")
+            self._model_status_label.config(text=f"Checking {display_name} for the latest models...")
 
         def _do_refresh():
-            models = model_catalog.refresh_model_catalog(self.watcher.cfg)
+            models = model_catalog.refresh_one(self.watcher.cfg, engine)
             if self._root is not None:
-                self._root.after(0, lambda: self._after_model_catalog_refresh(models))
+                self._root.after(0, lambda: self._after_model_catalog_refresh(engine, models))
 
         threading.Thread(target=_do_refresh, daemon=True).start()
 
-    def _after_model_catalog_refresh(self, models: Optional[list[str]]) -> None:
-        if self._analysis_engine_combo is not None and self._analysis_engine_combo.get() == "groq_api":
+    def _after_model_catalog_refresh(self, engine: str, models: Optional[list[str]]) -> None:
+        if self._analysis_engine_combo is not None and self._analysis_engine_combo.get() == engine:
             self._on_analysis_engine_changed()
         if self._model_status_label is None:
             return
+        display_name = _ENGINE_DISPLAY_NAMES.get(engine, engine)
         if models:
-            self._model_status_label.config(text=f"Refreshed -- {len(models)} model(s) available from Groq.")
+            self._model_status_label.config(
+                text=f"Refreshed -- {len(models)} model(s) available from {display_name}."
+            )
         else:
             self._model_status_label.config(
-                text="Couldn't refresh (no Groq key saved yet, or the request failed)."
+                text=f"Couldn't refresh (no {display_name} key saved yet, or the request failed)."
             )
 
     def _on_install_model(self) -> None:
